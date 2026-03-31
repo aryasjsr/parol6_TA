@@ -1,0 +1,143 @@
+{
+  "modbus": {
+    "ip": "192.168.1.10",
+    "port": 502,
+    "slave_id": 1,
+    "addresses": [
+      {
+        "name": "trigger_pick",
+        "type": "coil",
+        "address": 0,
+        "rw": "read",
+        "desc": "Pick trigger from PLC"
+      },
+      {
+        "name": "cycle_done",
+        "type": "coil",
+        "address": 1,
+        "rw": "write",
+        "desc": "Done signal to PLC"
+      },
+      {
+        "name": "error_flag",
+        "type": "coil",
+        "address": 2,
+        "rw": "write",
+        "desc": "Error signal to PLC"
+      },
+      {
+        "name": "jog_enable",
+        "type": "coil",
+        "address": 10,
+        "rw": "read",
+        "desc": "Modbus jog master enable"
+      },
+      {
+        "name": "jog_joint_bit0",
+        "type": "coil",
+        "address": 11,
+        "rw": "read",
+        "desc": "Joint ID bit 0 (LSB)"
+      },
+      {
+        "name": "jog_joint_bit1",
+        "type": "coil",
+        "address": 12,
+        "rw": "read",
+        "desc": "Joint ID bit 1"
+      },
+      {
+        "name": "jog_joint_bit2",
+        "type": "coil",
+        "address": 13,
+        "rw": "read",
+        "desc": "Joint ID bit 2 (MSB)"
+      },
+      {
+        "name": "jog_direction",
+        "type": "coil",
+        "address": 14,
+        "rw": "read",
+        "desc": "0 = negative, 1 = positive"
+      },
+      {
+        "name": "jog_trigger",
+        "type": "coil",
+        "address": 15,
+        "rw": "read",
+        "desc": "Rising edge triggers one jog step"
+      }
+    ],
+    "jog_lock_timeout_s": 5.0,
+    "jog_speed_pct": 20
+  },
+  "serial": {
+    "port": "COM3",
+    "baudrate": 115200
+  },
+  "vision": {
+    "video_source": "1",
+    "camera_index": 0,
+    "detection_method": "model",
+    "adaptive_block_size": 24,
+    "adaptive_c": -5,
+    "canny_threshold1": 50,
+    "canny_threshold2": 150,
+    "hsv_lower": [
+      0,
+      0,
+      150
+    ],
+    "hsv_upper": [
+      180,
+      56,
+      255
+    ],
+    "min_contour_area": 451,
+    "max_contour_area": 50001,
+    "morph_kernel_size": 3,
+    "brightness": 7,
+    "contrast": 1.0,
+    "zoom": 1.0,
+    "tune_live": false,
+    "preview_pick_zone": true,
+    "pick_inset_x_mm": 3.5,
+    "pick_inset_y_mm": 11.0,
+    "calibration": {
+      "snapshots_captured": 0,
+      "chessboard_size": [
+        9,
+        6
+      ],
+      "square_size_mm": 25.0
+    },
+    "model_path": "MOCK",
+    "model_conf_threshold": 0.5,
+    "model_iou_threshold": 0.45,
+    "safe_pick_margin_pct": 0.15,
+    "marginal_confirm_timeout_s": 2
+  },
+  "workspace": {
+    "x_min_mm": -200,
+    "x_max_mm": 200,
+    "y_min_mm": -200,
+    "y_max_mm": 200,
+    "z_fixed_mm": 200,
+    "margin_mm": 10,
+    "enabled": true
+  },
+  "failsafe": {
+    "serial_timeout_ms": 500,
+    "serial_retry_count": 3,
+    "modbus_reconnect_interval_s": 5,
+    "modbus_max_reconnect_wait_s": 30,
+    "workspace_timeout_s": 10,
+    "watchdog_timeout_s": 1,
+    "estop_keyboard_shortcut": "Space"
+  },
+  "robot": {
+    "default_speed_pct": 30,
+    "home_on_connect": false,
+    "gripper_output_pin": 1
+  }
+}

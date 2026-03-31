@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>PAROL6 3D Simulator</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #070E1C; overflow: hidden; font-family: 'Inter','Segoe UI',sans-serif; }
+  canvas { display: block; }
+  #hud {
+    position: absolute; top: 10px; left: 12px;
+    color: #C8A84B; font-size: 11px; font-weight: 600;
+    pointer-events: none; user-select: none;
+    text-shadow: 0 1px 4px rgba(0,0,0,.7);
+  }
+  #hud .val { color: #E8EDF5; font-weight: 400; }
+  #status {
+    position: absolute; bottom: 8px; right: 12px;
+    color: #3A4E6B; font-size: 9px;
+  }
+  #status.ok { color: #22C97A; }
+</style>
+</head>
+<body>
+<div id="hud"></div>
+<div id="status">connecting…</div>
+
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+               "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/" } }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+/* ───── PAROL6 DH Parameters (metres) ───── */
+const a1 = 0.11050, a2 = 0.02342, a3 = 0.180, a4 = 0.0435;
+const a5 = 0.17635, a6 = 0.110,   a7 = 0.04525;
+const ALPHA = [-Math.PI/2, Math.PI, Math.PI/2, -Math.PI/2, Math.PI/2, Math.PI];
+
+/* DH table: [d, a, alpha] per joint */
+const DH = [
+  { d: a1,  a: a2,  alpha: ALPHA[0] },
+  { d: 0,   a: a3,  alpha: ALPHA[1] },
+  { d: 0,   a:-a4,  alpha: ALPHA[2] },
+  { d:-a5,  a: 0,   alpha: ALPHA[3] },
+  { d: 0,   a: 0,   alpha: ALPHA[4] },
+  { d:-a6,  a: 0,   alpha: ALPHA[5] },
+];
+
+/* Joint reduction ratios & conversion */
+const RATIO = [6.4, 20, 20*(38/42), 4, 4, 10];
+const DEG_PER_STEP = 360 / (32 * 200);
+function steps2rad(steps, idx) {
+  return (steps * DEG_PER_STEP / RATIO[idx]) * Math.PI / 180;
+}
+
+/* ── Build DH transform  T = Rz(θ) · Tz(d) · Tx(a) · Rx(α) ── */
+function dhMatrix(theta, d, a, alpha) {
+  const ct = Math.cos(theta), st = Math.sin(theta);
+  const ca = Math.cos(alpha), sa = Math.sin(alpha);
+  const m = new THREE.Matrix4();
+  m.set(
+    ct, -st*ca,  st*sa, a*ct,
+    st,  ct*ca, -ct*sa, a*st,
+     0,    sa,     ca,    d,
+     0,     0,      0,    1
+  );
+  return m;
+}
+
+/* ───── Three.js scene ───── */
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setClearColor(0x070E1C);
+renderer.shadowMap.enabled = true;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth/window.innerHeight, 0.01, 10);
+camera.position.set(0.45, 0.35, 0.45);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0.15, 0);
+controls.enableDamping = true;
+controls.dampingFactor = 0.12;
+controls.update();
+
+/* Lights */
+const ambient = new THREE.AmbientLight(0x8A9AB8, 0.6);
+scene.add(ambient);
+const dirLight = new THREE.DirectionalLight(0xFFFFFF, 1.2);
+dirLight.position.set(0.5, 0.8, 0.6);
+dirLight.castShadow = true;
+scene.add(dirLight);
+const fill = new THREE.DirectionalLight(0x4A90D9, 0.4);
+fill.position.set(-0.4, 0.3, -0.5);
+scene.add(fill);
+
+/* Grid floor */
+const grid = new THREE.GridHelper(0.8, 16, 0x243D6B, 0x162B52);
+scene.add(grid);
+
+/* Base platform */
+const baseMat  = new THREE.MeshStandardMaterial({ color: 0x162B52, metalness: 0.6, roughness: 0.35 });
+const linkMat  = new THREE.MeshStandardMaterial({ color: 0xC8A84B, metalness: 0.5, roughness: 0.3 });
+const jointMat = new THREE.MeshStandardMaterial({ color: 0x4A90D9, metalness: 0.4, roughness: 0.4 });
+const eeMat    = new THREE.MeshStandardMaterial({ color: 0xE84040, metalness: 0.3, roughness: 0.5 });
+
+const baseGeo = new THREE.CylinderGeometry(0.05, 0.06, 0.015, 32);
+const baseMesh = new THREE.Mesh(baseGeo, baseMat);
+baseMesh.position.y = 0.0075;
+baseMesh.receiveShadow = true;
+scene.add(baseMesh);
+
+/* helpers to create link and joint visuals */
+function createJointVisual(radius) {
+  const geo = new THREE.SphereGeometry(radius, 16, 12);
+  const mesh = new THREE.Mesh(geo, jointMat);
+  mesh.castShadow = true;
+  return mesh;
+}
+function createLinkVisual(length, radius) {
+  if (Math.abs(length) < 0.001) return null;
+  const geo = new THREE.CylinderGeometry(radius, radius, Math.abs(length), 10);
+  const mesh = new THREE.Mesh(geo, linkMat);
+  mesh.castShadow = true;
+  return mesh;
+}
+
+/* ── Robot state: 6 joint angles in radians ── */
+let jointAngles = [0, 0, 0, 0, 0, 0];
+let jointSteps  = [0, 0, 0, 0, 0, 0];
+
+/* ── Forward kinematics → build frame positions for visual ── */
+function computeFK(q) {
+  const frames = [];
+  const T = new THREE.Matrix4().identity();
+  frames.push(new THREE.Vector3().setFromMatrixPosition(T));
+
+  for (let i = 0; i < 6; i++) {
+    const m = dhMatrix(q[i], DH[i].d, DH[i].a, DH[i].alpha);
+    T.multiply(m);
+    frames.push(new THREE.Vector3().setFromMatrixPosition(T));
+  }
+  return frames;
+}
+
+/* Tube-based robot arm visual */
+const tubeGroup = new THREE.Group();
+scene.add(tubeGroup);
+
+const jointSpheres = [];
+for (let i = 0; i <= 6; i++) {
+  const r = i === 0 ? 0.018 : i === 6 ? 0.012 : 0.015;
+  const mat = i === 6 ? eeMat : jointMat;
+  const geo = new THREE.SphereGeometry(r, 16, 12);
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.castShadow = true;
+  scene.add(mesh);
+  jointSpheres.push(mesh);
+}
+
+let linkMeshes = [];
+function rebuildLinks(frames) {
+  linkMeshes.forEach(m => { scene.remove(m); m.geometry.dispose(); });
+  linkMeshes = [];
+  for (let i = 0; i < frames.length - 1; i++) {
+    const a = frames[i], b = frames[i+1];
+    const dist = a.distanceTo(b);
+    if (dist < 0.001) continue;
+    const r = i === 0 ? 0.014 : 0.010;
+    const geo = new THREE.CylinderGeometry(r, r, dist, 8);
+    const mesh = new THREE.Mesh(geo, linkMat);
+    mesh.castShadow = true;
+
+    const mid = new THREE.Vector3().addVectors(a, b).multiplyScalar(0.5);
+    mesh.position.copy(mid);
+    const dir = new THREE.Vector3().subVectors(b, a).normalize();
+    const up = new THREE.Vector3(0, 1, 0);
+    const quat = new THREE.Quaternion().setFromUnitVectors(up, dir);
+    mesh.quaternion.copy(quat);
+    scene.add(mesh);
+    linkMeshes.push(mesh);
+  }
+}
+
+/* Coordinate axes at EE */
+const axesHelper = new THREE.AxesHelper(0.04);
+scene.add(axesHelper);
+
+function updateRobot() {
+  const frames = computeFK(jointAngles);
+  for (let i = 0; i < jointSpheres.length; i++) {
+    jointSpheres[i].position.copy(frames[i]);
+  }
+  rebuildLinks(frames);
+  axesHelper.position.copy(frames[6]);
+
+  /* HUD */
+  const degs = jointAngles.map((r, i) => (r * 180 / Math.PI).toFixed(1));
+  document.getElementById('hud').innerHTML =
+    degs.map((d, i) => `J${i+1}: <span class="val">${d}°</span>`).join('&ensp;');
+}
+
+/* Initial pose */
+updateRobot();
+
+/* ── Polling joint state from Flask API ── */
+const statusEl = document.getElementById('status');
+let pollFails = 0;
+
+async function poll() {
+  try {
+    const resp = await fetch('/api/joint_state');
+    if (!resp.ok) throw new Error(resp.status);
+    const data = await resp.json();
+    if (Array.isArray(data.steps) && data.steps.length >= 6) {
+      jointSteps = data.steps.slice(0, 6);
+      for (let i = 0; i < 6; i++) {
+        jointAngles[i] = steps2rad(jointSteps[i], i);
+      }
+      updateRobot();
+    }
+    pollFails = 0;
+    statusEl.textContent = 'live';
+    statusEl.className = 'ok';
+  } catch (e) {
+    pollFails++;
+    if (pollFails > 3) {
+      statusEl.textContent = 'offline';
+      statusEl.className = '';
+    }
+  }
+}
+setInterval(poll, 200);
+
+/* ── Render loop ── */
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>
