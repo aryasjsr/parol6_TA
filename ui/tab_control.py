@@ -4,7 +4,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QUrl
+from PyQt6.QtCore import Qt, QUrl, QTimer
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -335,10 +335,18 @@ class ControlTab(QWidget):
         self.joint_slider_value_labels: list[QLabel] = []
         self.cart_minus_buttons: dict[str, QPushButton] = {}
         self.cart_plus_buttons: dict[str, QPushButton] = {}
+        self.cart_value_labels: dict[str, QLabel] = {}
         self.jog_source_label = QLabel("Jog source: NONE")
         self.simulation_status_label = QLabel("Joint state: --")
         self.preview_joint_labels: list[QLabel] = []
         self.realtime_joint_labels: list[QLabel] = []
+
+        # --- Auto-repeat jog timer ---
+        self._jog_repeat_timer = QTimer(self)
+        self._jog_repeat_timer.setInterval(100)  # ms between repeats
+        self._jog_repeat_callback = None
+        self._jog_repeat_timer.timeout.connect(self._fire_jog_repeat)
+
         self._build_ui()
 
     def create_estop_button(self) -> QPushButton:
@@ -528,14 +536,19 @@ class ControlTab(QWidget):
             minus_button.setProperty("role", "jog")
             plus_button = QPushButton("+")
             plus_button.setProperty("role", "jog")
-            step_box = QDoubleSpinBox()
-            step_box.setRange(-999.0, 999.0)
-            step_box.setValue(1.0)
+            value_label = QLabel("0.0")
+            value_label.setMinimumWidth(62)
+            value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            value_label.setStyleSheet(
+                "color: #E8EDF5; font-size: 11px; font-weight: 600;"
+                "font-family: 'Consolas', 'Courier New', monospace;"
+            )
             self.cart_minus_buttons[axis] = minus_button
             self.cart_plus_buttons[axis] = plus_button
+            self.cart_value_labels[axis] = value_label
             layout.addWidget(QLabel(axis), row, 0)
             layout.addWidget(minus_button, row, 1)
-            layout.addWidget(step_box, row, 2)
+            layout.addWidget(value_label, row, 2)
             layout.addWidget(plus_button, row, 3)
         speed_label = QLabel("Speed %")
         self.speed_slider = QSlider()
@@ -704,11 +717,11 @@ class ControlTab(QWidget):
         view_btn_row = QHBoxLayout()
         view_btn_row.setSpacing(4)
         view_angles = [
-            ("Front",   0,    0),
-            ("Back",    0,  180),
-            ("Left",    0,  -90),
-            ("Right",   0,   90),
-            ("Top",    90,    0),
+            ("Front",  20,    0),
+            ("Back",   20,  180),
+            ("Left",   20,  -90),
+            ("Right",  20,   90),
+            ("Top",    80,    0),
             ("Iso",    30,  -60),
         ]
         self._view_angle_buttons: list[QPushButton] = []
@@ -811,6 +824,26 @@ class ControlTab(QWidget):
             return
         is_visible = self.simulation_content.isVisible()
         self.simulation_content.setVisible(not is_visible)
+
+    # --- Auto-repeat jog helpers ---
+    def _start_jog_repeat(self, callback) -> None:
+        """Begin auto-repeating *callback* while button is held."""
+        self._jog_repeat_callback = callback
+        callback()  # fire immediately on press
+        self._jog_repeat_timer.start()
+
+    def _stop_jog_repeat(self) -> None:
+        """Stop auto-repeating when button is released."""
+        self._jog_repeat_timer.stop()
+        self._jog_repeat_callback = None
+
+    def _fire_jog_repeat(self) -> None:
+        """Called by timer."""
+        if self._jog_repeat_callback is not None:
+            self._jog_repeat_callback()
+        if self.simulation_content is None:
+            return
+        is_visible = self.simulation_content.isVisible()
         self.simulation_toggle_button.setText(
             "Show Simulation" if is_visible else "Hide Simulation"
         )
@@ -844,12 +877,45 @@ class ControlTab(QWidget):
                 self.realtime_joint_labels[i].setText(f"{val:.2f}")
 
     def update_preview_joints(self, radians: list[float]) -> None:
-        """Update preview joint labels from simulator FK (radians → degrees)."""
+        """Update preview joint labels and cartesian values from simulator FK."""
         import math
+        import numpy as np
         for i, val in enumerate(radians[:6]):
             if i < len(self.preview_joint_labels):
                 self.preview_joint_labels[i].setText(f"{math.degrees(val):.2f}")
         self.sync_sliders_from_radians(radians)
+        self._update_cartesian_labels(radians)
+
+    def _update_cartesian_labels(self, radians: list[float]) -> None:
+        """Compute FK and update cartesian value labels (X/Y/Z in mm, Rx/Ry/Rz in °)."""
+        if not self.cart_value_labels:
+            return
+        try:
+            import numpy as np
+            from spatialmath import SE3
+            from tools.PAROL6_ROBOT import robot
+
+            q = np.array(radians[:6])
+            T = robot.fkine(q)
+
+            # Position in mm
+            x, y, z = T.t * 1000.0
+
+            # Euler angles (RPY = Roll-Pitch-Yaw) in degrees, ZYX order
+            rpy = T.rpy('deg', 'zyx')
+
+            values = {
+                "X": f"{x:.1f}",
+                "Y": f"{y:.1f}",
+                "Z": f"{z:.1f}",
+                "Rx": f"{rpy[0]:.1f}",
+                "Ry": f"{rpy[1]:.1f}",
+                "Rz": f"{rpy[2]:.1f}",
+            }
+            for axis, lbl in self.cart_value_labels.items():
+                lbl.setText(values.get(axis, "—"))
+        except Exception:
+            pass
 
     def sync_sliders_from_radians(self, radians: list[float]) -> None:
         """Sync slider positions from radians (called after any sim update)."""

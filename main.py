@@ -108,17 +108,33 @@ def main() -> int:
     )
 
     for index, button in enumerate(control.joint_minus_buttons):
-        button.clicked.connect(lambda _, joint=index: runtime.jog_joint(joint, -1))
+        _j, _d = index, -1
+        button.pressed.connect(
+            lambda j=_j, d=_d: control._start_jog_repeat(lambda: runtime.jog_joint(j, d))
+        )
+        button.released.connect(control._stop_jog_repeat)
     for index, button in enumerate(control.joint_plus_buttons):
-        button.clicked.connect(lambda _, joint=index: runtime.jog_joint(joint, 1))
+        _j, _d = index, 1
+        button.pressed.connect(
+            lambda j=_j, d=_d: control._start_jog_repeat(lambda: runtime.jog_joint(j, d))
+        )
+        button.released.connect(control._stop_jog_repeat)
     for index, slider in enumerate(control.joint_sliders):
         slider.valueChanged.connect(
             lambda val, jid=index: runtime.set_sim_joint_absolute(jid, val / 10.0)
         )
     for axis, button in control.cart_minus_buttons.items():
-        button.clicked.connect(lambda _, axis_name=axis: runtime.jog_cartesian(axis_name, -1))
+        _a, _d = axis, -1
+        button.pressed.connect(
+            lambda a=_a, d=_d: control._start_jog_repeat(lambda: runtime.jog_cartesian(a, d))
+        )
+        button.released.connect(control._stop_jog_repeat)
     for axis, button in control.cart_plus_buttons.items():
-        button.clicked.connect(lambda _, axis_name=axis: runtime.jog_cartesian(axis_name, 1))
+        _a, _d = axis, 1
+        button.pressed.connect(
+            lambda a=_a, d=_d: control._start_jog_repeat(lambda: runtime.jog_cartesian(a, d))
+        )
+        button.released.connect(control._stop_jog_repeat)
 
     control.run_button.clicked.connect(lambda: runtime.run_program(control.program_rows()))
     control.pause_button.clicked.connect(runtime.toggle_program_pause)

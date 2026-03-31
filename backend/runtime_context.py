@@ -256,13 +256,14 @@ class AppRuntime(QObject):
 
     def jog_joint(self, joint_id: int, direction: int) -> None:
         """Inject one short timed joint jog action (GUI source)."""
-        # Always update preview sim position
-        self._update_sim_joint(joint_id, direction)
-
         if self._preview_only:
-            self.log_message.emit(
-                f"[Preview] Joint jog J{joint_id + 1} {'+' if direction > 0 else '-'}", "info"
-            )
+            # Preview mode: update simulation only, no hardware
+            self._update_sim_joint(joint_id, direction)
+            return
+
+        # Real-time mode: send to hardware only if connected + enabled
+        if not self.is_connected() or not self.commander.is_enabled():
+            self.log_message.emit("Jog blocked – robot not connected/enabled", "warn")
             return
 
         if not self._jog_lock.acquire("gui"):
@@ -285,9 +286,11 @@ class AppRuntime(QObject):
     def jog_cartesian(self, axis: str, direction: int) -> None:
         """Inject one short timed cartesian jog action."""
         if self._preview_only:
-            self.log_message.emit(
-                f"[Preview] Cartesian jog {axis} {'+' if direction > 0 else '-'}", "info"
-            )
+            self._update_sim_cartesian(axis, direction)
+            return
+
+        if not self.is_connected() or not self.commander.is_enabled():
+            self.log_message.emit("Cartesian jog blocked – robot not connected/enabled", "warn")
             return
 
         step = 0.005 * direction
@@ -352,6 +355,54 @@ class AppRuntime(QObject):
         self._sim_position[joint_id] += step_rad
         lo, hi = self._parol6.Joint_limits_radian[joint_id]
         self._sim_position[joint_id] = max(lo, min(hi, self._sim_position[joint_id]))
+        self.sim_position_changed.emit(list(self._sim_position))
+
+    def _update_sim_cartesian(self, axis: str, direction: int) -> None:
+        """Advance sim-preview via cartesian delta + IK."""
+        import numpy as np
+        from spatialmath import SE3
+
+        robot = self._parol6.robot
+        q = np.array(self._sim_position)
+
+        T = robot.fkine(q)
+
+        lin_step = 0.005 * direction   # 5 mm per tick
+        rot_step = 1.5 * direction       # 1.5 deg per tick
+
+        T_new = SE3(T)
+
+        # --- Translation: WRF vs TRF ---
+        if axis in ("X", "Y", "Z"):
+            d = np.zeros(3)
+            idx = {"X": 0, "Y": 1, "Z": 2}[axis]
+            d[idx] = lin_step
+            if self.jog_control[2] == 1:  # WRF
+                T_new.t = T_new.t + d
+            else:  # TRF
+                T_new.t = T_new.t + T_new.R @ d
+
+        # --- Rotation: always post-multiply (tool-frame) ---
+        elif axis == "Rx":
+            T_new = T_new * SE3.Rx(rot_step, unit='deg')
+        elif axis == "Ry":
+            T_new = T_new * SE3.Ry(rot_step, unit='deg')
+        elif axis == "Rz":
+            T_new = T_new * SE3.Rz(rot_step, unit='deg')
+        else:
+            return
+
+        sol = robot.ikine_LMS(T_new, q0=q, ilimit=10)
+        if not sol.success:
+            self.log_message.emit("[Preview] Cartesian IK failed – unreachable", "warn")
+            return
+
+        q_new = sol.q
+        for i in range(6):
+            lo, hi = self._parol6.Joint_limits_radian[i]
+            q_new[i] = max(lo, min(hi, q_new[i]))
+
+        self._sim_position = list(q_new)
         self.sim_position_changed.emit(list(self._sim_position))
 
     def sync_sim_from_hardware(self, positions: list[int]) -> None:
