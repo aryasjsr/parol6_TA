@@ -73,9 +73,13 @@ def _build_deps(
     logger = ResearchLogger.instance()
     ws = WorkspaceValidator(cfg)
 
+    # Standby position [0, -90°, 180°, 0, 0, 180°] in encoder steps.
+    # Using zeros for all joints would be invalid (J2 and J3 outside their
+    # joint limits), causing IK to legitimately reject solutions.
+    standby_steps = [0, -32000, 57904, 0, 0, 32000]
     robot_data = RobotInputData()
     robot_data.initialize(
-        position_init=[0, 0, 0, 0, 0, 0],
+        position_init=standby_steps,
         speed_init=[0, 0, 0, 0, 0, 0],
         homed_init=[1, 1, 1, 1, 1, 1, 0, 0],
         inout_init=[0, 0, 0, 0, 1, 0, 0, 0],
@@ -85,7 +89,7 @@ def _build_deps(
     )
     command_data = RobotOutputData()
     command_data.initialize(
-        position_init=[0, 0, 0, 0, 0, 0],
+        position_init=standby_steps,
         speed_init=[0, 0, 0, 0, 0, 0],
         affected_joint_init=[1] * 8,
         inout_init=[0, 0, 0, 0, 1, 0, 0, 0],
@@ -125,7 +129,7 @@ def _build_deps(
     )
 
 
-def _make_bundle(safety: str, pick_world=(50.0, 50.0)) -> DetectionBundle:
+def _make_bundle(safety: str, pick_world=(100.0, 100.0)) -> DetectionBundle:
     """Create a DetectionBundle with the specified safety status."""
     return DetectionBundle(
         selongsong_box=np.array([200, 150, 350, 230], dtype=np.float64),

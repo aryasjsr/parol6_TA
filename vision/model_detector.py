@@ -157,12 +157,22 @@ class ModelDetector(BaseDetector):
             self._mock_mode = True
             _log.info("ModelDetector running in MOCK mode")
             return
+
+        # Reset state up-front so a failed real-model load can NEVER leave a
+        # stale MOCK session active. Without this, switching config from
+        # ``"MOCK"`` to a real path while onnxruntime fails to import would
+        # still report ``is_loaded == True`` and keep emitting synthetic
+        # bounding boxes — exactly the "bbox in a black frame" symptom.
+        self._session = None
+        self._mock_mode = False
+
         import onnxruntime as ort
 
-        if not path or not Path(path).is_file():
+        resolved = self._resolve_model_path(path)
+        if not resolved or not resolved.is_file():
             raise ModelNotFoundError(f"ONNX model not found: {path}")
         self._session = ort.InferenceSession(
-            path,
+            str(resolved),
             providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
         )
         meta = self._session.get_inputs()[0]
@@ -355,20 +365,76 @@ class ModelDetector(BaseDetector):
             cv2.putText(overlay, label, (box[0], max(box[1] - 6, 14)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
 
-        # Draw pick point crosshair
-        if bundle.pick_point_px is not None:
-            pu, pv = bundle.pick_point_px
-            color = {
-                "SAFE": (0, 255, 0),
-                "MARGINAL": (0, 191, 255),
-                "UNSAFE": (0, 0, 255),
-            }.get(bundle.pick_safety, (180, 180, 180))
+        # Resolve pick-point coordinates and safety colour.
+        #
+        # Earlier the crosshair was suppressed whenever ``pick_point_px`` was
+        # ``None`` (i.e. ``UNSAFE``), which made the live feed look exactly
+        # like the user's complaint: bboxes but no "titik pick point". We now
+        # fall back to the selongsong centroid so that every detected
+        # selongsong gets *some* marker — UNSAFE just turns it red.
+        status = bundle.pick_safety or "UNKNOWN"
+        color = {
+            "SAFE": (0, 255, 0),
+            "MARGINAL": (0, 191, 255),
+            "UNSAFE": (0, 0, 255),
+            "UNKNOWN": (180, 180, 180),
+        }.get(status, (180, 180, 180))
+
+        pick_px = bundle.pick_point_px
+        if pick_px is None and bundle.selongsong_box is not None:
+            sx1, sy1, sx2, sy2 = bundle.selongsong_box.astype(int)
+            pick_px = ((sx1 + sx2) // 2, (sy1 + sy2) // 2)
+
+        # Optional safe-zone rectangle (matches Colab inference overlay).
+        # Computed on-the-fly from selongsong − fixture so we do not have to
+        # change the DetectionBundle schema.
+        safe_zone = self._compute_safe_zone_rect(bundle)
+        if safe_zone is not None:
+            zx1, zy1, zx2, zy2 = safe_zone
+            cv2.rectangle(overlay, (zx1, zy1), (zx2, zy2), color, 1, cv2.LINE_AA)
+
+        # Draw pickup crosshair + textual status badge.
+        if pick_px is not None:
+            pu, pv = int(pick_px[0]), int(pick_px[1])
             cv2.drawMarker(overlay, (pu, pv), color, cv2.MARKER_CROSS, 20, 2)
+            label_lines = [f"{status} ({pu},{pv})"]
             if bundle.pick_point_world is not None:
-                text = f"({bundle.pick_point_world[0]:.1f}, {bundle.pick_point_world[1]:.1f}) mm"
-                cv2.putText(overlay, text, (pu + 12, pv - 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+                label_lines.append(
+                    f"({bundle.pick_point_world[0]:.1f}, {bundle.pick_point_world[1]:.1f}) mm"
+                )
+            for i, text in enumerate(label_lines):
+                cv2.putText(overlay, text, (pu + 12, pv - 8 + i * 16),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
         return overlay
+
+    @staticmethod
+    def _compute_safe_zone_rect(bundle: DetectionBundle) -> tuple[int, int, int, int] | None:
+        """Reconstruct the largest safe-zone rectangle from the bundle boxes.
+
+        Mirrors the geometry in :class:`SafePickValidator.check_pair`, but
+        only returns the rectangle so the overlay can render it. Returns
+        ``None`` when no meaningful safe zone exists.
+        """
+        if bundle.selongsong_box is None:
+            return None
+        sx1, sy1, sx2, sy2 = bundle.selongsong_box.astype(float)
+        if bundle.fixture_box is None:
+            return int(sx1), int(sy1), int(sx2), int(sy2)
+        fx1, fy1, fx2, fy2 = bundle.fixture_box.astype(float)
+        candidates: list[tuple[float, float, float, float]] = []
+        if fx1 > sx1:
+            candidates.append((sx1, sy1, min(sx2, fx1), sy2))
+        if fx2 < sx2:
+            candidates.append((max(sx1, fx2), sy1, sx2, sy2))
+        if fy1 > sy1:
+            candidates.append((sx1, sy1, sx2, min(sy2, fy1)))
+        if fy2 < sy2:
+            candidates.append((sx1, max(sy1, fy2), sx2, sy2))
+        candidates = [c for c in candidates if (c[2] - c[0]) > 0 and (c[3] - c[1]) > 0]
+        if not candidates:
+            return None
+        best = max(candidates, key=lambda c: (c[2] - c[0]) * (c[3] - c[1]))
+        return int(best[0]), int(best[1]), int(best[2]), int(best[3])
 
     # ------ private ------
 
@@ -378,6 +444,24 @@ class ModelDetector(BaseDetector):
         except (ModelNotFoundError, ImportError, Exception) as exc:
             _log.warning("Model lazy-load failed: %s", exc)
             self._session = None
+
+    @staticmethod
+    def _resolve_model_path(path: str) -> Path | None:
+        """Resolve *path* to an existing file.
+
+        Tries, in order: as-is (absolute or cwd-relative), then relative to
+        the PAROL6_app project root (i.e. the directory containing
+        ``main.py``). Returns the first hit or ``None``.
+        """
+        candidate = Path(path).expanduser()
+        if candidate.is_file():
+            return candidate.resolve()
+        # project root = PAROL6_app/ (this file lives in PAROL6_app/vision/)
+        project_root = Path(__file__).resolve().parent.parent
+        rooted = (project_root / path).resolve()
+        if rooted.is_file():
+            return rooted
+        return None
 
     def _generate_mock_bundles(
         self,

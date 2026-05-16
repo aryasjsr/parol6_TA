@@ -127,3 +127,27 @@ class ProgramModel:
         if not isinstance(rows, list):
             raise ValueError("Program JSON must contain a list of rows")
         return cls.from_rows(rows)
+
+    def save_txt(self, destination: str | Path) -> Path:
+        destination_path = Path(destination)
+        destination_path.write_text(self.to_script(), encoding="utf-8")
+        return destination_path
+
+    @classmethod
+    def load_txt(cls, source: str | Path) -> "ProgramModel":
+        text = Path(source).read_text(encoding="utf-8")
+        return cls.from_text(text)
+
+    @classmethod
+    def from_text(cls, text: str) -> "ProgramModel":
+        commands: list[ProgramCommand] = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                row = {"command": line, "parameters": "-", "notes": ""}
+                commands.append(cls.parse_row(row))
+            except Exception:
+                continue
+        return cls(commands)

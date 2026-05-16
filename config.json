@@ -76,7 +76,7 @@
     "baudrate": 115200
   },
   "vision": {
-    "video_source": "1",
+    "video_source": "0",
     "camera_index": 0,
     "detection_method": "model",
     "adaptive_block_size": 24,
@@ -96,8 +96,8 @@
     "min_contour_area": 451,
     "max_contour_area": 50001,
     "morph_kernel_size": 3,
-    "brightness": 7,
-    "contrast": 1.0,
+    "brightness": 19,
+    "contrast": 0.8,
     "zoom": 1.0,
     "tune_live": false,
     "preview_pick_zone": true,
@@ -111,11 +111,24 @@
       ],
       "square_size_mm": 25.0
     },
-    "model_path": "MOCK",
+    "model_path": "D:/ARYA/SEMESTER 8/TA/PAROL6/PAROL6_app/vision/models/best.onnx",
     "model_conf_threshold": 0.5,
     "model_iou_threshold": 0.45,
     "safe_pick_margin_pct": 0.15,
-    "marginal_confirm_timeout_s": 2
+    "marginal_confirm_timeout_s": 2,
+    "offset_x_mm": 0.0,
+    "offset_y_mm": 0.0,
+    "auto_insert_pre_post": true,
+    "pre_pick_joints_deg": [
+      90.0,
+      -144.683,
+      108.171,
+      2.222,
+      25.003,
+      180.0
+    ],
+    "post_pick_descent_mm": 50.0,
+    "post_pick_move_time_s": 2.0
   },
   "workspace": {
     "x_min_mm": -200,

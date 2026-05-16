@@ -5,6 +5,7 @@ from .shared_struct import RobotOutputData, RobotInputData
 from . import PAROL6_ROBOT
 import numpy as np
 from spatialmath import SE3
+from backend.ik_solver import solve_ik
 
 def move_joints(cmd_data: RobotOutputData, robot_data: RobotInputData,
                 joint_ids: List[int], speeds: List[int]) -> str:
@@ -81,18 +82,23 @@ def cartesian_jog(cmd_data: RobotOutputData,
     if rz != 0:
         T = T * SE3.Rz(rz, unit='deg'); log += f", Rz={rz:.1f}°"
 
-    # IK
-    sol = PAROL6_ROBOT.robot.ikine_LMS(T, q0=q1, ilimit=10)
-    if not getattr(sol, "success", False):
-        for i in range(6): 
+    # IK (enhanced solver: jogging mode → no subdivision, fixed strict tol,
+    # ilimit=20, unwrap_angles applied to result)
+    result = solve_ik(
+        PAROL6_ROBOT.robot,
+        T,
+        q1,
+        jogging=True,
+        joint_limits_radian=PAROL6_ROBOT.Joint_limits_radian,
+    )
+    if not result.success:
+        for i in range(6):
             cmd_data.speed[i] = 0
         cmd_data.command.value = 123
         return f"Warning: IK failed: {dx:.4f}, {dy:.4f}, {dz:.4f}"
 
-    q2    = sol.q if hasattr(sol, 'q') else sol[0]
-    print("q1:", np.rad2deg(q1))
-    print("q2:", np.rad2deg(q2))
-    dq = (q2-q1)
+    q2 = np.asarray(result.q, dtype=float)
+    dq = (q2 - q1)
 
     if dq[5] > 180*np.pi/180:
         dq[5] -= 2*np.pi

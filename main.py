@@ -136,6 +136,11 @@ def main() -> int:
         )
         button.released.connect(control._stop_jog_repeat)
 
+    for _i, _btn in enumerate(control.output_low_buttons):
+        _btn.clicked.connect(lambda _checked=False, p=_i + 1: runtime.set_digital_output(p, False))
+    for _i, _btn in enumerate(control.output_high_buttons):
+        _btn.clicked.connect(lambda _checked=False, p=_i + 1: runtime.set_digital_output(p, True))
+
     control.run_button.clicked.connect(lambda: runtime.run_program(control.program_rows()))
     control.pause_button.clicked.connect(runtime.toggle_program_pause)
     control.stop_button.clicked.connect(runtime.stop_program)
@@ -156,6 +161,15 @@ def main() -> int:
     vision.save_detection_button.clicked.connect(
         lambda: runtime.apply_vision_settings(vision.build_detection_settings(), persist=True)
     )
+    # -- Vision model (ONNX) wiring --
+    if vision.model_load_button is not None:
+        vision.model_load_button.clicked.connect(
+            lambda: _load_vision_model(runtime, vision, persist=False)
+        )
+    if vision.model_save_button is not None:
+        vision.model_save_button.clicked.connect(
+            lambda: _load_vision_model(runtime, vision, persist=True)
+        )
     vision.save_pick_zone_button.clicked.connect(
         lambda: runtime.save_pick_zone_settings(vision.build_pick_zone_settings())
     )
@@ -229,6 +243,10 @@ def _handle_runtime_snapshot(window: MainWindow):
         robot_data = snapshot.get("robot_data", {})
         positions = robot_data.get("position", [0, 0, 0, 0, 0, 0])
         window.control_tab.update_simulation_status(positions)
+        inputs = robot_data.get("inout", [0] * 8)
+        cmd_data = snapshot.get("cmd_data", {})
+        outputs = cmd_data.get("inout", inputs)
+        window.control_tab.update_io_state(inputs, outputs)
 
     return _slot
 
@@ -236,6 +254,21 @@ def _handle_runtime_snapshot(window: MainWindow):
 def _run_vision_calibration(runtime: AppRuntime, vision_tab) -> None:
     chessboard_size, square_size_mm = vision_tab.calibration_request()
     runtime.run_vision_calibration(chessboard_size, square_size_mm)
+
+
+def _load_vision_model(runtime: AppRuntime, vision_tab, persist: bool) -> None:
+    """Trigger an ONNX model (re)load from the Vision tab and mirror status.
+
+    Without this, the Vision tab's "Load Model" / "Save Config" buttons were
+    inert: clicking them did nothing, so the live feed kept silently running
+    contour detection even in model mode.
+    """
+    settings = vision_tab.build_model_settings()
+    if vision_tab.model_status_label is not None:
+        vision_tab.update_model_status("LOADING")
+    result = runtime.load_vision_model(settings, persist=persist)
+    status = "LOADED" if result == "LOADED" else "FAILED"
+    vision_tab.update_model_status(status)
 
 
 def _save_modbus_config(runtime: AppRuntime, modbus_tab) -> None:

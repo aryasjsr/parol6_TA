@@ -51,27 +51,40 @@ class SafePickValidator:
             return "UNKNOWN", (int(round(s_cx)), int(round(s_cy)))
 
         f = np.asarray(fixture_box, dtype=np.float64)
+        sx1, sy1, sx2, sy2 = s
+        fx1, fy1, fx2, fy2 = f
 
-        # Per-side overlap subtraction
-        safe_x1 = max(s[0], f[2])
-        safe_x2 = min(s[2], f[0])
-        safe_y1 = max(s[1], f[3])
-        safe_y2 = min(s[3], f[1])
+        # Build up to 4 candidate safe regions: parts of selongsong NOT
+        # overlapping fixture. Each candidate is a rectangle that lies on the
+        # selongsong but on one side of the fixture (LEFT, RIGHT, TOP, BOTTOM).
+        candidates: list[tuple[float, float, float, float]] = []
+        if fx1 > sx1:  # LEFT of fixture
+            candidates.append((sx1, sy1, min(sx2, fx1), sy2))
+        if fx2 < sx2:  # RIGHT of fixture
+            candidates.append((max(sx1, fx2), sy1, sx2, sy2))
+        if fy1 > sy1:  # TOP of fixture
+            candidates.append((sx1, sy1, sx2, min(sy2, fy1)))
+        if fy2 < sy2:  # BOTTOM of fixture
+            candidates.append((sx1, max(sy1, fy2), sx2, sy2))
 
-        # If fixture covers all sides, fallback to margin from centroid
-        if safe_x2 <= safe_x1 or safe_y2 <= safe_y1:
-            margin_x = s_w * margin_pct
-            margin_y = s_h * margin_pct
-            safe_x1 = s_cx - margin_x
-            safe_x2 = s_cx + margin_x
-            safe_y1 = s_cy - margin_y
-            safe_y2 = s_cy + margin_y
+        # Drop degenerate candidates with zero/negative dimensions
+        candidates = [
+            c for c in candidates if (c[2] - c[0]) > 0 and (c[3] - c[1]) > 0
+        ]
 
-        pick_u = int(round((safe_x1 + safe_x2) / 2.0))
-        pick_v = int(round((safe_y1 + safe_y2) / 2.0))
+        if not candidates:
+            # Selongsong fully covered by fixture on all sides
+            return "UNSAFE", None
 
-        zone_w = safe_x2 - safe_x1
-        zone_h = safe_y2 - safe_y1
+        # Pick candidate with the largest area = most room to grasp
+        best = max(candidates, key=lambda c: (c[2] - c[0]) * (c[3] - c[1]))
+        bx1, by1, bx2, by2 = best
+
+        pick_u = int(round((bx1 + bx2) / 2.0))
+        pick_v = int(round((by1 + by2) / 2.0))
+
+        zone_w = bx2 - bx1
+        zone_h = by2 - by1
         min_safe = min(s_w, s_h) * margin_pct
 
         if zone_w < min_safe or zone_h < min_safe:

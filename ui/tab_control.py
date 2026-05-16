@@ -4,7 +4,8 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QUrl, QTimer
+from PyQt6.QtCore import Qt, QUrl, QTimer, QRegularExpression
+from PyQt6.QtGui import QColor, QFont, QSyntaxHighlighter, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -17,9 +18,12 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
+    QPlainTextEdit,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QSlider,
     QSplitter,
@@ -29,10 +33,13 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem,
     QTextEdit,
     QToolButton,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 from program.program_model import ProgramCommand, ProgramModel
+from backend.config_manager import ConfigManager
 
 try:
     from backend.simulator_bridge import RobotCanvas
@@ -41,72 +48,152 @@ except Exception:
 
 
 COMMAND_LIBRARY: dict[str, dict[str, str]] = {
-    "start": {
+    "Begin": {
         "parameters": "-",
-        "notes": "Program boundary",
-        "hint": "Penanda awal program.",
+        "notes": "Program start",
+        "hint": "Penanda awal program. Harus ada di baris pertama.",
+        "template": "Begin()",
     },
     "MoveJoint": {
-        "parameters": "j1=0, j2=0, j3=0, j4=0, j5=0, j6=0, speed_pct=30",
+        "parameters": "j1,j2,j3,j4,j5,j6,t=4",
         "notes": "Move all joints in deg",
-        "hint": "Gunakan derajat untuk j1..j6 dan speed_pct 0..100.",
+        "hint": "6 joint angles (deg). Opsional: v=%, a=%, t=detik, trap/poly.",
+        "template": "MoveJoint({j1},{j2},{j3},{j4},{j5},{j6},t=4)",
+    },
+    "MovePose": {
+        "parameters": "x,y,z,rx,ry,rz,t=4",
+        "notes": "IK move via cartesian pose",
+        "hint": "x,y,z (mm), rx,ry,rz (deg). Gerak di joint-space via IK.",
+        "template": "MovePose({x},{y},{z},{rx},{ry},{rz},t=4)",
     },
     "MoveCart": {
-        "parameters": "x=0, y=0, z=200, r=0, p=0, yaw=0, speed_pct=30",
-        "notes": "Move to absolute pose",
-        "hint": "x,y,z dalam mm. r,p,yaw dalam deg.",
+        "parameters": "x,y,z,rx,ry,rz,t=4",
+        "notes": "Cartesian linear move",
+        "hint": "x,y,z (mm), rx,ry,rz (deg). Gerak linear di cartesian.",
+        "template": "MoveCart({x},{y},{z},{rx},{ry},{rz},t=4)",
     },
     "MoveCartRelTRF": {
-        "parameters": "dx=0, dy=0, dz=10, dr=0, dp=0, dyaw=0, speed_pct=30",
+        "parameters": "dx,dy,dz,dr,dp,dyaw,t=4",
         "notes": "Move relative to tool frame",
-        "hint": "dx,dy,dz dalam mm. dr,dp,dyaw dalam deg.",
+        "hint": "dx,dy,dz (mm), dr,dp,dyaw (deg). Relatif terhadap tool.",
+        "template": "MoveCartRelTRF(0,0,0,0,0,0,t=4)",
     },
-    "vision": {
-        "parameters": "-",
-        "notes": "Run vision-guided pick",
-        "hint": "Menjalankan pick berbasis vision dengan setting aktif.",
+    "SpeedJoint": {
+        "parameters": "v=50, a=30",
+        "notes": "Set joint speed/accel %",
+        "hint": "v=kecepatan %, a=akselerasi %. Berlaku untuk command berikutnya.",
+        "template": "SpeedJoint(v=50,a=30)",
     },
     "Home": {
         "parameters": "-",
         "notes": "Move robot to home",
         "hint": "Kirim robot ke posisi home.",
-    },
-    "Gripper": {
-        "parameters": "state=open",
-        "notes": "Control gripper state",
-        "hint": "Gunakan state=open atau state=close.",
-    },
-    "Output": {
-        "parameters": "n=1, state=ON",
-        "notes": "Set digital output",
-        "hint": "n adalah nomor output, state bisa ON/OFF.",
-    },
-    "Input": {
-        "parameters": "n=1, value=1, timeout_s=10",
-        "notes": "Wait for digital input",
-        "hint": "Menunggu input bernilai 1/0 sampai timeout_s.",
+        "template": "Home()",
     },
     "Delay": {
-        "parameters": "ms=500",
+        "parameters": "seconds",
         "notes": "Pause execution",
-        "hint": "Delay dalam milidetik.",
+        "hint": "Delay dalam detik (contoh: Delay(1.5)).",
+        "template": "Delay(1)",
     },
     "Loop": {
-        "parameters": "count=2",
-        "notes": "Repeat following block",
-        "hint": "Jumlah pengulangan blok sampai EndLoop.",
-    },
-    "EndLoop": {
         "parameters": "-",
-        "notes": "Close loop block",
-        "hint": "Penutup untuk Loop().",
+        "notes": "Loop back to Begin",
+        "hint": "Kembali ke Begin() (infinite loop). Taruh di akhir program.",
+        "template": "Loop()",
     },
-    "end": {
+    "End": {
         "parameters": "-",
-        "notes": "Program boundary",
-        "hint": "Penanda akhir program.",
+        "notes": "Program end",
+        "hint": "Penanda akhir program. Program berhenti di sini.",
+        "template": "End()",
+    },
+    "Input": {
+        "parameters": "pin, value",
+        "notes": "Wait for digital input",
+        "hint": "Menunggu input pin bernilai HIGH/LOW.",
+        "template": "Input(1,HIGH)",
+    },
+    "Output": {
+        "parameters": "pin, state",
+        "notes": "Set digital output",
+        "hint": "Set output pin ke HIGH atau LOW.",
+        "template": "Output(1,HIGH)",
+    },
+    "Gripper": {
+        "parameters": "position, speed, force",
+        "notes": "Control gripper",
+        "hint": "position 0-255, speed 0-255, force 100-1000.",
+        "template": "Gripper(255,100,120)",
+    },
+    "Gripper_cal": {
+        "parameters": "-",
+        "notes": "Calibrate gripper",
+        "hint": "Menjalankan kalibrasi gripper.",
+        "template": "Gripper_cal()",
+    },
+    "vision": {
+        "parameters": "-",
+        "notes": "Vision-guided pick",
+        "hint": "Menjalankan pick berbasis vision dengan setting aktif.",
+        "template": "vision()",
+    },
+    "Dummy": {
+        "parameters": "-",
+        "notes": "No-op / testing",
+        "hint": "Perintah dummy untuk testing. Tidak melakukan apa-apa.",
+        "template": "Dummy()",
     },
 }
+
+COMMAND_TREE_STRUCTURE: list[tuple[str, list[str]]] = [
+    ("Joint Space", ["MoveJoint", "MovePose", "SpeedJoint"]),
+    ("Cartesian Space", ["MoveCart", "MoveCartRelTRF"]),
+    ("Program Flow", ["Begin", "End", "Loop", "Delay"]),
+    ("I/O", ["Input", "Output"]),
+    ("Gripper", ["Gripper", "Gripper_cal"]),
+    ("Vision", ["vision"]),
+    ("Misc", ["Home", "Dummy"]),
+]
+
+
+class ProgramSyntaxHighlighter(QSyntaxHighlighter):
+    """Syntax highlighter for PAROL6 program text editor."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._rules: list[tuple[QRegularExpression, QTextCharFormat]] = []
+
+        # Keywords (command names) → green
+        keyword_format = QTextCharFormat()
+        keyword_format.setForeground(QColor("#4ADE80"))
+        keyword_format.setFontWeight(QFont.Weight.Bold)
+        keywords = list(COMMAND_LIBRARY.keys())
+        for word in keywords:
+            pattern = QRegularExpression(rf"\b{word}\b")
+            self._rules.append((pattern, keyword_format))
+
+        # Numbers → cyan
+        number_format = QTextCharFormat()
+        number_format.setForeground(QColor("#38BDF8"))
+        self._rules.append((QRegularExpression(r"-?\b\d+(?:\.\d+)?\b"), number_format))
+
+        # Parentheses → yellow
+        paren_format = QTextCharFormat()
+        paren_format.setForeground(QColor("#FBBF24"))
+        self._rules.append((QRegularExpression(r"[()]"), paren_format))
+
+        # Named params (key=) → light purple
+        param_format = QTextCharFormat()
+        param_format.setForeground(QColor("#A78BFA"))
+        self._rules.append((QRegularExpression(r"\b\w+=(?=[^=])"), param_format))
+
+    def highlightBlock(self, text: str) -> None:
+        for pattern, fmt in self._rules:
+            iterator = pattern.globalMatch(text)
+            while iterator.hasNext():
+                match = iterator.next()
+                self.setFormat(match.capturedStart(), match.capturedLength(), fmt)
 
 
 def _render_parameter_text(args: list[object], kwargs: dict[str, object]) -> str:
@@ -311,8 +398,9 @@ class ControlTab(QWidget):
         super().__init__()
         self.response_log = QTextEdit()
         self.safety_label = QLabel("NORMAL")
-        self.program_table = QTableWidget(0, 4)
-        self.generated_script = QTextEdit()
+        self.program_editor = QPlainTextEdit()
+        self.program_table = QTableWidget(0, 4)  # kept for backward compat
+        self.generated_script = QTextEdit()  # kept for backward compat
         self.current_line_value = QLabel("-")
         self.simulation_view: RobotCanvas | None = None
         self.simulation_view_rt: RobotCanvas | None = None
@@ -337,9 +425,21 @@ class ControlTab(QWidget):
         self.cart_plus_buttons: dict[str, QPushButton] = {}
         self.cart_value_labels: dict[str, QLabel] = {}
         self.jog_source_label = QLabel("Jog source: NONE")
+        self.input_state_labels: list[QLabel] = []
+        self.output_state_labels: list[QLabel] = []
+        self.output_low_buttons: list[QPushButton] = []
+        self.output_high_buttons: list[QPushButton] = []
         self.simulation_status_label = QLabel("Joint state: --")
         self.preview_joint_labels: list[QLabel] = []
         self.realtime_joint_labels: list[QLabel] = []
+        self.command_tree: QTreeWidget | None = None
+        self.command_hint_label: QLabel | None = None
+        self.commands_toggle_button: QPushButton | None = None
+        self.command_palette_group: QGroupBox | None = None
+        self._teaching_mode = "current"  # "current" or "custom"
+        self._current_file_path: str = ""  # path of currently open .txt
+        self._highlighter: ProgramSyntaxHighlighter | None = None
+        self._highlight_extra_selection = None
 
         # --- Auto-repeat jog timer ---
         self._jog_repeat_timer = QTimer(self)
@@ -407,8 +507,8 @@ class ControlTab(QWidget):
         layout.addWidget(CollapsibleSection("ROBOT ACTIONS", self._build_robot_actions_group()))
         layout.addWidget(CollapsibleSection("JOINT JOG", self._build_joint_jog_group()))
         layout.addWidget(CollapsibleSection("CARTESIAN JOG", self._build_cartesian_group()))
+        layout.addWidget(CollapsibleSection("DIGITAL I/O", self._build_io_group()))
         layout.addWidget(CollapsibleSection("FAILSAFE", self._build_failsafe_group()))
-        layout.addWidget(CollapsibleSection("RESPONSE LOG", self._build_response_log_group()))
         scroll.setWidget(panel)
         scroll.setMinimumWidth(340)
         return scroll
@@ -419,8 +519,33 @@ class ControlTab(QWidget):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
-        layout.addWidget(self._build_program_group(), 3)
-        layout.addWidget(self._build_generated_script_group(), 2)
+
+        center_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.command_palette_group = self._build_command_palette()
+        center_splitter.addWidget(self.command_palette_group)
+        center_splitter.addWidget(self._build_program_editor_group())
+        center_splitter.setStretchFactor(0, 0)
+        center_splitter.setStretchFactor(1, 1)
+        center_splitter.setSizes([220, 500])
+        center_splitter.setCollapsible(0, True)
+        center_splitter.setCollapsible(1, False)
+
+        vertical_splitter = QSplitter(Qt.Orientation.Vertical)
+        vertical_splitter.addWidget(center_splitter)
+        self.response_log_section = CollapsibleSection(
+            "RESPONSE LOG", self._build_response_log_group(), expanded=True
+        )
+        vertical_splitter.addWidget(self.response_log_section)
+        vertical_splitter.setStretchFactor(0, 1)
+        vertical_splitter.setStretchFactor(1, 0)
+        vertical_splitter.setSizes([500, 160])
+        vertical_splitter.setCollapsible(0, False)
+        vertical_splitter.setCollapsible(1, True)
+        vertical_splitter.setHandleWidth(6)
+        vertical_splitter.setStyleSheet(
+            "QSplitter::handle { background: #1E2A45; border-radius: 2px; }"
+        )
+        layout.addWidget(vertical_splitter, 1)
         return panel
 
     def _build_right_panel(self) -> QWidget:
@@ -565,6 +690,77 @@ class ControlTab(QWidget):
         layout.setColumnStretch(2, 1)
         return group
 
+    def _build_io_group(self) -> QWidget:
+        group = self._create_section_frame()
+        layout = QGridLayout(group)
+        self._configure_grid_section(layout)
+
+        # Inputs (read-only)
+        for i, name in enumerate(["INPUT 1", "INPUT 2"]):
+            name_lbl = QLabel(name)
+            state_lbl = QLabel("LOW")
+            state_lbl.setStyleSheet(
+                "color: #8A9AB8; font-weight: 700;"
+                "font-family: 'Consolas', 'Courier New', monospace;"
+            )
+            state_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.input_state_labels.append(state_lbl)
+            layout.addWidget(name_lbl, i, 0)
+            layout.addWidget(state_lbl, i, 1, 1, 2)
+
+        # Outputs (with LOW / HIGH buttons)
+        for i, name in enumerate(["OUTPUT 1", "OUTPUT 2"]):
+            row = 2 + i
+            name_lbl = QLabel(name)
+            state_lbl = QLabel("LOW")
+            state_lbl.setStyleSheet(
+                "color: #8A9AB8; font-weight: 700;"
+                "font-family: 'Consolas', 'Courier New', monospace;"
+            )
+            state_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            state_lbl.setMinimumWidth(56)
+            low_btn = QPushButton("LOW")
+            high_btn = QPushButton("HIGH")
+            high_btn.setProperty("role", "primary")
+            self.output_state_labels.append(state_lbl)
+            self.output_low_buttons.append(low_btn)
+            self.output_high_buttons.append(high_btn)
+            layout.addWidget(name_lbl, row, 0)
+            layout.addWidget(state_lbl, row, 1)
+            layout.addWidget(low_btn, row, 2)
+            layout.addWidget(high_btn, row, 3)
+
+        layout.setColumnStretch(1, 1)
+        return group
+
+    def update_io_state(self, inputs: list[int], outputs: list[int]) -> None:
+        """Refresh INPUT/OUTPUT state labels from a runtime snapshot.
+
+        inputs[0],inputs[1] map to INPUT 1, INPUT 2 (inout indices 0,1).
+        outputs[2],outputs[3] map to OUTPUT 1, OUTPUT 2 (inout indices 2,3).
+        """
+        def _style(label: QLabel, value: int) -> None:
+            if value:
+                label.setText("HIGH")
+                label.setStyleSheet(
+                    "color: #4ADE80; font-weight: 700;"
+                    "font-family: 'Consolas', 'Courier New', monospace;"
+                )
+            else:
+                label.setText("LOW")
+                label.setStyleSheet(
+                    "color: #8A9AB8; font-weight: 700;"
+                    "font-family: 'Consolas', 'Courier New', monospace;"
+                )
+
+        for i in range(min(2, len(self.input_state_labels))):
+            if i < len(inputs):
+                _style(self.input_state_labels[i], int(inputs[i]))
+        for i in range(min(2, len(self.output_state_labels))):
+            idx = 2 + i  # OUTPUT 1 -> inout[2], OUTPUT 2 -> inout[3]
+            if idx < len(outputs):
+                _style(self.output_state_labels[i], int(outputs[idx]))
+
     def _build_failsafe_group(self) -> QWidget:
         group = self._create_section_frame()
         layout = QGridLayout(group)
@@ -585,67 +781,114 @@ class ControlTab(QWidget):
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
         self.response_log.setReadOnly(True)
-        self.response_log.setMinimumHeight(120)
+        self.response_log.setMinimumHeight(80)
         layout.addWidget(self.response_log)
         return group
 
-    def _build_program_group(self) -> QGroupBox:
+    def _build_command_palette(self) -> QGroupBox:
+        group = QGroupBox("COMMANDS")
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(6, 10, 6, 6)
+        layout.setSpacing(6)
+
+        # Teaching mode radio buttons
+        teaching_frame = QFrame()
+        teaching_layout = QVBoxLayout(teaching_frame)
+        teaching_layout.setContentsMargins(4, 4, 4, 4)
+        teaching_layout.setSpacing(4)
+        self._radio_current = QRadioButton("Current Position")
+        self._radio_custom = QRadioButton("Custom Position")
+        self._radio_current.setChecked(True)
+        self._radio_current.toggled.connect(self._on_teaching_mode_changed)
+        teaching_layout.addWidget(self._radio_current)
+        teaching_layout.addWidget(self._radio_custom)
+        layout.addWidget(teaching_frame)
+
+        # Command tree
+        self.command_tree = QTreeWidget()
+        self.command_tree.setHeaderLabels(["Commands"])
+        self.command_tree.setMinimumWidth(180)
+        self.command_tree.setIndentation(16)
+        for category_name, commands in COMMAND_TREE_STRUCTURE:
+            category_item = QTreeWidgetItem([category_name])
+            category_item.setFlags(category_item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            for cmd_name in commands:
+                child = QTreeWidgetItem([cmd_name])
+                child.setData(0, Qt.ItemDataRole.UserRole, cmd_name)
+                category_item.addChild(child)
+            self.command_tree.addTopLevelItem(category_item)
+            category_item.setExpanded(True)
+        self.command_tree.itemClicked.connect(self._on_command_tree_clicked)
+        layout.addWidget(self.command_tree, 1)
+
+        # Hint label
+        self.command_hint_label = QLabel("Klik command untuk insert ke program.")
+        self.command_hint_label.setWordWrap(True)
+        self.command_hint_label.setStyleSheet("color: #8A9AB8; font-size: 11px; padding: 4px;")
+        layout.addWidget(self.command_hint_label)
+
+        # Park button
+        self.park_button = QPushButton("Park")
+        self.park_button.setProperty("role", "ghost")
+        self.park_button.clicked.connect(self._insert_park_program)
+        layout.addWidget(self.park_button)
+
+        group.setMaximumWidth(260)
+        return group
+
+    def _build_program_editor_group(self) -> QGroupBox:
         group = QGroupBox("PROGRAM EDITOR")
         layout = QVBoxLayout(group)
+        layout.setContentsMargins(6, 10, 6, 6)
+        layout.setSpacing(6)
 
-        toolbar = QHBoxLayout()
-        self.add_button = self._create_toolbar_button("Add", "primary", self._add_command)
-        self.delete_button = self._create_toolbar_button(
-            "Delete", "danger", self._delete_selected_command
-        )
-        self.move_up_button = self._create_toolbar_button("Move Up", None, self._move_selected_up)
-        self.move_down_button = self._create_toolbar_button(
-            "Move Down", None, self._move_selected_down
-        )
-        self.import_button = self._create_toolbar_button("Import JSON", None, self._import_program)
-        self.export_button = self._create_toolbar_button("Export JSON", None, self._export_program)
-        self.run_button = self._create_toolbar_button("Run", "primary", self._run_program)
+        # File toolbar
+        file_toolbar = QHBoxLayout()
+        self.commands_toggle_button = QPushButton("Commands")
+        self.commands_toggle_button.setCheckable(True)
+        self.commands_toggle_button.setChecked(True)
+        self.commands_toggle_button.toggled.connect(self._toggle_commands_visibility)
+        self.open_button = self._create_toolbar_button("Open", None, self._open_program)
+        self.save_button = self._create_toolbar_button("Save", None, self._save_program)
+        self.save_as_button = self._create_toolbar_button("Save As", None, self._save_as_program)
+        
+        file_toolbar.addWidget(self.commands_toggle_button)
+        for btn in [self.open_button, self.save_button, self.save_as_button]:
+            file_toolbar.addWidget(btn)
+        file_toolbar.addStretch(1)
+        layout.addLayout(file_toolbar)
+
+        # Execution toolbar
+        exec_toolbar = QHBoxLayout()
+        self.run_button = self._create_toolbar_button("Start", "primary", self._run_program)
         self.pause_button = self._create_toolbar_button("Pause", None, self._pause_program)
         self.stop_button = self._create_toolbar_button("Stop", "danger", self._stop_program)
         self.step_button = self._create_toolbar_button("Step", None, self._step_program)
-        for button in [
-            self.add_button,
-            self.delete_button,
-            self.move_up_button,
-            self.move_down_button,
-            self.import_button,
-            self.export_button,
-            self.run_button,
-            self.pause_button,
-            self.stop_button,
-            self.step_button,
-        ]:
-            toolbar.addWidget(button)
-        toolbar.addStretch(1)
-        layout.addLayout(toolbar)
+        for btn in [self.run_button, self.pause_button, self.stop_button, self.step_button]:
+            exec_toolbar.addWidget(btn)
+        exec_toolbar.addStretch(1)
+        layout.addLayout(exec_toolbar)
 
-        self.program_table.setHorizontalHeaderLabels(["No", "Command", "Parameters", "Notes"])
-        self.program_table.setAlternatingRowColors(True)
-        self.program_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.program_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.program_table.verticalHeader().setVisible(False)
-        self.program_table.cellDoubleClicked.connect(self._edit_command)
-        self._append_program_row("start", "-", "Program boundary")
-        layout.addWidget(self.program_table, 1)
+        # Text editor with syntax highlighting
+        self.program_editor.setFont(QFont("Consolas", 12))
+        self.program_editor.setStyleSheet(
+            "QPlainTextEdit { background-color: #0D1B35; color: #E8EDF5; "
+            "border: 1px solid #243D6B; border-radius: 4px; padding: 6px; }"
+        )
+        self.program_editor.setPlainText("Begin()\n\nEnd()\n")
+        self.program_editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self._highlighter = ProgramSyntaxHighlighter(self.program_editor.document())
+        layout.addWidget(self.program_editor, 1)
 
+        # Status row
         status_row = QHBoxLayout()
-        status_row.addWidget(QLabel("Current executing line:"))
+        status_row.addWidget(QLabel("Executing line:"))
         status_row.addWidget(self.current_line_value)
+        self._file_label = QLabel("")
+        self._file_label.setStyleSheet("color: #8A9AB8; font-size: 10px;")
         status_row.addStretch(1)
+        status_row.addWidget(self._file_label)
         layout.addLayout(status_row)
-        self._sync_generated_script()
-        return group
-
-    def _build_generated_script_group(self) -> QGroupBox:
-        group = QGroupBox("GENERATED SCRIPT")
-        layout = QVBoxLayout(group)
-        self.generated_script.setReadOnly(True)
-        layout.addWidget(self.generated_script)
         return group
 
     def _build_simulation_group(self) -> QFrame:
@@ -825,6 +1068,11 @@ class ControlTab(QWidget):
         is_visible = self.simulation_content.isVisible()
         self.simulation_content.setVisible(not is_visible)
 
+    def _toggle_commands_visibility(self, checked: bool) -> None:
+        if self.command_palette_group is None:
+            return
+        self.command_palette_group.setVisible(checked)
+
     # --- Auto-repeat jog helpers ---
     def _start_jog_repeat(self, callback) -> None:
         """Begin auto-repeating *callback* while button is held."""
@@ -931,27 +1179,23 @@ class ControlTab(QWidget):
                     self.joint_slider_value_labels[i].setText(f"{deg:.1f}°")
 
     def program_rows(self) -> list[dict[str, str]]:
-        """Return the current program table content in row-dict form."""
+        """Return the current program text parsed into row-dict form."""
         return self._serialize_program()
 
     def selected_program_line(self) -> int:
-        """Return the selected program line or the current line label as a 1-based integer."""
-        row = self.program_table.currentRow()
-        if row >= 0:
-            return row + 1
-        current = self.current_line_value.text().strip()
-        if current.isdigit():
-            return int(current)
-        return 1
+        """Return the current cursor line in the text editor as 1-based."""
+        cursor = self.program_editor.textCursor()
+        return cursor.blockNumber() + 1
 
     def set_execution_line(self, line_number: int | None) -> None:
-        """Update the highlighted execution line in the program table."""
-        if line_number is None or line_number <= 0 or line_number > self.program_table.rowCount():
+        """Highlight the currently executing line in the text editor."""
+        line_count = self.program_editor.document().blockCount()
+        if line_number is None or line_number <= 0 or line_number > line_count:
             self.current_line_value.setText("-")
-            self.program_table.clearSelection()
+            self._clear_line_highlight()
             return
         self.current_line_value.setText(str(line_number))
-        self.program_table.selectRow(line_number - 1)
+        self._highlight_line(line_number)
 
     def update_program_state(self, state: str) -> None:
         """Reflect program execution state in toolbar controls."""
@@ -963,9 +1207,54 @@ class ControlTab(QWidget):
         self.stop_button.setEnabled(is_running or is_paused)
         self.pause_button.setEnabled(is_running or is_paused)
         self.pause_button.setText("Resume" if is_paused else "Pause")
+        self.program_editor.setReadOnly(is_running or is_paused)
         if normalized == "idle":
             self.current_line_value.setText("-")
-            self.program_table.clearSelection()
+            self._clear_line_highlight()
+            self.program_editor.setReadOnly(False)
+
+    def get_live_joint_degrees(self) -> list[float] | None:
+        """Return live joint angles in degrees from the appropriate labels.
+
+        In preview mode reads from preview_joint_labels (sim state);
+        otherwise reads from realtime_joint_labels (hardware state).
+        Returns None if data is not available yet.
+        Called by teaching feature to capture current position.
+        """
+        is_preview = (
+            hasattr(self, "preview_mode_button")
+            and self.preview_mode_button.isChecked()
+        )
+        source_labels = (
+            self.preview_joint_labels if is_preview else self.realtime_joint_labels
+        )
+        try:
+            values = []
+            for label in source_labels:
+                text = label.text().strip()
+                if text == "--":
+                    return None
+                values.append(float(text))
+            if len(values) == 6:
+                return values
+        except (ValueError, IndexError):
+            pass
+        return None
+
+    def get_live_cartesian(self) -> dict[str, float] | None:
+        """Return live cartesian position from cart_value_labels."""
+        try:
+            result = {}
+            for axis in ["X", "Y", "Z", "Rx", "Ry", "Rz"]:
+                lbl = self.cart_value_labels.get(axis)
+                if lbl is None:
+                    return None
+                result[axis] = float(lbl.text())
+            return result
+        except (ValueError, AttributeError):
+            return None
+
+    # --- Toolbar helpers ---
 
     def _create_toolbar_button(
         self,
@@ -979,57 +1268,110 @@ class ControlTab(QWidget):
         button.clicked.connect(handler)
         return button
 
-    def _add_command(self) -> None:
-        dialog = CommandDialog(parent=self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        command, parameters, notes = dialog.values()
-        if not command:
-            return
-        self._append_program_row(command, parameters or "-", notes)
-        self._sync_generated_script()
-        self.append_log(f"Command added: {command}")
+    # --- Teaching & command palette ---
 
-    def _edit_command(self, row: int, _: int) -> None:
-        command = self.program_table.item(row, 1).text() if self.program_table.item(row, 1) else ""
-        parameters = self.program_table.item(row, 2).text() if self.program_table.item(row, 2) else ""
-        notes = self.program_table.item(row, 3).text() if self.program_table.item(row, 3) else ""
-        dialog = CommandDialog(command, parameters, notes, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        updated_command, updated_parameters, updated_notes = dialog.values()
-        if not updated_command:
-            return
-        self.program_table.setItem(row, 1, QTableWidgetItem(updated_command))
-        self.program_table.setItem(row, 2, QTableWidgetItem(updated_parameters or "-"))
-        self.program_table.setItem(row, 3, QTableWidgetItem(updated_notes))
-        self._sync_generated_script()
-        self.append_log(f"Command updated on line {row + 1}")
+    def _on_teaching_mode_changed(self, checked: bool) -> None:
+        self._teaching_mode = "current" if checked else "custom"
 
-    def _delete_selected_command(self) -> None:
-        row = self.program_table.currentRow()
-        if row < 0:
+    def _on_command_tree_clicked(self, item: QTreeWidgetItem, column: int) -> None:
+        cmd_name = item.data(0, Qt.ItemDataRole.UserRole)
+        if cmd_name is None:
             return
-        self.program_table.removeRow(row)
-        self._renumber_rows()
-        self._sync_generated_script()
-        self.append_log(f"Command deleted from line {row + 1}", "warn")
+        spec = COMMAND_LIBRARY.get(cmd_name)
+        if spec:
+            self.command_hint_label.setText(spec["hint"])
+        self._insert_command(cmd_name)
 
-    def _move_selected_up(self) -> None:
-        row = self.program_table.currentRow()
-        if row <= 0:
-            return
-        self._swap_rows(row, row - 1)
-        self.program_table.selectRow(row - 1)
-        self._sync_generated_script()
+    def _insert_command(self, cmd_name: str) -> None:
+        """Insert a command at the cursor in the text editor."""
+        spec = COMMAND_LIBRARY.get(cmd_name, {})
 
-    def _move_selected_down(self) -> None:
-        row = self.program_table.currentRow()
-        if row < 0 or row >= self.program_table.rowCount() - 1:
+        if cmd_name == "vision":
+            lines_to_insert = self._build_vision_block()
+        elif self._teaching_mode == "current":
+            if cmd_name == "MoveJoint":
+                joints = self.get_live_joint_degrees()
+                if joints:
+                    line = f"MoveJoint({','.join(f'{v:.3f}' for v in joints)},t=4)"
+                else:
+                    line = spec.get("template", f"{cmd_name}()")
+            elif cmd_name in ("MovePose", "MoveCart"):
+                cart = self.get_live_cartesian()
+                if cart:
+                    line = (f"{cmd_name}({cart['X']:.3f},{cart['Y']:.3f},{cart['Z']:.3f},"
+                            f"{cart['Rx']:.3f},{cart['Ry']:.3f},{cart['Rz']:.3f},t=4)")
+                else:
+                    line = spec.get("template", f"{cmd_name}()")
+            elif cmd_name == "MoveCartRelTRF":
+                line = spec.get("template", f"{cmd_name}()")
+            else:
+                line = spec.get("template", f"{cmd_name}()")
+            lines_to_insert = [line]
+        else:
+            lines_to_insert = [f"{cmd_name}()"]
+
+        cursor = self.program_editor.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock)
+        cursor.insertText("\n" + "\n".join(lines_to_insert))
+        self.program_editor.setTextCursor(cursor)
+        self.program_editor.setFocus()
+        if cmd_name == "vision" and len(lines_to_insert) > 1:
+            self.append_log(f"Inserted: vision block ({len(lines_to_insert)} lines)")
+        else:
+            self.append_log(f"Inserted: {cmd_name}")
+
+    def _build_vision_block(self) -> list[str]:
+        """Build the vision command block: pre-pick orientation, vision(), post-pick descent.
+
+        Pre-pick MoveJoint sets J6 to the calibrated grasping orientation so the
+        gripper fingers align perpendicular to the selongsong cylinder axis.
+        Post-pick MoveCartRelTRF descends along tool Z to actually grasp.
+        """
+        cfg = ConfigManager.instance()
+        if not bool(cfg.get("vision.auto_insert_pre_post", True)):
+            return ["vision()"]
+
+        joints = cfg.get("vision.pre_pick_joints_deg",
+                         [90.0, -144.683, 108.171, 2.222, 25.003, 180.0])
+        descent_mm = float(cfg.get("vision.post_pick_descent_mm", 50.0))
+        t_post = float(cfg.get("vision.post_pick_move_time_s", 2.0))
+
+        joints_str = ",".join(f"{float(v):.3f}" for v in joints)
+        return [
+            f"MoveJoint({joints_str},t=4)",
+            "vision()",
+            f"MoveCartRelTRF(0,0,{descent_mm:.3f},0,0,0,t={t_post})",
+        ]
+
+    def _insert_park_program(self) -> None:
+        """Insert a park program (like Commander's Park button)."""
+        self.program_editor.setPlainText(
+            "Begin()\n"
+            "MoveJoint(90.0,-144.683,108.171,2.222,25.003,180.0,t=4)\n"
+            "End()\n"
+        )
+        self.append_log("Park program loaded")
+
+    # --- Line highlight ---
+
+    def _highlight_line(self, line_number: int) -> None:
+        """Highlight a specific line in the text editor."""
+        block = self.program_editor.document().findBlockByLineNumber(line_number - 1)
+        if not block.isValid():
             return
-        self._swap_rows(row, row + 1)
-        self.program_table.selectRow(row + 1)
-        self._sync_generated_script()
+        cursor = QTextCursor(block)
+        cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
+        fmt = QTextCharFormat()
+        fmt.setBackground(QColor("#1E3A5F"))
+        selection = QTextEdit.ExtraSelection()
+        selection.cursor = cursor
+        selection.format = fmt
+        self.program_editor.setExtraSelections([selection])
+
+    def _clear_line_highlight(self) -> None:
+        self.program_editor.setExtraSelections([])
+
+    # --- Execution stubs (signals connected externally in main.py) ---
 
     def _run_program(self) -> None:
         self.current_line_value.setText("1")
@@ -1043,107 +1385,77 @@ class ControlTab(QWidget):
 
     def _stop_program(self) -> None:
         self.current_line_value.setText("-")
+        self._clear_line_highlight()
         self.append_log("Stop requested", "warn")
 
     def _step_program(self) -> None:
-        if self.program_table.rowCount() == 0:
+        line_count = self.program_editor.document().blockCount()
+        if line_count == 0:
             return
         current = self.current_line_value.text()
         if current == "-":
             next_line = 1
         else:
-            next_line = min(int(current) + 1, self.program_table.rowCount())
+            next_line = min(int(current) + 1, line_count)
         self.current_line_value.setText(str(next_line))
-        self.program_table.selectRow(next_line - 1)
+        self._highlight_line(next_line)
         self.append_log(f"Step requested to line {next_line}", "info")
 
-    def _export_program(self) -> None:
-        file_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Export Program",
-            str(Path.home() / "program.json"),
-            "JSON Files (*.json)",
-        )
-        if not file_path:
-            return
-        ProgramModel.from_rows(self._serialize_program()).save_json(file_path)
-        self.append_log(f"Program exported: {file_path}")
+    # --- File operations (.txt, Commander-compatible) ---
 
-    def _import_program(self) -> None:
+    def _open_program(self) -> None:
+        programs_dir = Path(__file__).resolve().parents[1] / "program" / "Programs"
+        programs_dir.mkdir(parents=True, exist_ok=True)
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Import Program",
-            str(Path.home()),
-            "JSON Files (*.json)",
+            "Open Program",
+            str(programs_dir),
+            "Text Files (*.txt);;All Files (*)",
         )
         if not file_path:
             return
-        data = ProgramModel.load_json(file_path).to_rows()
-        self.program_table.setRowCount(0)
-        for row in data:
-            self._append_program_row(
-                row.get("command", ""),
-                row.get("parameters", "-"),
-                row.get("notes", ""),
+        text = Path(file_path).read_text(encoding="utf-8")
+        self.program_editor.setPlainText(text)
+        self._current_file_path = file_path
+        self._file_label.setText(Path(file_path).name)
+        self.append_log(f"Opened: {file_path}")
+
+    def _save_program(self) -> None:
+        if self._current_file_path:
+            Path(self._current_file_path).write_text(
+                self.program_editor.toPlainText(), encoding="utf-8"
             )
-        self._sync_generated_script()
-        self.append_log(f"Program imported: {file_path}")
+            self.append_log(f"Saved: {self._current_file_path}")
+        else:
+            self._save_as_program()
 
-    def _append_program_row(self, command: str, parameters: str, notes: str) -> None:
-        normalized_command, normalized_parameters = _normalize_command_row(command, parameters)
-        row = self.program_table.rowCount()
-        self.program_table.insertRow(row)
-        self.program_table.setItem(row, 0, QTableWidgetItem(str(row + 1)))
-        self.program_table.setItem(row, 1, QTableWidgetItem(normalized_command))
-        self.program_table.setItem(row, 2, QTableWidgetItem(normalized_parameters))
-        self.program_table.setItem(row, 3, QTableWidgetItem(notes))
+    def _save_as_program(self) -> None:
+        programs_dir = Path(__file__).resolve().parents[1] / "program" / "Programs"
+        programs_dir.mkdir(parents=True, exist_ok=True)
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Program As",
+            str(programs_dir / "program.txt"),
+            "Text Files (*.txt);;All Files (*)",
+        )
+        if not file_path:
+            return
+        Path(file_path).write_text(
+            self.program_editor.toPlainText(), encoding="utf-8"
+        )
+        self._current_file_path = file_path
+        self._file_label.setText(Path(file_path).name)
+        self.append_log(f"Saved as: {file_path}")
 
-    def _swap_rows(self, first: int, second: int) -> None:
-        values = []
-        for row in (first, second):
-            values.append([
-                self.program_table.item(row, column).text()
-                if self.program_table.item(row, column) is not None
-                else ""
-                for column in range(1, 4)
-            ])
-        for row, value_set in zip((first, second), reversed(values)):
-            for column, value in enumerate(value_set, start=1):
-                self.program_table.setItem(row, column, QTableWidgetItem(value))
-        self._renumber_rows()
-
-    def _renumber_rows(self) -> None:
-        for row in range(self.program_table.rowCount()):
-            self.program_table.setItem(row, 0, QTableWidgetItem(str(row + 1)))
+    # --- Serialization (text → row dicts for executor compatibility) ---
 
     def _serialize_program(self) -> list[dict[str, str]]:
+        """Parse the text editor content into row-dict form for the executor."""
+        text = self.program_editor.toPlainText()
         rows: list[dict[str, str]] = []
-        for row in range(self.program_table.rowCount()):
-            rows.append(
-                {
-                    "command": self.program_table.item(row, 1).text()
-                    if self.program_table.item(row, 1)
-                    else "",
-                    "parameters": self.program_table.item(row, 2).text()
-                    if self.program_table.item(row, 2)
-                    else "",
-                    "notes": self.program_table.item(row, 3).text()
-                    if self.program_table.item(row, 3)
-                    else "",
-                }
-            )
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            rows.append({"command": line, "parameters": "-", "notes": ""})
         return rows
-
-    def _sync_generated_script(self) -> None:
-        rows = self._serialize_program()
-        try:
-            script = ProgramModel.from_rows(rows).to_script()
-        except Exception:
-            script_lines = []
-            for row in rows:
-                line = row["command"]
-                if row["parameters"] and row["parameters"] != "-":
-                    line = f"{line}  # {row['parameters']}"
-                script_lines.append(line)
-            script = "\n".join(script_lines).strip() + "\n"
-        self.generated_script.setPlainText(script)

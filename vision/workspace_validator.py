@@ -37,24 +37,26 @@ class WorkspaceValidator:
 
         return self.ValidationResult.VALID, "READY TO PICK"
 
-    @staticmethod
-    def pixel_to_world(u: float, v: float, intrinsic_matrix: np.ndarray, z_mm: float) -> tuple[float, float]:
+    def pixel_to_world(self, u: float, v: float, intrinsic_matrix: np.ndarray, z_mm: float) -> tuple[float, float]:
         fx = float(intrinsic_matrix[0, 0])
         fy = float(intrinsic_matrix[1, 1])
         cx = float(intrinsic_matrix[0, 2])
         cy = float(intrinsic_matrix[1, 2])
         x_mm = (float(u) - cx) * float(z_mm) / fx
         y_mm = (float(v) - cy) * float(z_mm) / fy
-        return x_mm, y_mm
+        offset_x = float(self._config.get("vision.offset_x_mm", 0.0))
+        offset_y = float(self._config.get("vision.offset_y_mm", 0.0))
+        return x_mm - offset_x, y_mm - offset_y
 
-    @staticmethod
-    def world_to_pixel(x_mm: float, y_mm: float, intrinsic_matrix: np.ndarray, z_mm: float) -> tuple[int, int]:
+    def world_to_pixel(self, x_mm: float, y_mm: float, intrinsic_matrix: np.ndarray, z_mm: float) -> tuple[int, int]:
         fx = float(intrinsic_matrix[0, 0])
         fy = float(intrinsic_matrix[1, 1])
         cx = float(intrinsic_matrix[0, 2])
         cy = float(intrinsic_matrix[1, 2])
-        u = int(round(float(x_mm) * fx / float(z_mm) + cx))
-        v = int(round(float(y_mm) * fy / float(z_mm) + cy))
+        offset_x = float(self._config.get("vision.offset_x_mm", 0.0))
+        offset_y = float(self._config.get("vision.offset_y_mm", 0.0))
+        u = int(round((float(x_mm) + offset_x) * fx / float(z_mm) + cx))
+        v = int(round((float(y_mm) + offset_y) * fy / float(z_mm) + cy))
         return u, v
 
     def draw_overlay(self, frame: np.ndarray, intrinsic_matrix: np.ndarray, z_mm: float) -> np.ndarray:

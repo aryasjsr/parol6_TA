@@ -112,6 +112,8 @@ class VisionTab(QWidget):
         self.workspace_y_max_spin: QDoubleSpinBox | None = None
         self.workspace_z_spin: QDoubleSpinBox | None = None
         self.workspace_margin_spin: QDoubleSpinBox | None = None
+        self.workspace_offset_x_spin: QDoubleSpinBox | None = None
+        self.workspace_offset_y_spin: QDoubleSpinBox | None = None
         self.save_workspace_button: QPushButton | None = None
         self.calibration_chessboard_x_spin: QSpinBox | None = None
         self.calibration_chessboard_y_spin: QSpinBox | None = None
@@ -484,6 +486,8 @@ class VisionTab(QWidget):
         self.workspace_y_max_spin = self._make_double_spinbox(-1000.0, 1000.0, 100.0, 1.0)
         self.workspace_z_spin = self._make_double_spinbox(1.0, 2000.0, 200.0, 1.0)
         self.workspace_margin_spin = self._make_double_spinbox(0.0, 200.0, 10.0, 0.5)
+        self.workspace_offset_x_spin = self._make_double_spinbox(-500.0, 500.0, 0.0, 0.5)
+        self.workspace_offset_y_spin = self._make_double_spinbox(-500.0, 500.0, 0.0, 0.5)
         self.save_workspace_button = QPushButton("Save Workspace")
         layout.addWidget(QLabel("X min"), 0, 0)
         layout.addWidget(self.workspace_x_min_spin, 0, 1)
@@ -497,7 +501,11 @@ class VisionTab(QWidget):
         layout.addWidget(self.workspace_z_spin, 2, 1)
         layout.addWidget(QLabel("Margin"), 2, 2)
         layout.addWidget(self.workspace_margin_spin, 2, 3)
-        layout.addWidget(self.save_workspace_button, 3, 0, 1, 4)
+        layout.addWidget(QLabel("Offset X (mm)"), 3, 0)
+        layout.addWidget(self.workspace_offset_x_spin, 3, 1)
+        layout.addWidget(QLabel("Offset Y (mm)"), 3, 2)
+        layout.addWidget(self.workspace_offset_y_spin, 3, 3)
+        layout.addWidget(self.save_workspace_button, 4, 0, 1, 4)
         return group
 
     def _build_calibration_group(self) -> QGroupBox:
@@ -674,6 +682,8 @@ class VisionTab(QWidget):
         self.workspace_y_max_spin.setValue(float(workspace.get("y_max_mm", 100.0)))
         self.workspace_z_spin.setValue(float(workspace.get("z_fixed_mm", 200.0)))
         self.workspace_margin_spin.setValue(float(workspace.get("margin_mm", 10.0)))
+        self.workspace_offset_x_spin.setValue(float(vision.get("offset_x_mm", 0.0)))
+        self.workspace_offset_y_spin.setValue(float(vision.get("offset_y_mm", 0.0)))
         calibration = vision.get("calibration", {})
         chessboard = calibration.get("chessboard_size", [9, 6])
         self.calibration_chessboard_x_spin.setValue(int(chessboard[0]))
@@ -743,6 +753,8 @@ class VisionTab(QWidget):
             "y_max_mm": float(self.workspace_y_max_spin.value()),
             "z_fixed_mm": float(self.workspace_z_spin.value()),
             "margin_mm": float(self.workspace_margin_spin.value()),
+            "_vision_offset_x_mm": float(self.workspace_offset_x_spin.value()),
+            "_vision_offset_y_mm": float(self.workspace_offset_y_spin.value()),
         }
 
     def calibration_request(self) -> tuple[tuple[int, int], float]:

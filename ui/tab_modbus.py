@@ -4,14 +4,17 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
+    QFormLayout,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QPushButton,
     QSizePolicy,
     QSpinBox,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QToolButton,
@@ -74,17 +77,45 @@ class ModbusTab(QWidget):
         self.jog_timeout_spin: QDoubleSpinBox | None = None
         self.jog_save_button: QPushButton | None = None
         self.jog_source_label = QLabel("Active source: NONE")
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(10)
-        layout.addWidget(_CollapsibleSection("MODBUS CONNECTION", self._build_connection_group()))
-        layout.addWidget(_CollapsibleSection("MODBUS JOG", self._build_jog_group()))
-        layout.addWidget(_CollapsibleSection("ADDRESS MAPPING", self._build_mapping_group()), 2)
-        layout.addWidget(_CollapsibleSection("LIVE MONITOR", self._build_monitor_group()), 1)
+
+        # --- Top row: Connection + Jog side-by-side (compact) ---
+        top_row = QHBoxLayout()
+        top_row.setSpacing(10)
+        top_row.addWidget(
+            _CollapsibleSection("MODBUS CONNECTION", self._build_connection_group()), 1
+        )
+        top_row.addWidget(
+            _CollapsibleSection("MODBUS JOG", self._build_jog_group()), 1
+        )
+        layout.addLayout(top_row)
+
+        # --- Bottom: Address Mapping | Live Monitor in horizontal splitter ---
+        data_splitter = QSplitter(Qt.Orientation.Horizontal)
+        data_splitter.addWidget(
+            _CollapsibleSection("ADDRESS MAPPING", self._build_mapping_group())
+        )
+        data_splitter.addWidget(
+            _CollapsibleSection("LIVE MONITOR", self._build_monitor_group())
+        )
+        data_splitter.setStretchFactor(0, 2)
+        data_splitter.setStretchFactor(1, 1)
+        data_splitter.setSizes([600, 320])
+        data_splitter.setHandleWidth(6)
+        data_splitter.setStyleSheet(
+            "QSplitter::handle { background: #1E2A45; border-radius: 2px; }"
+        )
+        layout.addWidget(data_splitter, 1)
 
     def _build_connection_group(self) -> QWidget:
         group = QWidget()
-        layout = QGridLayout(group)
+        outer = QVBoxLayout(group)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(8)
+
         self.ip_edit = QLineEdit("192.168.1.10")
         self.port_spin = QSpinBox()
         self.port_spin.setRange(1, 65535)
@@ -98,17 +129,23 @@ class ModbusTab(QWidget):
         self.disconnect_button.setProperty("role", "danger")
         self.save_button = QPushButton("Save Config")
 
-        layout.addWidget(QLabel("IP"), 0, 0)
-        layout.addWidget(self.ip_edit, 0, 1)
-        layout.addWidget(QLabel("Port"), 0, 2)
-        layout.addWidget(self.port_spin, 0, 3)
-        layout.addWidget(QLabel("Slave ID"), 1, 0)
-        layout.addWidget(self.slave_id_spin, 1, 1)
-        layout.addWidget(QLabel("Status"), 1, 2)
-        layout.addWidget(self.status_value, 1, 3)
-        layout.addWidget(self.connect_button, 2, 0, 1, 2)
-        layout.addWidget(self.disconnect_button, 2, 2)
-        layout.addWidget(self.save_button, 2, 3)
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        form.setHorizontalSpacing(10)
+        form.setVerticalSpacing(6)
+        form.addRow("IP", self.ip_edit)
+        form.addRow("Port", self.port_spin)
+        form.addRow("Slave ID", self.slave_id_spin)
+        form.addRow("Status", self.status_value)
+        outer.addLayout(form)
+
+        button_row = QHBoxLayout()
+        button_row.setSpacing(6)
+        button_row.addWidget(self.connect_button)
+        button_row.addWidget(self.disconnect_button)
+        button_row.addWidget(self.save_button)
+        outer.addLayout(button_row)
+        outer.addStretch(1)
         return group
 
     def _build_mapping_group(self) -> QWidget:
@@ -125,39 +162,56 @@ class ModbusTab(QWidget):
 
         self.address_table.setHorizontalHeaderLabels(["Name", "Type", "Address", "RW", "Description"])
         self.address_table.verticalHeader().setVisible(False)
+        self.address_table.setAlternatingRowColors(True)
+        addr_header = self.address_table.horizontalHeader()
+        addr_header.setStretchLastSection(True)
+        addr_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         layout.addWidget(self.address_table, 1)
         return group
 
     def _build_monitor_group(self) -> QWidget:
         group = QWidget()
         layout = QVBoxLayout(group)
+        layout.setContentsMargins(0, 0, 0, 0)
         self.monitor_table.setHorizontalHeaderLabels(["Signal", "Value"])
         self.monitor_table.verticalHeader().setVisible(False)
+        self.monitor_table.setAlternatingRowColors(True)
+        mon_header = self.monitor_table.horizontalHeader()
+        mon_header.setStretchLastSection(True)
+        mon_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(self.monitor_table, 1)
         return group
 
     def _build_jog_group(self) -> QWidget:
         group = QWidget()
-        layout = QGridLayout(group)
-        self.jog_source_label.setStyleSheet("color: #8A9AB8; font-weight: 600;")
-        layout.addWidget(self.jog_source_label, 0, 0, 1, 2)
+        outer = QVBoxLayout(group)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(8)
 
-        layout.addWidget(QLabel("Jog speed (%)"), 1, 0)
+        self.jog_source_label.setStyleSheet("color: #8A9AB8; font-weight: 600;")
+        outer.addWidget(self.jog_source_label)
+
         self.jog_speed_spin = QDoubleSpinBox()
         self.jog_speed_spin.setRange(1, 100)
         self.jog_speed_spin.setValue(20)
         self.jog_speed_spin.setDecimals(0)
-        layout.addWidget(self.jog_speed_spin, 1, 1)
 
-        layout.addWidget(QLabel("Lock timeout (s)"), 2, 0)
         self.jog_timeout_spin = QDoubleSpinBox()
         self.jog_timeout_spin.setRange(1, 60)
         self.jog_timeout_spin.setValue(5.0)
         self.jog_timeout_spin.setDecimals(1)
-        layout.addWidget(self.jog_timeout_spin, 2, 1)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        form.setHorizontalSpacing(10)
+        form.setVerticalSpacing(6)
+        form.addRow("Jog speed (%)", self.jog_speed_spin)
+        form.addRow("Lock timeout (s)", self.jog_timeout_spin)
+        outer.addLayout(form)
 
         self.jog_save_button = QPushButton("Save Jog Config")
-        layout.addWidget(self.jog_save_button, 3, 0, 1, 2)
+        outer.addWidget(self.jog_save_button)
+        outer.addStretch(1)
         return group
 
     def update_jog_source(self, source: str) -> None:

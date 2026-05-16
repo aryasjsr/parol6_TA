@@ -18,6 +18,7 @@ from backend.research_logger import ResearchLogger
 from backend.serial_worker import SerialWorkerThread
 from program.program_executor import ProgramExecutor, ProgramExecutorDependencies
 from program.program_model import ProgramModel
+from program.preview_executor import PreviewProgramExecutor
 from tools.shared_struct import RobotInputData, RobotOutputData
 from vision.camera_pipeline import VisionWorkerThread
 from vision.object_detector import DetectionResult
@@ -224,6 +225,22 @@ class AppRuntime(QObject):
         self.buttons[3] = 1
         self.log_message.emit("Clear error requested", "info")
 
+    def set_digital_output(self, pin: int, state: bool) -> None:
+        """Set OUTPUT 1 or OUTPUT 2 directly (mirrors PAROL Commander Set_output_X).
+
+        pin=1 → inout index 2, pin=2 → inout index 3.
+        """
+        if pin not in (1, 2):
+            self.log_message.emit(f"Invalid output pin: {pin}", "warn")
+            return
+        idx = pin + 1
+        value = 1 if state else 0
+        self.command_data.inout[idx] = value
+        self.robot_data.inout[idx] = value
+        self.log_message.emit(
+            f"OUTPUT {pin} -> {'HIGH' if state else 'LOW'}", "info"
+        )
+
     def set_speed_percent(self, value: int) -> None:
         """Update GUI jog speed percent for the GUI reactor."""
         self.jog_control[0] = int(value)
@@ -398,9 +415,18 @@ class AppRuntime(QObject):
             return
 
         q_new = sol.q
+        CLAMP_TOL = self._parol6.DEG2RAD(0.5)  # 0.5° tolerance
         for i in range(6):
             lo, hi = self._parol6.Joint_limits_radian[i]
-            q_new[i] = max(lo, min(hi, q_new[i]))
+            if q_new[i] < lo and q_new[i] >= lo - CLAMP_TOL:
+                q_new[i] = lo
+            elif q_new[i] > hi and q_new[i] <= hi + CLAMP_TOL:
+                q_new[i] = hi
+            if not (lo <= q_new[i] <= hi):
+                self.log_message.emit(
+                    f"[Preview] Cartesian jog blocked – J{i+1} limit reached", "warn"
+                )
+                return
 
         self._sim_position = list(q_new)
         self.sim_position_changed.emit(list(self._sim_position))
@@ -474,10 +500,37 @@ class AppRuntime(QObject):
             self._vision_worker.apply_settings(settings)
         self.vision_status_changed.emit("info", "Vision settings applied")
 
+    def load_vision_model(self, settings: dict | None = None, persist: bool = False) -> str:
+        """Load (or reload) the ONNX model used by the vision worker.
+
+        *settings* may include ``model_path``, ``model_conf_threshold``,
+        ``model_iou_threshold``. When *persist* is True these values are also
+        saved to ``config.json``.
+        """
+        settings = settings or {}
+        if persist:
+            for key, value in settings.items():
+                self.config.set(f"vision.{key}", value)
+        # Apply settings to the live worker so it uses the new thresholds
+        # immediately on the next frame.
+        if self._vision_worker is not None and settings:
+            self._vision_worker.apply_settings(settings)
+        if self._vision_worker is None:
+            self.vision_status_changed.emit(
+                "warn",
+                "Start the camera before loading a model.",
+            )
+            return "NO_WORKER"
+        model_path = settings.get("model_path") or str(self.config.get("vision.model_path", ""))
+        return self._vision_worker.load_model(model_path)
+
     def save_workspace_settings(self, settings: dict) -> None:
         """Persist workspace configuration to config.json."""
         for key, value in settings.items():
-            self.config.set(f"workspace.{key}", value)
+            if key.startswith("_vision_"):
+                self.config.set(f"vision.{key[8:]}", value)
+            else:
+                self.config.set(f"workspace.{key}", value)
         self.vision_status_changed.emit("info", "Workspace settings saved")
 
     def save_pick_zone_settings(self, settings: dict) -> None:
@@ -587,11 +640,22 @@ class AppRuntime(QObject):
         return result
 
     def run_program(self, rows: list[dict[str, str]]) -> None:
-        """Execute the full program from UI rows in a background worker."""
+        """Execute the full program from UI rows in a background worker.
+
+        When preview mode is active the program runs as a **dry-run**
+        simulation — joint targets are computed via FK/IK and emitted to
+        the 3D preview canvas, but **no commands are sent to hardware**.
+        """
+        if self._preview_only:
+            self._start_preview_executor(rows, None)
+            return
         self._start_program_executor(rows, None)
 
     def step_program(self, rows: list[dict[str, str]], line_number: int) -> None:
         """Execute a single selected program line."""
+        if self._preview_only:
+            self._start_preview_executor(rows, line_number)
+            return
         self._start_program_executor(rows, line_number)
 
     def stop_program(self) -> None:
@@ -673,6 +737,10 @@ class AppRuntime(QObject):
                 if current_log and current_log != self._last_log_value:
                     self._last_log_value = current_log
                     self.log_message.emit(current_log, "info")
+                # Sync preview sim from hardware when running real programs
+                if not self._preview_only and self.is_connected():
+                    hw_pos = list(self.robot_data.position)
+                    self.sync_sim_from_hardware(hw_pos)
             except RuntimeError:
                 break
             time.sleep(0.01)
@@ -717,6 +785,7 @@ class AppRuntime(QObject):
             vision_getter=lambda: self._vision_worker.get_latest_detection() if self._vision_worker is not None else None,
             modbus_value_getter=self.read_modbus_value,
             modbus_writer=self.write_modbus_coil if self._modbus_worker is not None else None,
+            bundle_getter=lambda: self._vision_worker.get_latest_bundle() if self._vision_worker is not None else None,
         )
         self._program_executor = ProgramExecutor(model, dependencies, single_line=single_line)
         self._program_executor.log_message.connect(self.log_message)
@@ -730,6 +799,36 @@ class AppRuntime(QObject):
             except Exception:
                 pass
         self._program_executor.start()
+
+    def _start_preview_executor(self, rows: list[dict[str, str]], single_line: int | None) -> None:
+        """Launch a dry-run executor that visualises the program in the 3D sim
+        without sending any commands to hardware."""
+        if self.is_program_running():
+            self.log_message.emit("Program executor is already running", "warn")
+            return
+        model = ProgramModel.from_rows(rows)
+        if not model.commands:
+            self.log_message.emit("Program is empty", "warn")
+            return
+        self._last_program_rows = rows
+        executor = PreviewProgramExecutor(
+            model=model,
+            initial_radians=list(self._sim_position),
+            config_getter=self.config.get,
+            single_line=single_line,
+        )
+        executor.log_message.connect(self.log_message)
+        executor.line_changed.connect(self.program_line_changed)
+        executor.state_changed.connect(self.program_state_changed)
+        executor.finished_execution.connect(self._on_program_finished)
+        executor.sim_position_changed.connect(self._on_preview_sim_position)
+        self._program_executor = executor
+        self._program_executor.start()
+
+    def _on_preview_sim_position(self, radians: list[float]) -> None:
+        """Relay preview executor sim updates to the shared sim state and UI."""
+        self._sim_position = list(radians[:6])
+        self.sim_position_changed.emit(list(self._sim_position))
 
     def _on_modbus_connection_changed(self, connected: bool, description: str) -> None:
         self.modbus_connection_changed.emit(connected, description)

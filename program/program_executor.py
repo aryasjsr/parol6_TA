@@ -33,6 +33,7 @@ from backend.exceptions import (
     WorkspaceViolationError,
 )
 from backend.failsafe_manager import FailsafeManager
+from backend.ik_solver import solve_ik
 from backend.research_logger import ResearchLogger
 from program.program_model import ProgramCommand, ProgramModel
 from tools.shared_struct import RobotInputData, RobotOutputData
@@ -105,20 +106,27 @@ class ProgramExecutor(QThread):
         self._marginal_event = threading.Event()  # set when user confirms/skips
         self._marginal_action: str = ""  # "confirm" or "skip"
         self._loop_frame: dict[str, int] | None = None
+        self._speed_state: dict[str, float] = {}  # v, a overrides from SpeedJoint
         self.COMMAND_HANDLERS: dict[str, Callable[[ProgramCommand, int], int | None]] = {
             "start": self._execute_start,
+            "Begin": self._execute_start,
             "MoveCart": self._execute_move_cart,
             "MoveJoint": self._execute_move_joint,
+            "MovePose": self._execute_move_pose,
             "MoveCartRelTRF": self._execute_move_cart_rel_trf,
+            "SpeedJoint": self._execute_speed_joint,
             "vision": self._execute_vision,
             "Home": self._execute_home,
             "Gripper": self._execute_gripper,
+            "Gripper_cal": self._execute_gripper_cal,
             "Output": self._execute_output,
             "Input": self._execute_input,
             "Delay": self._execute_delay,
             "Loop": self._execute_loop,
             "EndLoop": self._execute_end_loop,
             "end": self._execute_end,
+            "End": self._execute_end,
+            "Dummy": self._execute_dummy,
         }
 
     def stop(self) -> None:
@@ -196,13 +204,101 @@ class ProgramExecutor(QThread):
     def _execute_move_joint(self, command: ProgramCommand, index: int) -> int | None:
         self._ensure_motion_safe()
         joint_target = self._resolve_joint_target(command)
+        t_val = float(command.kwargs.get("t", 0))
+        v_val = command.kwargs.get("v")
+        a_val = command.kwargs.get("a")
+        profile = "trap"
+        if "poly" in command.kwargs:
+            profile = "poly"
+        elif "trap" in command.kwargs:
+            profile = "trap"
+        v_pct = float(v_val) if v_val is not None else self._speed_state.get(
+            "v", float(command.kwargs.get("speed_pct", self._deps.config_getter("robot.default_speed_pct", 30)))
+        )
+        a_pct = float(a_val) if a_val is not None else self._speed_state.get("a")
         action = Move2JointsAction(
             q_deg=joint_target,
-            v_pct=float(command.kwargs.get("speed_pct", self._deps.config_getter("robot.default_speed_pct", 30))),
+            t=t_val if t_val > 0 else None,
+            v_pct=v_pct,
+            a_pct=a_pct,
+            profile=profile,
             shared_string=self._deps.shared_string,
         )
-        self._inject_and_wait(action, timeout_s=30.0)
+        self._inject_and_wait(action, timeout_s=max(30.0, t_val + 10))
         self._log(f"MoveJoint -> {joint_target}", "info")
+        return None
+
+    def _execute_move_pose(self, command: ProgramCommand, index: int) -> int | None:
+        """MovePose: IK from cartesian target, execute in joint space (Commander style)."""
+        self._ensure_motion_safe()
+        target_pose = self._build_absolute_pose(command)
+        t_val = float(command.kwargs.get("t", 0))
+        v_val = command.kwargs.get("v")
+        a_val = command.kwargs.get("a")
+        profile = "trap"
+        if "poly" in command.kwargs:
+            profile = "poly"
+        elif "trap" in command.kwargs:
+            profile = "trap"
+        q0 = self._current_joint_radians()
+        result = solve_ik(
+            PAROL6_ROBOT.robot,
+            target_pose,
+            q0,
+            jogging=False,
+            joint_limits_radian=PAROL6_ROBOT.Joint_limits_radian,
+        )
+        if not result.success:
+            raise IKFailureError(
+                f"MovePose: IK failed: residual={result.residual:.2e}, "
+                f"iterations={result.iterations}, violations={result.violations}"
+            )
+        q_rad = np.asarray(result.q).reshape(-1)[:6]
+        self._validate_ik_solution(q_rad, q0)
+        q_deg = [float(np.rad2deg(v)) for v in q_rad]
+        v_pct = float(v_val) if v_val is not None else self._speed_state.get(
+            "v", float(self._deps.config_getter("robot.default_speed_pct", 30))
+        )
+        a_pct = float(a_val) if a_val is not None else self._speed_state.get("a")
+        action = Move2JointsAction(
+            q_deg=q_deg,
+            t=t_val if t_val > 0 else None,
+            v_pct=v_pct,
+            a_pct=a_pct,
+            profile=profile,
+            shared_string=self._deps.shared_string,
+        )
+        self._inject_and_wait(action, timeout_s=max(30.0, t_val + 10))
+        self._log(f"MovePose -> {[f'{d:.1f}' for d in q_deg]}", "info")
+        return None
+
+    def _execute_speed_joint(self, command: ProgramCommand, index: int) -> int | None:
+        """SpeedJoint: set default v/a percentages for subsequent motion commands."""
+        v = command.kwargs.get("v")
+        a = command.kwargs.get("a")
+        if v is not None:
+            self._speed_state["v"] = float(v)
+        if a is not None:
+            self._speed_state["a"] = float(a)
+        self._log(f"SpeedJoint set: v={v}, a={a}", "info")
+        return None
+
+    def _execute_gripper_cal(self, command: ProgramCommand, index: int) -> int | None:
+        """Gripper_cal: calibrate the gripper."""
+        self._log("Gripper calibration requested", "info")
+        pin = int(self._deps.config_getter("robot.gripper_output_pin", 1))
+        output_index = self._map_output_pin(pin)
+        action = _DigitalOutputAction(output_index, True, self._deps.shared_string)
+        self._inject_and_wait(action, timeout_s=5.0)
+        time.sleep(0.5)
+        action2 = _DigitalOutputAction(output_index, False, self._deps.shared_string)
+        self._inject_and_wait(action2, timeout_s=5.0)
+        self._log("Gripper calibration done", "info")
+        return None
+
+    def _execute_dummy(self, command: ProgramCommand, index: int) -> int | None:
+        """Dummy: no-op command for testing."""
+        self._log("Dummy command (no-op)", "info")
         return None
 
     def _execute_move_cart(self, command: ProgramCommand, index: int) -> int | None:
@@ -235,9 +331,20 @@ class ProgramExecutor(QThread):
         return None
 
     def _execute_gripper(self, command: ProgramCommand, index: int) -> int | None:
-        state = str(self._first_value(command, "state", command.args[0] if command.args else "open")).strip().lower()
+        # Commander-style: Gripper(position, speed, force) or legacy state=open/close
+        if len(command.args) >= 2:
+            # Commander style: positional numeric args
+            position = int(float(command.args[0]))
+            speed = int(float(command.args[1])) if len(command.args) > 1 else 100
+            force = int(float(command.args[2])) if len(command.args) > 2 else 120
+            # Map: position > 127 = close, else open
+            mapped_state = position > 127
+            self._log(f"Gripper(pos={position}, speed={speed}, force={force})", "info")
+        else:
+            state = str(self._first_value(command, "state", command.args[0] if command.args else "open")).strip().lower()
+            mapped_state = state in {"close", "on", "high", "1", "true"}
+            self._log(f"Gripper -> {state}", "info")
         pin = int(self._deps.config_getter("robot.gripper_output_pin", 1))
-        mapped_state = state in {"close", "on", "high", "1", "true"}
         output_command = ProgramCommand(
             name="Output",
             args=[pin, "ON" if mapped_state else "OFF"],
@@ -247,7 +354,6 @@ class ProgramExecutor(QThread):
             parameters_text=f"{pin}, {'ON' if mapped_state else 'OFF'}",
         )
         self._execute_output(output_command, index)
-        self._log(f"Gripper -> {state}", "info")
         return None
 
     def _execute_output(self, command: ProgramCommand, index: int) -> int | None:
@@ -278,8 +384,14 @@ class ProgramExecutor(QThread):
         raise PAROL6Error(f"Input({selector}) timed out waiting for {expected_bool}")
 
     def _execute_delay(self, command: ProgramCommand, index: int) -> int | None:
-        duration_ms = float(self._first_value(command, "ms", command.args[0] if command.args else 0.0))
-        remaining_s = max(duration_ms, 0.0) / 1000.0
+        # Accept seconds (Commander style). First arg is seconds.
+        raw = command.args[0] if command.args else self._first_value(command, "ms", 0.0)
+        duration_s = float(raw)
+        # If value > 100, assume ms for backward compat; otherwise treat as seconds
+        if duration_s > 100:
+            remaining_s = max(duration_s, 0.0) / 1000.0
+        else:
+            remaining_s = max(duration_s, 0.0)
         while remaining_s > 0:
             self._check_stopped()
             self._wait_if_paused()
@@ -291,12 +403,22 @@ class ProgramExecutor(QThread):
         return None
 
     def _execute_loop(self, command: ProgramCommand, index: int) -> int | None:
+        """Loop: Commander-style infinite loop back to Begin (index 0).
+
+        If count arg is given, behaves as counted loop (legacy).
+        """
         if self._single_line is not None:
             self._log("Loop step inspected", "info")
             return None
+        count_raw = command.args[0] if command.args else self._first_value(command, "count", None)
+        if count_raw is None or str(count_raw).strip() == "":
+            # Commander infinite loop: go back to beginning
+            self._log("Loop() -> back to Begin", "info")
+            return 0  # jump to first line
+        # Counted loop (legacy)
         if self._loop_frame is not None:
             raise PAROL6Error("Nested Loop is not supported in v1.1")
-        remaining = int(command.args[0] if command.args else self._first_value(command, "count", 0))
+        remaining = int(count_raw)
         self._loop_frame = {"start_index": index, "remaining": remaining}
         return None
 
@@ -540,25 +662,81 @@ class ProgramExecutor(QThread):
         current_u, current_v = detection.pick_point_px
         return target_u - float(current_u), target_v - float(current_v)
 
+    def _validate_ik_solution(self, q_rad: np.ndarray, q0_rad: np.ndarray) -> None:
+        """Post-IK validation. solve_ik already enforces joint limits and applies
+        unwrap_angles to eliminate sign flips, so only large-motion warning remains.
+
+        Layer 1: Joint limits (boundary clamp with 0.5° tolerance) — defensive
+                 double-check; solve_ik should have rejected violations already.
+        Layer 3: Speed limit warning based on displacement.
+        """
+        # Layer 1: defensive joint limits check + boundary clamp
+        CLAMP_TOL = np.deg2rad(0.5)
+        for i in range(6):
+            lo, hi = PAROL6_ROBOT.Joint_limits_radian[i]
+            if q_rad[i] < lo and q_rad[i] >= lo - CLAMP_TOL:
+                q_rad[i] = lo
+            elif q_rad[i] > hi and q_rad[i] <= hi + CLAMP_TOL:
+                q_rad[i] = hi
+            if not (lo <= q_rad[i] <= hi):
+                raise IKFailureError(
+                    f"IK solution: joint {i+1} = {np.rad2deg(q_rad[i]):.2f}° "
+                    f"out of range [{np.rad2deg(lo):.1f}°, {np.rad2deg(hi):.1f}°]"
+                )
+
+        # Layer 3: large-motion warning (sign flip layer removed — handled by
+        # unwrap_angles inside solve_ik).
+        for i in range(6):
+            delta_steps = abs(PAROL6_ROBOT.RAD2STEPS(q_rad[i] - q0_rad[i], i))
+            if delta_steps > PAROL6_ROBOT.Joint_max_speed[i] * 10:
+                self._log(
+                    f"Warning: IK solution requires large motion on joint {i+1} "
+                    f"({delta_steps:.0f} steps)",
+                    "warn",
+                )
+
     def _move_to_pose(self, target_pose: SE3, speed_pct: float) -> None:
         q0 = self._current_joint_radians()
-        solution = PAROL6_ROBOT.robot.ikine_LMS(target_pose, q0=q0, ilimit=30, mask=[1, 1, 1, 1, 1, 1])
-        if getattr(solution, "success", False) is False:
-            solution = PAROL6_ROBOT.robot.ikine_LMS(target_pose, q0=q0, ilimit=60)
-        if getattr(solution, "success", True) is False or not hasattr(solution, "q"):
-            raise IKFailureError("Failed to solve inverse kinematics")
-        q_deg = [float(np.rad2deg(value)) for value in np.asarray(solution.q).reshape(-1)[:6]]
-        action = Move2JointsAction(q_deg=q_deg, v_pct=float(speed_pct), shared_string=self._deps.shared_string)
+        result = solve_ik(
+            PAROL6_ROBOT.robot,
+            target_pose,
+            q0,
+            jogging=False,
+            joint_limits_radian=PAROL6_ROBOT.Joint_limits_radian,
+        )
+        if not result.success:
+            raise IKFailureError(
+                f"IK failed: residual={result.residual:.2e}, "
+                f"iterations={result.iterations}, violations={result.violations}"
+            )
+        q_rad = np.asarray(result.q).reshape(-1)[:6]
+        self._validate_ik_solution(q_rad, q0)
+        q_deg = [float(np.rad2deg(value)) for value in q_rad]
+        t_val = None  # cartesian moves use v_pct by default
+        action = Move2JointsAction(
+            q_deg=q_deg,
+            t=t_val,
+            v_pct=float(speed_pct),
+            a_pct=self._speed_state.get("a"),
+            shared_string=self._deps.shared_string,
+        )
         self._inject_and_wait(action, timeout_s=30.0)
 
     def _build_absolute_pose(self, command: ProgramCommand) -> SE3:
-        x_mm = float(self._first_value(command, "x", 0.0)) / 1000.0
-        y_mm = float(self._first_value(command, "y", 0.0)) / 1000.0
-        z_mm = float(self._first_value(command, "z", self._deps.config_getter("workspace.z_fixed_mm", 200.0))) / 1000.0
-        r_deg = float(self._first_value(command, "r", 0.0))
-        p_deg = float(self._first_value(command, "p", 0.0))
-        yaw_deg = float(self._first_value(command, "yaw", 0.0))
-        return SE3(x_mm, y_mm, z_mm) * SE3.Rx(r_deg, unit="deg") * SE3.Ry(p_deg, unit="deg") * SE3.Rz(yaw_deg, unit="deg")
+        # Support Commander-style positional args: Command(x,y,z,rx,ry,rz,...)
+        args = command.args
+        x_mm = float(args[0]) if len(args) > 0 and command.kwargs.get("x") is None else float(self._first_value(command, "x", 0.0))
+        y_mm = float(args[1]) if len(args) > 1 and command.kwargs.get("y") is None else float(self._first_value(command, "y", 0.0))
+        z_mm = float(args[2]) if len(args) > 2 and command.kwargs.get("z") is None else float(self._first_value(command, "z", self._deps.config_getter("workspace.z_fixed_mm", 200.0)))
+        r_deg = float(args[3]) if len(args) > 3 and command.kwargs.get("r") is None else float(self._first_value(command, "r", self._first_value(command, "rx", 0.0)))
+        p_deg = float(args[4]) if len(args) > 4 and command.kwargs.get("p") is None else float(self._first_value(command, "p", self._first_value(command, "ry", 0.0)))
+        yaw_deg = float(args[5]) if len(args) > 5 and command.kwargs.get("yaw") is None else float(self._first_value(command, "yaw", self._first_value(command, "rz", 0.0)))
+        x_m, y_m, z_m = x_mm / 1000.0, y_mm / 1000.0, z_mm / 1000.0
+        pose = SE3.RPY([r_deg, p_deg, yaw_deg], unit="deg", order="xyz")
+        pose.t[0] = x_m
+        pose.t[1] = y_m
+        pose.t[2] = z_m
+        return pose
 
     def _resolve_joint_target(self, command: ProgramCommand) -> list[float]:
         current = self._current_joint_degrees()
