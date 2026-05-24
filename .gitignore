@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Local config & runtime state (contain machine-specific absolute paths)
+config.json
+runtime_state.json
+
+# Generated logs
+logs/
+
+# Local program files
+program/
+
+# ML model files (large binaries)
+vision/models/
+
+# Test cache
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db

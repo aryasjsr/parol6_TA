@@ -95,7 +95,7 @@ Cart_ang_velocity_limits = [[-100,100],[-100,100],[-100,100]]
 
 
 Commands_list = [ "Input","Output","Dummy","Begin","Home","Delay","End","Loop","MoveJoint","MovePose","SpeedJoint","MoveCart",
-                 "MoveCart","MoveCartRelTRF","Gripper","Gripper_cal"]
+                 "MoveCart","MoveCartRelTRF","Gripper","Gripper_cal","vision","ModbusRead","ModbusWrite","timestamp"]
 
 Commands_list_true = [item + "()" for item in Commands_list]
 

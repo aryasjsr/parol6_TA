@@ -25,6 +25,16 @@ from spatialmath.base.argcheck import (
     getvector,
     isscalar,
 )
+from Commander_feature_adapters import (
+    build_vision_pick_sequence,
+    execute_modbus_read,
+    execute_modbus_write,
+    execute_timestamp_command,
+    modbus_manager,
+    read_state,
+    research_logger,
+    update_state,
+)
 def normalize_angle(angle):
     """Normalize angle to [-pi, pi] range to handle angle wrapping"""
     while angle > np.pi:
@@ -668,6 +678,14 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
             elif Buttons[6] == 1: # For testing accel motions?
                 Command_out.value = 69
             
+            elif Buttons[7] == 1 and program_stop_requested():
+                Robot_mode = "Dummy"
+                finish_program_stop(Position_out,Speed_out,Command_out,Position_in,Buttons,shared_string)
+
+            elif Buttons[7] == 1 and program_paused():
+                Robot_mode = "Program"
+                dummy_data(Position_out,Speed_out,Command_out,Position_in)
+                shared_string.value = b'Log: Program paused'
 
             # Program execution
             ######################################################
@@ -733,12 +751,17 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
                         # Set error flag, exit program
                     if error_state == 0:
                         shared_string.value = b'Log: program will try to run'
+                        control_state = program_control_state()
+                        next_state = "STEP" if control_state.get("state") == "STEP" else "RUNNING"
+                        update_state("program_control", {"state": next_state, "paused": False, "stop_requested": False, "step_requested": control_state.get("step_requested", 0), "updated_at": time.time()})
+                        research_logger.record("program_started", program_len, Image_path + "/Programs/execute_script.txt")
 
                     # Check if first and last commands are valid
                 Robot_mode = "Program"
 
                 if error_state == 0:
                     if Program_step < program_len:
+                        program_step_before = Program_step
 
                         # Delay command
                         if clean_string[Program_step] == 'Delay()':
@@ -784,8 +807,9 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
                             cond2 = 0
                             if command_value.count(',') == 1:
                                 x = command_value.split(',')
+                                x = [item.strip() for item in x]
                                 try:
-                                    if int(x[0]) == 1 or int(x[0] == 2):
+                                    if int(x[0]) == 1 or int(x[0]) == 2:
                                         cond1 = 1
                                     else:
                                         shared_string.value = b'Error: Invalid Output() command'
@@ -2110,6 +2134,54 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
 
 
                         # Dummy command (used for testing)
+                        elif clean_string[Program_step] == 'vision()':
+                            logging.debug('Log: vision() command')
+                            generated_commands = build_vision_pick_sequence(shared_string)
+                            if generated_commands is not None:
+                                generated_clean = [re.sub(r'\(.*?\)', '()', command) for command in generated_commands]
+                                clean_string_commands[Program_step:Program_step + 1] = generated_commands
+                                clean_string[Program_step:Program_step + 1] = generated_clean
+                                program_len = len(clean_string)
+                                Command_out.value = 255
+                                if len(generated_commands) == 0:
+                                    shared_string.value = b'Log: vision() skipped'
+                                else:
+                                    research_logger.record("vision_sequence_inserted", len(generated_commands))
+                            else:
+                                error_state = 1
+                                Buttons[7] = 0
+                                update_state("program_control", {"state": "ERROR", "paused": False, "stop_requested": False, "step_requested": 0, "updated_at": time.time()})
+
+                        elif clean_string[Program_step] == 'ModbusRead()':
+                            logging.debug('Log: ModbusRead() command')
+                            if execute_modbus_read(clean_string_commands[Program_step], shared_string):
+                                Program_step = Program_step + 1
+                                Command_out.value = 255
+                            else:
+                                error_state = 1
+                                Buttons[7] = 0
+                                update_state("program_control", {"state": "ERROR", "paused": False, "stop_requested": False, "step_requested": 0, "updated_at": time.time()})
+
+                        elif clean_string[Program_step] == 'ModbusWrite()':
+                            logging.debug('Log: ModbusWrite() command')
+                            if execute_modbus_write(clean_string_commands[Program_step], shared_string):
+                                Program_step = Program_step + 1
+                                Command_out.value = 255
+                            else:
+                                error_state = 1
+                                Buttons[7] = 0
+                                update_state("program_control", {"state": "ERROR", "paused": False, "stop_requested": False, "step_requested": 0, "updated_at": time.time()})
+
+                        elif clean_string[Program_step] == 'timestamp()':
+                            logging.debug('Log: timestamp() command')
+                            if execute_timestamp_command(clean_string_commands[Program_step], shared_string):
+                                Program_step = Program_step + 1
+                                Command_out.value = 255
+                            else:
+                                error_state = 1
+                                Buttons[7] = 0
+                                update_state("program_control", {"state": "ERROR", "paused": False, "stop_requested": False, "step_requested": 0, "updated_at": time.time()})
+
                         elif clean_string[Program_step] == 'Dummy()':
                             logging.debug('Log: Dummy() command')
                             Command_out.value = 255 # Set dummy data
@@ -2121,6 +2193,13 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
                             Program_step = 1
                             Robot_mode = "Dummy"
                             Buttons[7] = 0
+                            update_state("program_control", {"state": "IDLE", "paused": False, "stop_requested": False, "step_requested": 0, "updated_at": time.time()})
+                            try:
+                                modbus_manager.write_value("cycle_done", True)
+                                modbus_manager.write_value("error_flag", False)
+                            except Exception:
+                                None
+                            research_logger.record("program_finished", 1)
 
 
                          # Gripper command
@@ -2157,6 +2236,9 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
                             Program_step = Program_step + 1
                             #Robot_mode = "Dummy"
                             #Buttons[7] = 0
+
+                        if program_control_state().get("state") == "STEP" and Buttons[7] == 1 and Program_step != program_step_before:
+                            finish_program_stop(Position_out,Speed_out,Command_out,Position_in,Buttons,shared_string,"Program step complete")
                            
                         
                 
@@ -2216,6 +2298,25 @@ def dummy_data(Position_out,Speed_out,Command_out,Position_in):
     for i in range(6):
         Position_out[i] = Position_in[i]
         Speed_out[i] = 0
+
+def program_control_state():
+    state = read_state("program_control", {})
+    return state if isinstance(state, dict) else {}
+
+def program_stop_requested():
+    state = program_control_state()
+    return bool(state.get("stop_requested", False)) or state.get("state") == "STOP_REQUESTED"
+
+def program_paused():
+    state = program_control_state()
+    return bool(state.get("paused", False)) or state.get("state") == "PAUSED"
+
+def finish_program_stop(Position_out,Speed_out,Command_out,Position_in,Buttons,shared_string, reason="Program stopped"):
+    Buttons[7] = 0
+    dummy_data(Position_out,Speed_out,Command_out,Position_in)
+    update_state("program_control", {"state": "IDLE", "paused": False, "stop_requested": False, "step_requested": 0, "updated_at": time.time()})
+    research_logger.record("program_idle", 1, reason)
+    shared_string.value = f"Log: {reason}".encode("utf-8")[:99]
 
 def extract_content_from_command(command):
     match = re.search(r'\((.*?)\)', command)

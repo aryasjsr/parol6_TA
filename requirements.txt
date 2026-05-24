@@ -11,12 +11,17 @@ kiwisolver==1.4.5
 matplotlib==3.8.3
 numpy==1.23.4
 oclock==1.4.0
+opencv-python>=4.9.0
+onnxruntime>=1.17.0
+openpyxl>=3.1.2
 packaging==23.2
+pandas>=2.0.0
 pgraph-python==0.6.2
 pillow==10.2.0
 progress==1.6
 pyparsing==3.1.1
 pyserial==3.5
+pymodbus>=3.6.0
 python-dateutil==2.8.2
 roboticstoolbox-python==1.0.3
 rtb-data==1.0.1
