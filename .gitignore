@@ -11,9 +11,11 @@ env/
 # Local config & runtime state (contain machine-specific absolute paths)
 config.json
 runtime_state.json
+runtime_state.*.tmp
 
 # Generated logs
 logs/
+tools/Camera/calibration_snapshots/
 
 # Local program files
 program/

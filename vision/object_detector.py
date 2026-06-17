@@ -48,17 +48,23 @@ class DetectionBundle:
     selongsong_box: np.ndarray | None  # [x1,y1,x2,y2] pixel, frame coords
     fixture_box: np.ndarray | None  # [x1,y1,x2,y2] pixel, frame coords
     pick_point_px: tuple[int, int] | None  # (u,v) safe pick point in pixel
-    pick_point_world: tuple[float, float] | None  # (X_mm, Y_mm)
+    pick_point_world: tuple[float, float] | None  # Legacy name: (X_base_mm, Y_base_mm)
     pick_safety: str = "UNKNOWN"  # "SAFE" | "MARGINAL" | "UNSAFE" | "UNKNOWN"
     conf_selongsong: float = 0.0  # confidence score class 0
     conf_fixture: float = 0.0  # confidence score class 1 (0.0 if not found)
 
     def as_dict(self) -> dict:
+        pick_point_base = (
+            [round(v, 3) for v in self.pick_point_world]
+            if self.pick_point_world is not None
+            else None
+        )
         return {
             "selongsong_box": self.selongsong_box.tolist() if self.selongsong_box is not None else None,
             "fixture_box": self.fixture_box.tolist() if self.fixture_box is not None else None,
             "pick_point_px": list(self.pick_point_px) if self.pick_point_px is not None else None,
-            "pick_point_world": [round(v, 3) for v in self.pick_point_world] if self.pick_point_world is not None else None,
+            "pick_point_base": pick_point_base,
+            "pick_point_world": pick_point_base,
             "pick_safety": self.pick_safety,
             "conf_selongsong": round(self.conf_selongsong, 3),
             "conf_fixture": round(self.conf_fixture, 3),

@@ -9,7 +9,7 @@ import platform
 import os
 from tkinter import filedialog
 import PIL
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageTk
 import logging
 import tkinter as tk
 from tkinter import ttk
@@ -17,6 +17,7 @@ from tkinter.messagebox import showinfo
 from tkinter import messagebox
 import random
 import multiprocessing
+import queue
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.animation as animation
 #from visual_kinematics.RobotSerial import *
@@ -126,7 +127,8 @@ class CollapsibleFrame(customtkinter.CTkFrame):
     def __init__(self, parent, title, content_height=None, **kwargs):
         super().__init__(parent, corner_radius=8, border_width=1, border_color=UI_BORDER, fg_color=UI_SURFACE, **kwargs)
         self.columnconfigure(0, weight=1)
-        
+        self.rowconfigure(1, weight=1)
+
         self.header_frame = customtkinter.CTkFrame(self, fg_color="transparent")
         self.header_frame.grid(row=0, column=0, sticky="ew", padx=6, pady=4)
         self.header_frame.columnconfigure(0, weight=1)
@@ -149,11 +151,13 @@ class CollapsibleFrame(customtkinter.CTkFrame):
         self.toggle_btn.grid(row=0, column=1, padx=6, pady=6, sticky="e")
         
         if content_height:
-            self.content_frame = customtkinter.CTkScrollableFrame(self, fg_color="transparent", corner_radius=0, height=content_height)
+            self.content_frame = customtkinter.CTkFrame(self, fg_color="transparent", corner_radius=0, height=content_height)
         else:
             self.content_frame = customtkinter.CTkFrame(self, fg_color="transparent", corner_radius=0)
             
-        self.content_frame.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 8))
+        self.content_frame.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 8))
+        if content_height:
+            self.content_frame.grid_propagate(False)
         self.content_frame.columnconfigure((0, 1, 2, 3), weight=1)
         
         self.is_collapsed = False
@@ -162,7 +166,7 @@ class CollapsibleFrame(customtkinter.CTkFrame):
 
     def toggle(self):
         if self.is_collapsed:
-            self.content_frame.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 8))
+            self.content_frame.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 8))
             self.toggle_btn.configure(text="▼")
             self.is_collapsed = False
         else:
@@ -177,7 +181,7 @@ padx_top_bot = 20
 def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOut_out,Timeout_out,Gripper_data_out,
          Position_in,Speed_in,Homed_in,InOut_in,Temperature_error_in,Position_error_in,Timeout_error,Timing_data_in,
          XTR_data,Gripper_data_in,
-        Joint_jog_buttons,Cart_jog_buttons,Jog_control,General_data,Buttons):
+        Joint_jog_buttons,Cart_jog_buttons,Jog_control,General_data,Buttons,program_log_queue=None):
     
 
 
@@ -195,8 +199,6 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         tabs = [
             (getattr(app, "move_mode_select_button", None), {"Jog", "Cart"}),
             (getattr(app, "I0_mode_select_button", None), {"I/O"}),
-            (getattr(app, "Calibrate_button", None), {"Calibrate"}),
-            (getattr(app, "Gripper_button", None), {"Gripper"}),
             (getattr(app, "Vision_button", None), {"Vision"}),
             (getattr(app, "Modbus_button", None), {"Modbus"}),
             (getattr(app, "Research_button", None), {"Research"}),
@@ -283,28 +285,20 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         app.I0_mode_select_button = customtkinter.CTkButton(app.menu_select_frame,text="⇅  I/O", font=_tab_font, command = raise_frame_IO)
         app.I0_mode_select_button.grid(row=0, column=1, padx=(padx_top_bot,0),pady = 5,sticky="nw")
 
-        # Calibrate button — gear / settings
-        app.Calibrate_button = customtkinter.CTkButton(app.menu_select_frame,text="⚙  Calibrate", font=_tab_font, command = raise_calibrate_frame)
-        app.Calibrate_button.grid(row=0, column=2, padx=(padx_top_bot,0) ,pady = 5,sticky="nw")
-
-        # Gripper button — pinch / clamp
-        app.Gripper_button = customtkinter.CTkButton(app.menu_select_frame,text="⊓  Gripper", font=_tab_font, command = raise_gripper_frame)
-        app.Gripper_button.grid(row=0, column=3, padx=(padx_top_bot,0) ,pady = 5,sticky="nw")
-
         # Vision button — camera lens / eye
         app.Vision_button = customtkinter.CTkButton(app.menu_select_frame,text="◉  Vision", font=_tab_font, command = raise_vision_frame)
-        app.Vision_button.grid(row=0, column=4, padx=(padx_top_bot,0) ,pady = 5,sticky="nw")
+        app.Vision_button.grid(row=0, column=2, padx=(padx_top_bot,0) ,pady = 5,sticky="nw")
 
         # Modbus button — bolt / live link
         app.Modbus_button = customtkinter.CTkButton(app.menu_select_frame,text="⚡  Modbus", font=_tab_font, command = raise_modbus_frame)
-        app.Modbus_button.grid(row=0, column=5, padx=(padx_top_bot,0) ,pady = 5,sticky="nw")
+        app.Modbus_button.grid(row=0, column=3, padx=(padx_top_bot,0) ,pady = 5,sticky="nw")
 
         # Research button — chart / analytics
         app.Research_button = customtkinter.CTkButton(app.menu_select_frame,text="▤  Research", font=_tab_font, command = raise_research_frame)
-        app.Research_button.grid(row=0, column=6, padx=(padx_top_bot,0) ,pady = 5,sticky="nw")
+        app.Research_button.grid(row=0, column=4, padx=(padx_top_bot,0) ,pady = 5,sticky="nw")
 
         app.fw_label = customtkinter.CTkLabel(app.menu_select_frame, text="Source controller fw v1.0.0", text_color=UI_GOLD, font=customtkinter.CTkFont(family='JetBrains Mono', size=12, weight='bold'))
-        app.fw_label.grid(row=0, column=7, padx=(20,10), pady=5 ,sticky="ne")
+        app.fw_label.grid(row=0, column=5, padx=(20,10), pady=5 ,sticky="ne")
 
         # help button
         help_image =Image.open(os.path.join(Image_path, "help.png"))
@@ -313,7 +307,7 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         app.help_button = customtkinter.CTkButton(app.menu_select_frame, corner_radius=0, height=1, border_spacing=10,
                                                 fg_color="transparent", text_color=("gray10", "gray90"),
                                                 image=app.help_button_image, anchor="CENTER",text = "",hover = 0,command = Open_help) #hover = 0
-        app.help_button.grid(row=0, column=8, padx=(10,0), sticky="news")
+        app.help_button.grid(row=0, column=6, padx=(10,0), sticky="news")
 
 
     def bottom_frames():
@@ -388,7 +382,7 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         app.cart_jog = customtkinter.CTkButton(app.jog_frame.content_frame,text="Cartesian jog", font = customtkinter.CTkFont(size=15, family='TkDefaultFont'),command = raise_frame_cart)
         app.cart_jog.grid(row=0, column=1, padx=20,pady = (10,20),sticky="news")
 
-        joint_names = ['Base', 'Shoulder', 'Elbow', 'Wrist 1', 'Wrist 2', 'Wrist 3']
+        joint_names = ['J1', 'J2', 'J3', 'J4', 'J5', 'J6']
 
         def button_press_left(event=None, var = 0):
             left_jog_buttons[var] = 1
@@ -467,7 +461,7 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
             app.move_arrow_right[y].bind('<ButtonRelease-1>',make_lambda4(y))
 
 
-    app.cart_frame = CollapsibleFrame(app.left_upper_stack, title="Cartesian Jog Controls")
+    app.cart_frame = CollapsibleFrame(app.left_upper_stack, title="Cartesian Jog Controls", content_height=620)
     app.cart_frame.grid(row=0, column=0, sticky="nsew")
     app.cart_frame.content_frame.grid_rowconfigure(0, weight=0)
 
@@ -695,21 +689,49 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
             store[label] = (entry, cast)
         return entry
 
-    def vision_frame():
+    def vision_frame(host=None):
+        host = host or app.vision_frame
+        for child in host.winfo_children():
+            child.destroy()
+        host.grid_columnconfigure(0, weight=0, minsize=app.vision_left_width)
+        host.grid_columnconfigure(1, weight=0)
+        host.grid_columnconfigure(2, weight=1)
+        host.grid_rowconfigure(1, weight=1)
+        app.vision_host = host
+
         cfg_all = load_config()
         cfg = cfg_all["vision"]
         workspace = cfg_all["workspace"]
+        object_info_cache = getattr(app, "_vision_object_info_cache", {})
+        cached_info_labels = (
+            object_info_cache.get("labels", {})
+            if isinstance(object_info_cache, dict)
+            else {}
+        )
+        cached_safety = (
+            str(object_info_cache.get("safety", "UNKNOWN")).upper()
+            if isinstance(object_info_cache, dict)
+            else "UNKNOWN"
+        )
 
-        title = customtkinter.CTkLabel(app.vision_frame, text="Vision System", font=customtkinter.CTkFont(size=20, weight="bold"))
-        title.grid(row=0, column=0, columnspan=3, padx=16, pady=(12, 6), sticky="w")
+        title = customtkinter.CTkLabel(host, text="Vision System", font=customtkinter.CTkFont(size=20, weight="bold"))
+        title.grid(row=0, column=0, columnspan=2, padx=16, pady=(12, 6), sticky="w")
+        detached = host is not app.vision_frame
+        app.vision_dock_button = customtkinter.CTkButton(
+            host,
+            text="Dock Vision" if detached else "Detach Vision",
+            width=110,
+            command=dock_vision_window if detached else detach_vision_window,
+        )
+        app.vision_dock_button.grid(row=0, column=2, padx=16, pady=(12, 6), sticky="e")
 
-        live_panel = customtkinter.CTkFrame(app.vision_frame, corner_radius=0)
+        live_panel = customtkinter.CTkFrame(host, corner_radius=0)
         live_panel.grid(row=1, column=0, padx=(12, 2), pady=(0, 12), sticky="nsew")
         live_panel.grid_columnconfigure(0, weight=1)
         live_panel.grid_rowconfigure(1, weight=1)
 
         # Draggable Divider Handle
-        app.vision_handle = customtkinter.CTkFrame(app.vision_frame, width=7, corner_radius=3, fg_color=UI_HANDLE, cursor="sb_h_double_arrow")
+        app.vision_handle = customtkinter.CTkFrame(host, width=7, corner_radius=3, fg_color=UI_HANDLE, cursor="sb_h_double_arrow")
         app.vision_handle.grid(row=1, column=1, sticky="ns", padx=2, pady=12)
 
         def start_vision_resize(event):
@@ -720,7 +742,7 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
             delta = event.x_root - app.vision_drag_start_x
             new_width = max(300, min(1400, app.vision_drag_start_width + delta))
             app.vision_left_width = new_width
-            app.vision_frame.grid_columnconfigure(0, minsize=new_width)
+            host.grid_columnconfigure(0, minsize=new_width)
 
         app.vision_handle.bind("<ButtonPress-1>", start_vision_resize)
         app.vision_handle.bind("<B1-Motion>", drag_vision_resize)
@@ -738,10 +760,30 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         app.vision_start.grid(row=0, column=3, padx=6, pady=4)
         app.vision_stop = customtkinter.CTkButton(controls, text="Stop Camera", command=stop_vision_camera)
         app.vision_stop.grid(row=0, column=4, padx=6, pady=4)
+        app.vision_detection_on = customtkinter.CTkButton(
+            controls,
+            text="Detection ON",
+            width=100,
+            command=lambda: set_vision_detection(True),
+        )
+        app.vision_detection_on.grid(row=1, column=3, padx=6, pady=4)
+        app.vision_detection_off = customtkinter.CTkButton(
+            controls,
+            text="Detection OFF",
+            width=100,
+            command=lambda: set_vision_detection(False),
+        )
+        app.vision_detection_off.grid(row=1, column=4, padx=6, pady=4)
 
         app.vision_feed_label = customtkinter.CTkLabel(live_panel, text="Camera feed not started", anchor="center")
         app.vision_feed_label.grid(row=1, column=0, padx=8, pady=8, sticky="nsew")
-        app.vision_safety_badge = customtkinter.CTkLabel(live_panel, text="UNKNOWN", height=28, anchor="center")
+        app.vision_feed_label.bind("<Button-1>", capture_camera_base_pixel)
+        app.vision_safety_badge = customtkinter.CTkLabel(
+            live_panel,
+            text=cached_safety,
+            height=28,
+            anchor="center",
+        )
         app.vision_safety_badge.grid(row=2, column=0, padx=8, pady=(0, 8), sticky="ew")
 
         app.vision_marginal_frame = customtkinter.CTkFrame(live_panel, corner_radius=0)
@@ -755,7 +797,7 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         app.vision_marginal_countdown.grid(row=1, column=0, columnspan=3, padx=8, pady=(0, 6), sticky="ew")
         app.vision_marginal_frame.grid_remove()
 
-        side = customtkinter.CTkScrollableFrame(app.vision_frame, corner_radius=0)
+        side = customtkinter.CTkScrollableFrame(host, corner_radius=0)
         side.grid(row=1, column=2, padx=(2, 12), pady=(0, 12), sticky="nsew")
         side.grid_columnconfigure(0, weight=1)
         app.vision_entries = {}
@@ -763,30 +805,22 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         detection = CollapsibleFrame(side, title="Detection Setup")
         detection.grid(row=0, column=0, padx=4, pady=6, sticky="ew")
         detection.content_frame.grid_columnconfigure((1, 3), weight=1)
-        customtkinter.CTkLabel(detection.content_frame, text="Method").grid(row=1, column=0, padx=6, pady=4, sticky="w")
-        app.vision_method = customtkinter.CTkOptionMenu(detection.content_frame, values=["adaptive", "canny", "hsv", "model"])
-        app.vision_method.set(str(cfg.get("detection_method", "adaptive")))
-        app.vision_method.grid(row=1, column=1, padx=6, pady=4, sticky="we")
-        app.vision_tune_live = customtkinter.CTkCheckBox(detection.content_frame, text="Tune Live")
-        app.vision_tune_live.grid(row=1, column=2, columnspan=2, padx=6, pady=4, sticky="w")
-        if bool(cfg.get("tune_live", False)):
-            app.vision_tune_live.select()
-        _grid_labeled_entry(detection.content_frame, 2, 0, "Adaptive block", cfg.get("adaptive_block_size", 11), store=app.vision_entries, cast=int)
-        _grid_labeled_entry(detection.content_frame, 2, 2, "Adaptive C", cfg.get("adaptive_c", 2), store=app.vision_entries, cast=int)
-        _grid_labeled_entry(detection.content_frame, 3, 0, "Canny t1", cfg.get("canny_threshold1", 50), store=app.vision_entries, cast=int)
-        _grid_labeled_entry(detection.content_frame, 3, 2, "Canny t2", cfg.get("canny_threshold2", 150), store=app.vision_entries, cast=int)
-        _grid_labeled_entry(detection.content_frame, 4, 0, "HSV lower", ",".join(str(x) for x in cfg.get("hsv_lower", [0, 0, 150])), width=130, store=app.vision_entries)
-        _grid_labeled_entry(detection.content_frame, 4, 2, "HSV upper", ",".join(str(x) for x in cfg.get("hsv_upper", [180, 60, 255])), width=130, store=app.vision_entries)
-        _grid_labeled_entry(detection.content_frame, 5, 0, "Min area", cfg.get("min_contour_area", 500), store=app.vision_entries, cast=int)
-        _grid_labeled_entry(detection.content_frame, 5, 2, "Max area", cfg.get("max_contour_area", 50000), store=app.vision_entries, cast=int)
-        _grid_labeled_entry(detection.content_frame, 6, 0, "Morph kernel", cfg.get("morph_kernel_size", 3), store=app.vision_entries, cast=int)
-        _grid_labeled_entry(detection.content_frame, 6, 2, "Brightness", cfg.get("brightness", 0), store=app.vision_entries, cast=int)
-        _grid_labeled_entry(detection.content_frame, 7, 0, "Contrast", cfg.get("contrast", 1.0), store=app.vision_entries, cast=float)
-        _grid_labeled_entry(detection.content_frame, 7, 2, "Zoom", cfg.get("zoom", 1.0), store=app.vision_entries, cast=float)
-        app.vision_apply = customtkinter.CTkButton(detection.content_frame, text="Apply Detection", command=lambda: save_vision_settings(False))
-        app.vision_apply.grid(row=8, column=0, columnspan=2, padx=6, pady=8, sticky="we")
-        app.vision_save = customtkinter.CTkButton(detection.content_frame, text="Save Detection", command=lambda: save_vision_settings(True))
-        app.vision_save.grid(row=8, column=2, columnspan=2, padx=6, pady=8, sticky="we")
+        customtkinter.CTkLabel(
+            detection.content_frame,
+            text="Method: ONNX model",
+            anchor="w",
+        ).grid(row=1, column=0, columnspan=4, padx=6, pady=4, sticky="we")
+        _grid_labeled_entry(detection.content_frame, 2, 0, "Brightness", cfg.get("brightness", 0), store=app.vision_entries, cast=int)
+        _grid_labeled_entry(detection.content_frame, 2, 2, "Contrast", cfg.get("contrast", 1.0), store=app.vision_entries, cast=float)
+        _grid_labeled_entry(detection.content_frame, 3, 0, "Zoom", cfg.get("zoom", 1.0), store=app.vision_entries, cast=float)
+        _grid_labeled_entry(detection.content_frame, 3, 2, "Camera width", cfg.get("camera_width", 1280), store=app.vision_entries, cast=int)
+        _grid_labeled_entry(detection.content_frame, 4, 0, "Camera height", cfg.get("camera_height", 720), store=app.vision_entries, cast=int)
+        app.vision_apply = customtkinter.CTkButton(
+            detection.content_frame,
+            text="Apply Detection",
+            command=save_vision_settings,
+        )
+        app.vision_apply.grid(row=5, column=0, columnspan=4, padx=6, pady=8, sticky="we")
 
         model = CollapsibleFrame(side, title="Model Config")
         model.grid(row=1, column=0, padx=4, pady=6, sticky="ew")
@@ -807,21 +841,21 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         app.vision_info_labels = {}
         for idx, key in enumerate(["Status", "BBox", "Centroid", "Dimension", "Pick point", "Orientation"]):
             customtkinter.CTkLabel(info.content_frame, text=key).grid(row=idx + 1, column=0, padx=6, pady=3, sticky="w")
-            label = customtkinter.CTkLabel(info.content_frame, text="-", anchor="w", justify="left")
+            label = customtkinter.CTkLabel(
+                info.content_frame,
+                text=str(cached_info_labels.get(key, "-")),
+                anchor="w",
+                justify="left",
+            )
             label.grid(row=idx + 1, column=1, padx=6, pady=3, sticky="we")
             app.vision_info_labels[key] = label
 
         pick_zone = CollapsibleFrame(side, title="Safe Pick Zone")
         pick_zone.grid(row=3, column=0, padx=4, pady=6, sticky="ew")
         pick_zone.content_frame.grid_columnconfigure((1, 3), weight=1)
-        _grid_labeled_entry(pick_zone.content_frame, 1, 0, "Inset X", cfg.get("pick_inset_x_mm", 10.0), store=app.vision_entries, cast=float)
-        _grid_labeled_entry(pick_zone.content_frame, 1, 2, "Inset Y", cfg.get("pick_inset_y_mm", 8.0), store=app.vision_entries, cast=float)
-        _grid_labeled_entry(pick_zone.content_frame, 2, 0, "Safe margin", cfg.get("safe_pick_margin_pct", 0.15), store=app.vision_entries, cast=float)
-        _grid_labeled_entry(pick_zone.content_frame, 2, 2, "Marginal timeout", cfg.get("marginal_confirm_timeout_s", 2.0), store=app.vision_entries, cast=float)
-        app.vision_preview_pick_zone = customtkinter.CTkCheckBox(pick_zone.content_frame, text="Preview Pick Zone")
-        app.vision_preview_pick_zone.grid(row=3, column=0, columnspan=4, padx=6, pady=4, sticky="w")
-        if bool(cfg.get("preview_pick_zone", True)):
-            app.vision_preview_pick_zone.select()
+        _grid_labeled_entry(pick_zone.content_frame, 1, 0, "Safe margin", cfg.get("safe_pick_margin_pct", 0.25), store=app.vision_entries, cast=float)
+        _grid_labeled_entry(pick_zone.content_frame, 1, 2, "Left offset px", cfg.get("safe_pick_left_offset_px", 0.0), store=app.vision_entries, cast=float)
+        _grid_labeled_entry(pick_zone.content_frame, 2, 0, "Marginal timeout", cfg.get("marginal_confirm_timeout_s", 2.0), store=app.vision_entries, cast=float)
 
         workspace_panel = CollapsibleFrame(side, title="Workspace")
         workspace_panel.grid(row=4, column=0, padx=4, pady=6, sticky="ew")
@@ -835,48 +869,103 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         _grid_labeled_entry(workspace_panel.content_frame, 3, 2, "Margin", workspace.get("margin_mm", 10), store=app.workspace_entries, cast=float)
         _grid_labeled_entry(workspace_panel.content_frame, 4, 0, "Offset X", cfg.get("offset_x_mm", 0), store=app.vision_entries, cast=float)
         _grid_labeled_entry(workspace_panel.content_frame, 4, 2, "Offset Y", cfg.get("offset_y_mm", 0), store=app.vision_entries, cast=float)
+        _grid_labeled_entry(workspace_panel.content_frame, 5, 0, "Z Tool offset", cfg.get("z_tool_offset_mm", 0), store=app.vision_entries, cast=float)
 
-        auto_pick = CollapsibleFrame(side, title="Auto Pick")
-        auto_pick.grid(row=5, column=0, padx=4, pady=6, sticky="ew")
-        auto_pick.content_frame.grid_columnconfigure((1, 3), weight=1)
-        _grid_labeled_entry(auto_pick.content_frame, 1, 0, "RPY deg", ",".join(str(x) for x in cfg.get("pick_pose_rpy_deg", [0, 0, 0])), width=130, store=app.vision_entries)
-        _grid_labeled_entry(auto_pick.content_frame, 1, 2, "Pick time", cfg.get("pick_move_time_s", 4.0), store=app.vision_entries, cast=float)
-        _grid_labeled_entry(auto_pick.content_frame, 2, 0, "Descent mm", cfg.get("post_pick_descent_mm", 50.0), store=app.vision_entries, cast=float)
-        _grid_labeled_entry(auto_pick.content_frame, 2, 2, "Descent time", cfg.get("post_pick_move_time_s", 2.0), store=app.vision_entries, cast=float)
-        _grid_labeled_entry(auto_pick.content_frame, 3, 0, "Gripper close", ",".join(str(x) for x in cfg.get("gripper_close", [255, 100, 120])), width=130, store=app.vision_entries)
-        customtkinter.CTkButton(auto_pick.content_frame, text="Run Vision Pick (vision())", command=run_vision_pick_now).grid(row=4, column=0, columnspan=4, padx=6, pady=(8, 4), sticky="we")
-
-        ibvs_panel = CollapsibleFrame(side, title="IBVS Visual Servoing")
-        ibvs_panel.grid(row=6, column=0, padx=4, pady=6, sticky="ew")
-        ibvs_panel.content_frame.grid_columnconfigure((1, 3), weight=1)
-        app.vision_ibvs_enabled = customtkinter.CTkCheckBox(ibvs_panel.content_frame, text="Enable IBVS")
-        app.vision_ibvs_enabled.grid(row=0, column=0, columnspan=2, padx=6, pady=4, sticky="w")
-        if bool(cfg.get("ibvs_enabled", False)):
-            app.vision_ibvs_enabled.select()
-        app.vision_ibvs_dispatch = customtkinter.CTkCheckBox(ibvs_panel.content_frame, text="Dispatch to robot")
-        app.vision_ibvs_dispatch.grid(row=0, column=2, columnspan=2, padx=6, pady=4, sticky="w")
-        _grid_labeled_entry(ibvs_panel.content_frame, 1, 0, "Depth m", cfg.get("ibvs_depth_m", 0.5), store=app.vision_entries, cast=float)
-        _grid_labeled_entry(ibvs_panel.content_frame, 1, 2, "Lambda", cfg.get("ibvs_lambda", 1.0), store=app.vision_entries, cast=float)
-        _grid_labeled_entry(ibvs_panel.content_frame, 2, 0, "Deadband px", cfg.get("ibvs_deadband_px", 4.0), store=app.vision_entries, cast=float)
-        _grid_labeled_entry(ibvs_panel.content_frame, 2, 2, "Max step mm", cfg.get("ibvs_max_step_mm", 20.0), store=app.vision_entries, cast=float)
-        customtkinter.CTkButton(ibvs_panel.content_frame, text="Start IBVS", width=110, command=start_ibvs_servo).grid(row=3, column=0, padx=6, pady=8, sticky="we")
-        customtkinter.CTkButton(ibvs_panel.content_frame, text="Stop IBVS", width=110, command=stop_ibvs_servo).grid(row=3, column=1, padx=6, pady=8, sticky="we")
-        app.vision_ibvs_status = customtkinter.CTkLabel(ibvs_panel.content_frame, text="IBVS: idle", anchor="w", justify="left")
-        app.vision_ibvs_status.grid(row=4, column=0, columnspan=4, padx=6, pady=4, sticky="we")
+        vision_tool = CollapsibleFrame(side, title="Vision Tool")
+        vision_tool.grid(row=5, column=0, padx=4, pady=6, sticky="ew")
+        vision_tool.content_frame.grid_columnconfigure((1, 3), weight=1)
+        tool_cfg = cfg.get("tool_z", {})
+        _grid_labeled_entry(vision_tool.content_frame, 1, 0, "Reference joints", ",".join(str(x) for x in tool_cfg.get("reference_joint_deg", [90, -88, 182.259, 0, 3, 180])), width=180, store=app.vision_entries)
+        _grid_labeled_entry(vision_tool.content_frame, 1, 2, "Pose tolerance", tool_cfg.get("pose_tolerance_deg", 1.0), store=app.vision_entries, cast=float)
+        _grid_labeled_entry(vision_tool.content_frame, 2, 0, "X Tool fixed", tool_cfg.get("x_tool_fixed_mm", -60.0), store=app.vision_entries, cast=float)
+        _grid_labeled_entry(vision_tool.content_frame, 2, 2, "Y Tool fixed", tool_cfg.get("y_tool_fixed_mm", 0.0), store=app.vision_entries, cast=float)
+        _grid_labeled_entry(vision_tool.content_frame, 3, 0, "Z+ min", tool_cfg.get("z_plus_min_mm", 0.0), store=app.vision_entries, cast=float)
+        _grid_labeled_entry(vision_tool.content_frame, 3, 2, "Z+ max", tool_cfg.get("z_plus_max_mm", 78.0), store=app.vision_entries, cast=float)
+        _grid_labeled_entry(vision_tool.content_frame, 4, 0, "Retreat margin", tool_cfg.get("retreat_margin_mm", 30.0), store=app.vision_entries, cast=float)
+        _grid_labeled_entry(vision_tool.content_frame, 4, 2, "Vision samples", tool_cfg.get("sample_count", 5), store=app.vision_entries, cast=int)
+        _grid_labeled_entry(vision_tool.content_frame, 5, 0, "Detection age", tool_cfg.get("detection_max_age_s", 1.0), store=app.vision_entries, cast=float)
+        _grid_labeled_entry(vision_tool.content_frame, 5, 2, "Runtime age", tool_cfg.get("runtime_max_age_s", 30.0), store=app.vision_entries, cast=float)
+        customtkinter.CTkButton(
+            vision_tool.content_frame,
+            text="Test Compute Tool-Z (Optional)",
+            command=run_vision_pick_now,
+        ).grid(row=6, column=0, columnspan=4, padx=6, pady=(8, 4), sticky="we")
 
         calibration = CollapsibleFrame(side, title="Camera Calibration")
-        calibration.grid(row=7, column=0, padx=4, pady=6, sticky="ew")
+        calibration.grid(row=6, column=0, padx=4, pady=6, sticky="ew")
         calibration.content_frame.grid_columnconfigure((1, 3), weight=1)
         cal_cfg = cfg.get("calibration", {})
+        camera_base_points = list(getattr(app, "camera_base_points", []))
+        camera_base_pending_pixel = getattr(app, "camera_base_pending_pixel", None)
+        camera_base_calibration_active = bool(
+            getattr(app, "camera_base_calibration_active", False)
+        )
+        app.camera_base_calibration_active = camera_base_calibration_active
+        app.camera_calibration_toggle = customtkinter.CTkButton(
+            calibration.content_frame,
+            text=f"Calibration Click: {'ON' if camera_base_calibration_active else 'OFF'}",
+            fg_color=UI_SUCCESS if camera_base_calibration_active else UI_SURFACE_HIGH,
+            command=toggle_camera_base_calibration,
+        )
+        app.camera_calibration_toggle.grid(
+            row=0,
+            column=0,
+            columnspan=4,
+            padx=6,
+            pady=(6, 2),
+            sticky="we",
+        )
         _grid_labeled_entry(calibration.content_frame, 1, 0, "Chessboard", ",".join(str(x) for x in cal_cfg.get("chessboard_size", [9, 6])), width=120, store=app.vision_entries)
         _grid_labeled_entry(calibration.content_frame, 1, 2, "Square mm", cal_cfg.get("square_size_mm", 25.0), store=app.vision_entries, cast=float)
         customtkinter.CTkButton(calibration.content_frame, text="Snap Frame", command=capture_vision_snapshot).grid(row=2, column=0, padx=6, pady=6, sticky="we")
         customtkinter.CTkButton(calibration.content_frame, text="Run Calibration", command=run_vision_calibration).grid(row=2, column=1, padx=6, pady=6, sticky="we")
-        customtkinter.CTkButton(calibration.content_frame, text="Mock Detection", command=set_mock_vision_detection).grid(row=2, column=2, padx=6, pady=6, sticky="we")
+        customtkinter.CTkButton(
+            calibration.content_frame,
+            text="Reset Intrinsic",
+            fg_color=UI_DANGER,
+            hover_color="#9F1239",
+            command=reset_vision_intrinsic,
+        ).grid(row=2, column=2, columnspan=2, padx=6, pady=6, sticky="we")
+        app.vision_chessboard_preview = customtkinter.CTkCheckBox(
+            calibration.content_frame,
+            text="Show chessboard corners",
+            command=save_vision_settings,
+        )
+        app.vision_chessboard_preview.grid(
+            row=3,
+            column=0,
+            columnspan=4,
+            padx=6,
+            pady=6,
+            sticky="w",
+        )
+        if bool(cal_cfg.get("preview_enabled", True)):
+            app.vision_chessboard_preview.select()
         app.vision_calibration = customtkinter.CTkLabel(calibration.content_frame, text="Calibration: -", anchor="w", justify="left")
-        app.vision_calibration.grid(row=3, column=0, columnspan=4, padx=6, pady=4, sticky="we")
+        app.vision_calibration.grid(row=4, column=0, columnspan=4, padx=6, pady=4, sticky="we")
+        app.camera_base_points = camera_base_points
+        app.camera_base_pending_pixel = camera_base_pending_pixel
+        app.camera_base_point_status = customtkinter.CTkLabel(
+            calibration.content_frame,
+            text=(
+                f"Calibration click {'ON' if camera_base_calibration_active else 'OFF'}; "
+                f"{len(camera_base_points)}/9 points saved"
+            ),
+            anchor="w",
+            justify="left",
+        )
+        app.camera_base_point_status.grid(row=5, column=0, columnspan=4, padx=6, pady=4, sticky="we")
+        customtkinter.CTkButton(calibration.content_frame, text="Add TCP/Base Point", command=add_camera_base_point).grid(row=6, column=0, padx=6, pady=6, sticky="we")
+        customtkinter.CTkButton(calibration.content_frame, text="Reset 9 Points", command=reset_camera_base_points).grid(row=6, column=1, padx=6, pady=6, sticky="we")
+        customtkinter.CTkButton(calibration.content_frame, text="Solve Camera-to-Base", command=solve_camera_to_base).grid(row=6, column=2, columnspan=2, padx=6, pady=6, sticky="we")
+        app.camera_base_points_text = customtkinter.CTkTextbox(calibration.content_frame, height=120)
+        app.camera_base_points_text.grid(row=7, column=0, columnspan=4, padx=6, pady=6, sticky="we")
+        refresh_camera_base_points()
         app.vision_status = customtkinter.CTkLabel(side, text="Status: stopped", anchor="w", justify="left")
-        app.vision_status.grid(row=8, column=0, padx=6, pady=8, sticky="we")
+        app.vision_status.grid(row=7, column=0, padx=6, pady=8, sticky="we")
+        app._last_vision_image_update = 0
+        start_vision_feed_loop(app.vision_feed_label)
+        start_vision_state_loop(app.vision_status)
 
     def modbus_frame():
         cfg = load_config()["modbus"]
@@ -940,6 +1029,24 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
             label.grid(row=4 + idx // 4, column=(idx % 4) * 2, columnspan=2, padx=5, pady=2, sticky="we")
             app.modbus_block_a_labels[key] = label
 
+        block_a.content_frame.grid_rowconfigure(6, weight=1)
+        block_a_log_columns = ("n", "timestamp", "response_ms", "status", "detail")
+        block_a_log_container = customtkinter.CTkFrame(block_a.content_frame, fg_color="transparent")
+        block_a_log_container.grid(row=6, column=0, columnspan=10, padx=5, pady=(4, 2), sticky="nsew")
+        block_a_log_container.grid_columnconfigure(0, weight=1)
+        block_a_log_container.grid_rowconfigure(0, weight=1)
+        app.modbus_block_a_log_tree = ttk.Treeview(block_a_log_container, columns=block_a_log_columns, show="headings", height=6)
+        block_a_log_headings = {"n": "N", "timestamp": "Time", "response_ms": "RT (ms)", "status": "Status", "detail": "Detail"}
+        block_a_log_widths = {"n": 50, "timestamp": 110, "response_ms": 80, "status": 70, "detail": 220}
+        for column in block_a_log_columns:
+            app.modbus_block_a_log_tree.heading(column, text=block_a_log_headings[column])
+            app.modbus_block_a_log_tree.column(column, width=block_a_log_widths[column], stretch=column == "detail")
+        app.modbus_block_a_log_tree.grid(row=0, column=0, sticky="nsew")
+        block_a_log_scroll = ttk.Scrollbar(block_a_log_container, orient="vertical", command=app.modbus_block_a_log_tree.yview)
+        block_a_log_scroll.grid(row=0, column=1, sticky="ns")
+        app.modbus_block_a_log_tree.configure(yscrollcommand=block_a_log_scroll.set)
+        customtkinter.CTkButton(block_a.content_frame, text="Export XLSX", width=110, command=export_modbus_block_a_xlsx).grid(row=7, column=0, columnspan=2, padx=5, pady=(2, 6), sticky="we")
+
         block_b_cfg = cfg.get("block_b", {})
         block_b = CollapsibleFrame(tests, title="Blok B - Cycle Time Test")
         block_b.grid(row=0, column=1, padx=(6, 0), pady=0, sticky="nsew")
@@ -962,6 +1069,24 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
             label = customtkinter.CTkLabel(block_b.content_frame, text=f"{key}: -", anchor="w")
             label.grid(row=3 + idx // 4, column=(idx % 4) * 2, columnspan=2, padx=5, pady=2, sticky="we")
             app.modbus_block_b_labels[key] = label
+
+        block_b.content_frame.grid_rowconfigure(5, weight=1)
+        block_b_log_columns = ("index", "timestamp", "status", "duration_s", "note")
+        block_b_log_container = customtkinter.CTkFrame(block_b.content_frame, fg_color="transparent")
+        block_b_log_container.grid(row=5, column=0, columnspan=10, padx=5, pady=(4, 2), sticky="nsew")
+        block_b_log_container.grid_columnconfigure(0, weight=1)
+        block_b_log_container.grid_rowconfigure(0, weight=1)
+        app.modbus_block_b_log_tree = ttk.Treeview(block_b_log_container, columns=block_b_log_columns, show="headings", height=6)
+        block_b_log_headings = {"index": "Idx", "timestamp": "Time", "status": "Status", "duration_s": "Duration (s)", "note": "Note"}
+        block_b_log_widths = {"index": 50, "timestamp": 110, "status": 70, "duration_s": 100, "note": 220}
+        for column in block_b_log_columns:
+            app.modbus_block_b_log_tree.heading(column, text=block_b_log_headings[column])
+            app.modbus_block_b_log_tree.column(column, width=block_b_log_widths[column], stretch=column == "note")
+        app.modbus_block_b_log_tree.grid(row=0, column=0, sticky="nsew")
+        block_b_log_scroll = ttk.Scrollbar(block_b_log_container, orient="vertical", command=app.modbus_block_b_log_tree.yview)
+        block_b_log_scroll.grid(row=0, column=1, sticky="ns")
+        app.modbus_block_b_log_tree.configure(yscrollcommand=block_b_log_scroll.set)
+        customtkinter.CTkButton(block_b.content_frame, text="Export XLSX", width=110, command=export_modbus_block_b_xlsx).grid(row=6, column=0, columnspan=2, padx=5, pady=(2, 6), sticky="we")
 
         # Draggable horizontal divider handle
         app.modbus_h_handle = customtkinter.CTkFrame(app.modbus_frame, height=7, corner_radius=3, fg_color=UI_HANDLE, cursor="sb_v_double_arrow")
@@ -1188,53 +1313,63 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         entries = getattr(app, "vision_entries", {})
         settings = {
             "video_source": app.vision_source_menu.get(),
-            "detection_method": app.vision_method.get(),
-            "tune_live": bool(app.vision_tune_live.get()),
-            "preview_pick_zone": bool(app.vision_preview_pick_zone.get()),
+            "detection_enabled": vision_manager.detection_enabled(),
+            "detection_method": "model",
             "model_path": app.vision_model_entry.get().strip(),
-            "ibvs_enabled": bool(getattr(app, "vision_ibvs_enabled", None) and app.vision_ibvs_enabled.get()),
         }
         key_map = {
-            "Adaptive block": "adaptive_block_size",
-            "Adaptive C": "adaptive_c",
-            "Canny t1": "canny_threshold1",
-            "Canny t2": "canny_threshold2",
-            "Min area": "min_contour_area",
-            "Max area": "max_contour_area",
-            "Morph kernel": "morph_kernel_size",
             "Brightness": "brightness",
             "Contrast": "contrast",
             "Zoom": "zoom",
+            "Camera width": "camera_width",
+            "Camera height": "camera_height",
             "Conf": "model_conf_threshold",
             "IoU": "model_iou_threshold",
-            "Inset X": "pick_inset_x_mm",
-            "Inset Y": "pick_inset_y_mm",
             "Safe margin": "safe_pick_margin_pct",
+            "Left offset px": "safe_pick_left_offset_px",
             "Marginal timeout": "marginal_confirm_timeout_s",
             "Offset X": "offset_x_mm",
             "Offset Y": "offset_y_mm",
-            "Pick time": "pick_move_time_s",
-            "Descent mm": "post_pick_descent_mm",
-            "Descent time": "post_pick_move_time_s",
+            "Z Tool offset": "z_tool_offset_mm",
             "Square mm": "calibration.square_size_mm",
-            "Depth m": "ibvs_depth_m",
-            "Lambda": "ibvs_lambda",
-            "Deadband px": "ibvs_deadband_px",
-            "Max step mm": "ibvs_max_step_mm",
+            "Pose tolerance": "tool_z.pose_tolerance_deg",
+            "X Tool fixed": "tool_z.x_tool_fixed_mm",
+            "Y Tool fixed": "tool_z.y_tool_fixed_mm",
+            "Z+ min": "tool_z.z_plus_min_mm",
+            "Z+ max": "tool_z.z_plus_max_mm",
+            "Retreat margin": "tool_z.retreat_margin_mm",
+            "Vision samples": "tool_z.sample_count",
+            "Detection age": "tool_z.detection_max_age_s",
+            "Runtime age": "tool_z.runtime_max_age_s",
         }
         for label, key in key_map.items():
             if label in entries:
                 entry, cast = entries[label]
-                value = _entry_value(entry, load_config()["vision"].get(key.split(".")[-1], ""), cast)
+                current_vision = load_config()["vision"]
+                if key.startswith("tool_z."):
+                    nested_key = key.split(".", 1)[1]
+                    default_value = current_vision.get("tool_z", {}).get(nested_key, "")
+                else:
+                    default_value = current_vision.get(key.split(".")[-1], "")
+                value = _entry_value(entry, default_value, cast)
                 if key.startswith("calibration."):
                     settings.setdefault("calibration", {})[key.split(".", 1)[1]] = value
+                elif key.startswith("tool_z."):
+                    settings.setdefault("tool_z", {})[key.split(".", 1)[1]] = value
                 else:
                     settings[key] = value
-        settings["hsv_lower"] = _parse_int_list(entries["HSV lower"][0].get(), [0, 0, 150])
-        settings["hsv_upper"] = _parse_int_list(entries["HSV upper"][0].get(), [180, 60, 255])
-        settings["pick_pose_rpy_deg"] = _parse_float_list(entries["RPY deg"][0].get(), [0.0, 0.0, 0.0])[:3]
-        settings["gripper_close"] = _parse_int_list(entries["Gripper close"][0].get(), [255, 100, 120])[:3]
-        settings["calibration"]["chessboard_size"] = _parse_int_list(entries["Chessboard"][0].get(), [9, 6])[:2]
+        settings.setdefault("calibration", {})["chessboard_size"] = _parse_int_list(
+            entries["Chessboard"][0].get(),
+            [9, 6],
+        )[:2]
+        settings["calibration"]["preview_enabled"] = bool(
+            getattr(app, "vision_chessboard_preview", None)
+            and app.vision_chessboard_preview.get()
+        )
+        settings.setdefault("tool_z", {})["reference_joint_deg"] = _parse_float_list(
+            entries["Reference joints"][0].get(),
+            [90.0, -88.0, 182.259, 0.0, 3.0, 180.0],
+        )[:6]
         return settings
 
     def build_workspace_settings():
@@ -1245,24 +1380,27 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
             workspace[key] = _entry_value(entry, load_config()["workspace"].get(key, 0), cast)
         return workspace
 
-    def save_vision_settings(persist=True):
+    def save_vision_settings():
         settings = build_vision_settings()
         workspace = build_workspace_settings()
-        if persist:
-            cfg = load_config()
-            calibration_update = settings.pop("calibration", {})
-            cfg["vision"].update(settings)
-            cfg["vision"].setdefault("calibration", {}).update(calibration_update)
-            cfg["workspace"].update(workspace)
-            save_config(cfg)
-        else:
-            calibration_update = settings.pop("calibration", {})
-            if calibration_update:
-                cfg = load_config()
-                cfg["vision"].setdefault("calibration", {}).update(calibration_update)
-                save_config(cfg)
+        previous_cfg = load_config()
+        previous_vision = previous_cfg.get("vision", {})
+        calibration_changed = (
+            str(previous_vision.get("video_source", "")) != str(settings.get("video_source", ""))
+            or float(previous_vision.get("zoom", 1.0)) != float(settings.get("zoom", 1.0))
+            or int(previous_vision.get("camera_width", 1280)) != int(settings.get("camera_width", 1280))
+            or int(previous_vision.get("camera_height", 720)) != int(settings.get("camera_height", 720))
+        )
+        cfg = previous_cfg
+        calibration_update = settings.pop("calibration", {})
+        cfg["vision"].update(settings)
+        cfg["vision"].setdefault("calibration", {}).update(calibration_update)
+        if calibration_changed:
+            cfg["vision"].setdefault("camera_to_base", {})["valid"] = False
+        cfg["workspace"].update(workspace)
+        save_config(cfg)
         vision_manager.save_settings(settings, workspace)
-        research_logger.record("vision_settings_saved", 1, "persist" if persist else "live")
+        research_logger.record("vision_settings_saved", 1, "apply")
         shared_string.value = b'Log: Vision settings saved'
 
     def refresh_vision_sources():
@@ -1278,13 +1416,13 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
             app.vision_model_entry.insert(0, path)
 
     def load_vision_model():
-        save_vision_settings(True)
+        save_vision_settings()
         status = vision_manager.load_model(app.vision_model_entry.get().strip())
         app.vision_model_status.configure(text="Model: " + str(status))
         research_logger.record("vision_model_load", 1 if status == "LOADED" else 0, status)
 
     def start_vision_camera():
-        save_vision_settings(True)
+        save_vision_settings()
         source = app.vision_source_menu.get()
         vision_manager.start(source)
         research_logger.record("vision_start", 1, source)
@@ -1293,9 +1431,87 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         vision_manager.stop()
         research_logger.record("vision_stop", 1)
 
-    def set_mock_vision_detection():
-        vision_manager.set_mock_detection(0.0, 0.0)
-        research_logger.record("vision_mock_detection", 1)
+    def set_vision_detection(enabled):
+        vision_manager.set_detection_enabled(enabled)
+        app._last_vision_image_update = 0
+        research_logger.record("vision_detection_enabled", 1 if enabled else 0)
+
+    def vision_window_is_detached():
+        window = getattr(app, "vision_detached_window", None)
+        if window is None:
+            return False
+        try:
+            return bool(window.winfo_exists())
+        except Exception:
+            return False
+
+    def detach_vision_window():
+        if vision_window_is_detached():
+            app.vision_detached_window.lift()
+            app.vision_detached_window.focus_force()
+            return
+        save_vision_settings()
+        for child in app.vision_frame.winfo_children():
+            child.destroy()
+
+        placeholder = customtkinter.CTkFrame(app.vision_frame, fg_color="transparent")
+        placeholder.grid(row=0, column=0, columnspan=3, rowspan=2, sticky="nsew")
+        placeholder.grid_columnconfigure(0, weight=1)
+        placeholder.grid_rowconfigure(0, weight=1)
+        customtkinter.CTkLabel(
+            placeholder,
+            text="Vision is open in a separate window",
+            font=customtkinter.CTkFont(size=18, weight="bold"),
+        ).grid(row=0, column=0, padx=20, pady=(20, 8))
+        customtkinter.CTkButton(
+            placeholder,
+            text="Dock Vision",
+            command=dock_vision_window,
+        ).grid(row=1, column=0, padx=20, pady=(0, 20))
+
+        window = customtkinter.CTkToplevel(app)
+        app.vision_detached_window = window
+        window.title("PAROL6 Vision")
+        window.geometry("1600x900")
+        window.minsize(1000, 650)
+        window.protocol("WM_DELETE_WINDOW", dock_vision_window)
+        detached_host = customtkinter.CTkFrame(
+            window,
+            corner_radius=8,
+            fg_color=UI_SURFACE,
+            border_width=1,
+            border_color=UI_BORDER,
+        )
+        detached_host.pack(fill="both", expand=True, padx=5, pady=5)
+        app.vision_detached_host = detached_host
+        vision_frame(detached_host)
+        window.lift()
+
+    def dock_vision_window():
+        if not vision_window_is_detached():
+            return
+        try:
+            save_vision_settings()
+        except Exception as exc:
+            logging.warning("Could not save Vision settings before docking: %s", exc)
+        window = app.vision_detached_window
+        app.vision_detached_window = None
+        try:
+            window.destroy()
+        except Exception:
+            pass
+        vision_frame(app.vision_frame)
+        if getattr(app, "current_menu", "") == "Vision":
+            app.vision_frame.grid(
+                row=1,
+                column=0,
+                columnspan=4,
+                rowspan=4,
+                padx=(5, 5),
+                pady=5,
+                sticky="news",
+            )
+            app.vision_frame.tkraise()
 
     def set_marginal_decision(decision):
         state = read_state("vision_confirmation", {})
@@ -1303,15 +1519,273 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         update_state("vision_confirmation", {"status": decision, "token": token, "decision": decision, "updated_at": time.time()})
         research_logger.record("marginal_" + decision, 1)
 
+    def toggle_camera_base_calibration():
+        active = not bool(getattr(app, "camera_base_calibration_active", False))
+        app.camera_base_calibration_active = active
+        app.camera_calibration_toggle.configure(
+            text=f"Calibration Click: {'ON' if active else 'OFF'}",
+            fg_color=UI_SUCCESS if active else UI_SURFACE_HIGH,
+        )
+        point_count = len(getattr(app, "camera_base_points", []))
+        pending = getattr(app, "camera_base_pending_pixel", None)
+        if active and pending is not None:
+            app.camera_base_point_status.configure(
+                text=(
+                    f"Pending pixel=({pending[0]:.1f},{pending[1]:.1f}); "
+                    "jog TCP/pointer to the same physical point, then Add"
+                )
+            )
+        elif active:
+            app.camera_base_point_status.configure(
+                text=(
+                    f"Calibration click ON; {point_count}/9 points saved. "
+                    "Click the physical point in the live feed"
+                )
+            )
+        else:
+            app.camera_base_point_status.configure(
+                text=f"Calibration click OFF; {point_count}/9 points saved"
+            )
+        app._last_vision_image_update = 0
+        research_logger.record("camera_base_click_mode", 1 if active else 0)
+
+    def capture_camera_base_pixel(event):
+        if not bool(getattr(app, "camera_base_calibration_active", False)):
+            app.camera_base_point_status.configure(
+                text="Calibration click is OFF; turn it ON before selecting a point"
+            )
+            return
+        vision_state = read_state("vision", {})
+        frame_size = vision_state.get("frame_size", [0, 0]) if isinstance(vision_state, dict) else [0, 0]
+        if len(frame_size) < 2 or int(frame_size[0]) <= 0 or int(frame_size[1]) <= 0:
+            shared_string.value = b'Error: Camera-to-Base needs an active camera frame'
+            return
+        display_size = getattr(app, "_vision_display_size", None)
+        if not display_size:
+            shared_string.value = b'Error: Camera-to-Base live image is not displayed'
+            return
+        display_w, display_h = [float(value) for value in display_size]
+        composed_size = vision_state.get("display_frame_size", frame_size)
+        if len(composed_size) < 2 or int(composed_size[0]) <= 0 or int(composed_size[1]) <= 0:
+            composed_size = frame_size
+        composed_w, composed_h = [float(value) for value in composed_size]
+        click_widget = getattr(event, "widget", app.vision_feed_label)
+        label_w = float(max(click_widget.winfo_width(), 1))
+        label_h = float(max(click_widget.winfo_height(), 1))
+        origin_x = (label_w - display_w) / 2.0
+        origin_y = (label_h - display_h) / 2.0
+        local_x = float(event.x) - origin_x
+        local_y = float(event.y) - origin_y
+        camera_display_w = display_w * float(frame_size[0]) / composed_w
+        camera_display_h = display_h * float(frame_size[1]) / composed_h
+        if (
+            local_x < 0
+            or local_y < 0
+            or local_x > camera_display_w
+            or local_y > camera_display_h
+        ):
+            shared_string.value = b'Error: Click inside the camera image, not the mask preview'
+            return
+        pixel_u = local_x * composed_w / display_w
+        pixel_v = local_y * composed_h / display_h
+        app.camera_base_pending_pixel = [pixel_u, pixel_v]
+        app.camera_base_point_status.configure(
+            text=(
+                f"Pending pixel=({pixel_u:.1f},{pixel_v:.1f}); "
+                "jog TCP/pointer to the same physical point, then Add"
+            )
+        )
+        app._last_vision_image_update = 0
+
+    def draw_camera_base_calibration_overlay(image, frame_size, display_frame_size):
+        if not bool(getattr(app, "camera_base_calibration_active", False)):
+            return image
+        if len(frame_size) < 2 or int(frame_size[0]) <= 0 or int(frame_size[1]) <= 0:
+            return image
+        if (
+            len(display_frame_size) < 2
+            or int(display_frame_size[0]) <= 0
+            or int(display_frame_size[1]) <= 0
+        ):
+            display_frame_size = frame_size
+
+        marked = image.copy()
+        draw = ImageDraw.Draw(marked)
+        scale_x = float(marked.width) / float(display_frame_size[0])
+        scale_y = float(marked.height) / float(display_frame_size[1])
+        radius = max(7, int(min(marked.size) * 0.014))
+        line_width = max(2, radius // 4)
+
+        def draw_marker(pixel, color, label):
+            x = float(pixel[0]) * scale_x
+            y = float(pixel[1]) * scale_y
+            draw.ellipse(
+                (x - radius, y - radius, x + radius, y + radius),
+                outline=color,
+                width=line_width,
+            )
+            draw.line((x - radius * 1.4, y, x + radius * 1.4, y), fill=color, width=line_width)
+            draw.line((x, y - radius * 1.4, x, y + radius * 1.4), fill=color, width=line_width)
+            draw.text((x + radius + 4, y - radius), label, fill=color)
+
+        for index, point in enumerate(getattr(app, "camera_base_points", []), start=1):
+            pixel = point.get("pixel") if isinstance(point, dict) else None
+            if pixel is not None and len(pixel) >= 2:
+                draw_marker(pixel, (0, 255, 255), f"P{index}")
+
+        pending = getattr(app, "camera_base_pending_pixel", None)
+        if pending is not None and len(pending) >= 2:
+            draw_marker(pending, (255, 215, 0), "PENDING")
+        return marked
+
+    def render_vision_feed(label, vision_state=None):
+        if label is not getattr(app, "vision_feed_label", None):
+            return False
+        try:
+            if not label.winfo_exists():
+                return False
+        except (tk.TclError, RuntimeError):
+            return False
+
+        image = vision_manager.latest_frame_image()
+        if image is None:
+            return False
+        vision_state = vision_state if isinstance(vision_state, dict) else read_state("vision", {})
+        frame_size = vision_state.get("frame_size", [0, 0])
+        display_frame_size = vision_state.get("display_frame_size", frame_size)
+        image = draw_camera_base_calibration_overlay(
+            image,
+            frame_size,
+            display_frame_size,
+        )
+        ctk_image = customtkinter.CTkImage(
+            light_image=image,
+            dark_image=image,
+            size=image.size,
+        )
+        label._vision_ctk_image = ctk_image
+        app._vision_ctk_image = ctk_image
+        widget_scaling = label._get_widget_scaling()
+        app._vision_display_size = ctk_image._get_scaled_size(widget_scaling)
+        label.configure(image=ctk_image, text="")
+        app._last_vision_image_update = time.monotonic()
+        return True
+
+    def start_vision_feed_loop(label):
+        def update_feed():
+            if label is not getattr(app, "vision_feed_label", None):
+                return
+            try:
+                if not label.winfo_exists():
+                    return
+                if getattr(app, "current_menu", "") == "Vision" or vision_window_is_detached():
+                    render_vision_feed(label)
+                label.after(100, update_feed)
+            except (tk.TclError, RuntimeError):
+                return
+            except Exception as exc:
+                logging.warning("Vision live-feed refresh failed: %s", exc)
+                try:
+                    label.after(250, update_feed)
+                except (tk.TclError, RuntimeError):
+                    pass
+
+        label.after_idle(update_feed)
+
+    def refresh_camera_base_points():
+        if not hasattr(app, "camera_base_points_text"):
+            return
+        app.camera_base_points_text.delete("1.0", tk.END)
+        for index, point in enumerate(getattr(app, "camera_base_points", []), start=1):
+            pixel = point["pixel"]
+            base = point["base"]
+            app.camera_base_points_text.insert(
+                tk.END,
+                (
+                    f"{index:02d}: pixel=({pixel[0]:.1f},{pixel[1]:.1f}) "
+                    f"Base=({base[0]:.3f},{base[1]:.3f})\n"
+                ),
+            )
+
+    def add_camera_base_point():
+        pending = getattr(app, "camera_base_pending_pixel", None)
+        if pending is None:
+            shared_string.value = b'Error: Click a camera point before adding Base point'
+            return
+        q_current = np.array(
+            [PAROL6_ROBOT.STEPS2RADS(Position_in[index], index) for index in range(6)],
+            dtype=float,
+        )
+        transform = PAROL6_ROBOT.robot.fkine(q_current)
+        tcp_mm = np.asarray(transform.t, dtype=float) * 1000.0
+        app.camera_base_points.append(
+            {
+                "pixel": [float(pending[0]), float(pending[1])],
+                "base": [float(tcp_mm[0]), float(tcp_mm[1])],
+            }
+        )
+        app.camera_base_pending_pixel = None
+        app.camera_base_point_status.configure(
+            text=(
+                f"Calibration click {'ON' if app.camera_base_calibration_active else 'OFF'}; "
+                f"{len(app.camera_base_points)}/9 points saved"
+            )
+        )
+        refresh_camera_base_points()
+        app._last_vision_image_update = 0
+
+    def reset_camera_base_points():
+        app.camera_base_points = []
+        app.camera_base_pending_pixel = None
+        app.camera_base_point_status.configure(
+            text=(
+                f"Calibration click {'ON' if app.camera_base_calibration_active else 'OFF'}; "
+                "0/9 points saved"
+            )
+        )
+        refresh_camera_base_points()
+        app._last_vision_image_update = 0
+
+    def solve_camera_to_base():
+        points = list(getattr(app, "camera_base_points", []))
+        if len(points) < 9:
+            shared_string.value = f"Error: Camera-to-Base needs 9 points; got {len(points)}".encode("utf-8")[:99]
+            return
+        try:
+            result = vision_manager.run_camera_to_base_calibration(
+                [point["pixel"] for point in points],
+                [point["base"] for point in points],
+            )
+        except Exception as exc:
+            shared_string.value = f"Error: Camera-to-Base failed {exc}".encode("utf-8")[:99]
+            research_logger.record("camera_to_base_error", 1, str(exc))
+            return
+        app.camera_base_point_status.configure(
+            text=(
+                f"Camera-to-Base valid: RMS={result['rms_error_mm']:.3f} mm, "
+                f"max={result['max_error_mm']:.3f} mm"
+            )
+        )
+        shared_string.value = b'Log: Camera-to-Base calibration complete'
+        research_logger.record("camera_to_base_calibration", 1, str(result))
+
     def capture_vision_snapshot():
         try:
+            save_vision_settings()
             count = vision_manager.capture_snapshot()
-            shared_string.value = f"Log: Calibration snapshot {count}".encode("utf-8")[:99]
+            summary = vision_manager.calibration_summary()
+            snapshot_path = str(summary.get("last_snapshot_path", ""))
+            valid = bool(summary.get("last_snapshot_valid", False))
+            filename = os.path.basename(snapshot_path) if snapshot_path else "-"
+            shared_string.value = (
+                f"Log: Snapshot {count} {'FOUND' if valid else 'NO BOARD'} {filename}"
+            ).encode("utf-8")[:99]
             research_logger.record("vision_calibration_snapshot", count)
         except Exception as exc:
             shared_string.value = f"Error: Snapshot failed {exc}".encode("utf-8")[:99]
 
     def run_vision_calibration():
+        save_vision_settings()
         settings = build_vision_settings()
         cal = settings.get("calibration", {})
         chessboard = tuple(cal.get("chessboard_size", [9, 6])[:2])
@@ -1324,10 +1798,47 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
             shared_string.value = f"Error: Calibration failed {exc}".encode("utf-8")[:99]
             research_logger.record("vision_calibration_error", 1, str(exc))
 
-    def run_vision_pick_now():
-        save_vision_settings(True)
+    def reset_vision_intrinsic():
+        confirmed = messagebox.askyesno(
+            "Reset Intrinsic Calibration",
+            (
+                "Hapus hasil intrinsic, seluruh snapshot calibration, dan "
+                "Camera-to-Base calibration?\n\n"
+                "Pengaturan Chessboard dan Square mm tetap dipertahankan."
+            ),
+        )
+        if not confirmed:
+            return
         try:
-            sequence = build_vision_pick_sequence(shared_string)
+            save_vision_settings()
+            summary = vision_manager.reset_intrinsic_calibration(delete_snapshots=True)
+            app.camera_base_points = []
+            app.camera_base_pending_pixel = None
+            refresh_camera_base_points()
+            app.camera_base_point_status.configure(
+                text="Calibration click OFF; 0/9 points saved"
+            )
+            app.camera_base_calibration_active = False
+            app.camera_calibration_toggle.configure(
+                text="Calibration Click: OFF",
+                fg_color=UI_SURFACE_HIGH,
+            )
+            app._last_vision_image_update = 0
+            deleted = int(summary.get("deleted_snapshots", 0))
+            shared_string.value = (
+                f"Log: Intrinsic reset; {deleted} snapshots deleted"
+            ).encode("utf-8")[:99]
+            research_logger.record("vision_intrinsic_reset", deleted)
+        except Exception as exc:
+            shared_string.value = (
+                f"Error: Intrinsic reset failed {exc}"
+            ).encode("utf-8")[:99]
+            research_logger.record("vision_intrinsic_reset_error", 1, str(exc))
+
+    def run_vision_pick_now():
+        save_vision_settings()
+        try:
+            sequence = build_vision_pick_sequence(shared_string, program_log_queue)
         except Exception as exc:
             shared_string.value = f"Error: vision pick failed {exc}".encode("utf-8")[:99]
             research_logger.record("vision_pick_error", 1, str(exc))
@@ -1340,26 +1851,6 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         except Exception:
             pass
         research_logger.record("vision_pick_dry_run", len(sequence), "|".join(sequence))
-
-    def start_ibvs_servo():
-        save_vision_settings(True)
-        dispatch = bool(app.vision_ibvs_dispatch.get())
-        ipc = {"shared_string": shared_string}
-        try:
-            status = vision_manager.start_ibvs(ipc_arrays=ipc, dispatch=dispatch)
-            app.vision_ibvs_status.configure(text=f"IBVS: started (dispatch={dispatch})")
-            research_logger.record("ibvs_start", 1, str(status))
-        except Exception as exc:
-            app.vision_ibvs_status.configure(text=f"IBVS: error {exc}")
-            research_logger.record("ibvs_start_error", 1, str(exc))
-
-    def stop_ibvs_servo():
-        try:
-            vision_manager.stop_ibvs()
-            app.vision_ibvs_status.configure(text="IBVS: stopped")
-            research_logger.record("ibvs_stop", 1)
-        except Exception as exc:
-            app.vision_ibvs_status.configure(text=f"IBVS: error {exc}")
 
     def add_modbus_row(row=None):
         row = row or {"name": "signal", "type": "coil", "address": 0, "rw": "read", "desc": ""}
@@ -1481,6 +1972,129 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         modbus_manager.stop_block_b()
         research_logger.record("modbus_block_b_ui_stop", 1)
 
+    def _format_modbus_timestamp(epoch_value):
+        try:
+            return datetime.fromtimestamp(float(epoch_value)).strftime("%H:%M:%S.%f")[:-3]
+        except Exception:
+            return ""
+
+    def _write_modbus_samples_workbook(path, samples, sheet_title, columns, headings, meta):
+        ext = os.path.splitext(path)[1].lower()
+        iso_columns = {"timestamp"}
+        if ext == ".csv":
+            import csv as _csv
+            with open(path, "w", newline="", encoding="utf-8") as fh:
+                writer = _csv.writer(fh)
+                writer.writerow([headings.get(c, c) for c in columns])
+                for sample in samples:
+                    row = []
+                    for c in columns:
+                        v = sample.get(c, "")
+                        if c in iso_columns and v not in ("", None):
+                            try:
+                                v = datetime.fromtimestamp(float(v)).isoformat(timespec="milliseconds")
+                            except Exception:
+                                pass
+                        row.append(v)
+                    writer.writerow(row)
+            return path
+        from openpyxl import Workbook
+        wb = Workbook()
+        ws = wb.active
+        ws.title = sheet_title[:31] if sheet_title else "Samples"
+        ws.append([headings.get(c, c) for c in columns])
+        for sample in samples:
+            row = []
+            for c in columns:
+                v = sample.get(c, "")
+                if c in iso_columns and v not in ("", None):
+                    try:
+                        v = datetime.fromtimestamp(float(v)).isoformat(timespec="milliseconds")
+                    except Exception:
+                        pass
+                row.append(v)
+            ws.append(row)
+        summary_ws = wb.create_sheet("Summary")
+        summary_ws.append(["Field", "Value"])
+        for key in ("started_at", "finished_at"):
+            value = meta.get(key)
+            if value:
+                try:
+                    value = datetime.fromtimestamp(float(value)).isoformat(timespec="milliseconds")
+                except Exception:
+                    pass
+            summary_ws.append([key, value if value is not None else ""])
+        for key in ("target", "completed", "stopped_early"):
+            summary_ws.append([key, meta.get(key, "")])
+        stats = meta.get("stats", {}) or {}
+        for key, value in stats.items():
+            summary_ws.append([f"stat.{key}", value])
+        settings = meta.get("settings", {}) or {}
+        for key, value in settings.items():
+            summary_ws.append([f"setting.{key}", value])
+        wb.save(path)
+        return path
+
+    def export_modbus_block_a_xlsx():
+        samples = modbus_manager.get_block_a_full_samples()
+        if not samples:
+            messagebox.showwarning("Export Blok A", "Belum ada data. Jalankan test Blok A terlebih dahulu.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            initialfile=f"modbus_block_a_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
+            filetypes=(("Excel", "*.xlsx"), ("CSV", "*.csv")),
+        )
+        if not path:
+            return
+        meta = modbus_manager.get_block_a_full_meta()
+        if not meta.get("stats"):
+            meta["stats"] = read_state("modbus_block_a", {}).get("stats", {})
+        try:
+            exported = _write_modbus_samples_workbook(
+                path,
+                samples,
+                "Block A Samples",
+                ("n", "timestamp", "response_ms", "status", "detail"),
+                {"n": "N", "timestamp": "Timestamp", "response_ms": "Response (ms)", "status": "Status", "detail": "Detail"},
+                meta,
+            )
+        except Exception as exc:
+            messagebox.showerror("Export Blok A", f"Gagal export: {exc}")
+            return
+        research_logger.record("modbus_block_a_export", 1, str(exported))
+        messagebox.showinfo("Export Blok A", f"Berhasil disimpan ke:\n{exported}")
+
+    def export_modbus_block_b_xlsx():
+        samples = modbus_manager.get_block_b_full_samples()
+        if not samples:
+            messagebox.showwarning("Export Blok B", "Belum ada data. Jalankan test Blok B terlebih dahulu.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            initialfile=f"modbus_block_b_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
+            filetypes=(("Excel", "*.xlsx"), ("CSV", "*.csv")),
+        )
+        if not path:
+            return
+        meta = modbus_manager.get_block_b_full_meta()
+        if not meta.get("stats"):
+            meta["stats"] = read_state("modbus_block_b", {}).get("stats", {})
+        try:
+            exported = _write_modbus_samples_workbook(
+                path,
+                samples,
+                "Block B Samples",
+                ("index", "timestamp", "status", "duration_s", "note"),
+                {"index": "Index", "timestamp": "Timestamp", "status": "Status", "duration_s": "Duration (s)", "note": "Note"},
+                meta,
+            )
+        except Exception as exc:
+            messagebox.showerror("Export Blok B", f"Gagal export: {exc}")
+            return
+        research_logger.record("modbus_block_b_export", 1, str(exported))
+        messagebox.showinfo("Export Blok B", f"Berhasil disimpan ke:\n{exported}")
+
     def set_research_enabled(enabled):
         research_logger.set_enabled(enabled)
         if enabled:
@@ -1539,28 +2153,111 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         latest = vision_state.get("latest") if isinstance(vision_state, dict) else None
         bundle = vision_state.get("latest_bundle") if isinstance(vision_state, dict) else None
         status = str(vision_state.get("status", "stopped")) if isinstance(vision_state, dict) else "stopped"
-        app.vision_status.configure(text="Status: " + status)
-        app.vision_model_status.configure(text="Model: " + str(vision_state.get("model_status", "NOT LOADED")))
-        safety = "UNKNOWN"
-        if isinstance(bundle, dict) and bundle.get("pick_safety"):
-            safety = str(bundle.get("pick_safety")).upper()
-        elif isinstance(latest, dict) and latest.get("workspace_status"):
-            safety = str(latest.get("workspace_status")).upper()
+        detection_enabled = bool(
+            vision_state.get("detection_enabled", vision_manager.detection_enabled())
+        ) if isinstance(vision_state, dict) else vision_manager.detection_enabled()
+        frame_size = vision_state.get("frame_size", [0, 0]) if isinstance(vision_state, dict) else [0, 0]
+        status_text = "Status: " + status
+        if len(frame_size) >= 2 and int(frame_size[0]) > 0 and int(frame_size[1]) > 0:
+            status_text += f" | Camera actual {int(frame_size[0])}x{int(frame_size[1])}"
+        status_text += f" | Detection {'ON' if detection_enabled else 'OFF'}"
+        app.vision_status.configure(text=status_text)
+        if hasattr(app, "vision_detection_on"):
+            app.vision_detection_on.configure(
+                state="disabled" if detection_enabled else "normal",
+                fg_color=UI_SUCCESS if detection_enabled else UI_SURFACE_HIGH,
+            )
+        if hasattr(app, "vision_detection_off"):
+            app.vision_detection_off.configure(
+                state="normal" if detection_enabled else "disabled",
+                fg_color=UI_DANGER if not detection_enabled else UI_SURFACE_HIGH,
+            )
+        model_status = str(vision_state.get("model_status", "NOT LOADED"))
+        model_input = vision_state.get("model_input_size", [0, 0]) if isinstance(vision_state, dict) else [0, 0]
+        if len(model_input) >= 2 and int(model_input[0]) > 0 and int(model_input[1]) > 0:
+            model_status += f" | Input {int(model_input[0])}x{int(model_input[1])} letterbox"
+        app.vision_model_status.configure(text="Model: " + model_status)
         color_map = {"SAFE": "#7AC922", "VALID": "#7AC922", "MARGINAL": "#F5A623", "MARGIN": "#F5A623", "UNSAFE": "#E84040", "OUT": "#E84040", "UNKNOWN": "#8A9AB8"}
-        app.vision_safety_badge.configure(text=safety, text_color=color_map.get(safety, "#8A9AB8"))
+        info_values = None
+        safety = "UNKNOWN"
         if isinstance(latest, dict):
-            app.vision_info_labels["Status"].configure(text=str(latest.get("workspace_message", latest.get("status", "-"))))
-            app.vision_info_labels["BBox"].configure(text=str(latest.get("bbox_px", "-")))
-            app.vision_info_labels["Centroid"].configure(text=f"px={latest.get('centroid_px', '-')} | world={latest.get('centroid_world', '-')}")
-            app.vision_info_labels["Dimension"].configure(text=f"W={latest.get('width_mm', 0)} mm | H={latest.get('height_mm', 0)} mm")
-            app.vision_info_labels["Pick point"].configure(text=str(latest.get("pick_point_world", "-")))
-            app.vision_info_labels["Orientation"].configure(text=str(latest.get("orientation_deg", "-")))
+            safety = str(latest.get("workspace_status", "UNKNOWN")).upper()
+            info_values = {
+                "Status": str(latest.get("workspace_message", latest.get("status", "-"))),
+                "BBox": str(latest.get("bbox_px", "-")),
+                "Centroid": f"px={latest.get('centroid_px', '-')} | Base={latest.get('centroid_world', '-')}",
+                "Dimension": f"W={latest.get('width_mm', 0)} mm | H={latest.get('height_mm', 0)} mm",
+                "Pick point": f"Base={latest.get('pick_point_world', '-')}",
+                "Orientation": str(latest.get("orientation_deg", "-")),
+            }
+        elif isinstance(bundle, dict) and bundle.get("selongsong_box"):
+            box = [float(value) for value in bundle.get("selongsong_box", [])[:4]]
+            if len(box) == 4:
+                x1, y1, x2, y2 = box
+                centroid = [round((x1 + x2) / 2.0, 1), round((y1 + y2) / 2.0, 1)]
+                dimension = [round(max(0.0, x2 - x1), 1), round(max(0.0, y2 - y1), 1)]
+            else:
+                centroid = "-"
+                dimension = [0.0, 0.0]
+            safety_text = str(bundle.get("pick_safety", "UNKNOWN")).upper()
+            confidence = float(bundle.get("conf_selongsong", 0.0))
+            safety = safety_text
+            info_values = {
+                "Status": f"{safety_text} | confidence={confidence:.3f}",
+                "BBox": str(bundle.get("selongsong_box", "-")),
+                "Centroid": f"px={centroid} | Base={bundle.get('pick_point_base', '-')}",
+                "Dimension": f"W={dimension[0]} px | H={dimension[1]} px",
+                "Pick point": (
+                    f"px={bundle.get('pick_point_px', '-')} | "
+                    f"Base={bundle.get('pick_point_base', '-')}"
+                ),
+                "Orientation": "N/A (model bbox)",
+            }
+
+        if info_values is not None:
+            app._vision_object_info_cache = {
+                "labels": info_values,
+                "safety": safety,
+                "updated_at": time.time(),
+            }
+        elif not detection_enabled or status.strip().lower().startswith("stopped"):
+            app._vision_object_info_cache = {}
+            info_values = {key: "-" for key in app.vision_info_labels}
+            safety = "UNKNOWN"
         else:
-            for label in app.vision_info_labels.values():
-                label.configure(text="-")
+            cached = getattr(app, "_vision_object_info_cache", {})
+            if isinstance(cached, dict) and isinstance(cached.get("labels"), dict):
+                info_values = cached["labels"]
+                safety = str(cached.get("safety", "UNKNOWN")).upper()
+            else:
+                info_values = {key: "-" for key in app.vision_info_labels}
+
+        app.vision_safety_badge.configure(
+            text=safety,
+            text_color=color_map.get(safety, "#8A9AB8"),
+        )
+        for key, label in app.vision_info_labels.items():
+            label.configure(text=str(info_values.get(key, "-")))
         calibration = vision_state.get("calibration", {}) if isinstance(vision_state, dict) else {}
         if isinstance(calibration, dict):
-            app.vision_calibration.configure(text=f"Calibration: fx={calibration.get('fx', 0)} fy={calibration.get('fy', 0)} snapshots={calibration.get('snapshots_captured', 0)}")
+            camera_to_base = calibration.get("camera_to_base", {})
+            camera_to_base = camera_to_base if isinstance(camera_to_base, dict) else {}
+            chessboard_found = bool(vision_state.get("chessboard_found", False))
+            chessboard_pattern = vision_state.get("chessboard_pattern", [0, 0])
+            last_snapshot = os.path.basename(
+                str(calibration.get("last_snapshot_path", ""))
+            ) or "-"
+            app.vision_calibration.configure(
+                text=(
+                    f"Intrinsic: fx={calibration.get('fx', 0)} fy={calibration.get('fy', 0)} "
+                    f"snapshots={calibration.get('snapshots_captured', 0)}\n"
+                    f"Chessboard {chessboard_pattern}: "
+                    f"{'FOUND' if chessboard_found else 'NOT FOUND'} | "
+                    f"last={last_snapshot}\n"
+                    f"Camera-to-Base: {'VALID' if camera_to_base.get('valid') else 'NOT CALIBRATED'} "
+                    f"RMS={camera_to_base.get('rms_error_mm', '-')}"
+                )
+            )
         confirm = read_state("vision_confirmation", {})
         if isinstance(confirm, dict) and confirm.get("status") == "pending":
             app.vision_marginal_frame.grid()
@@ -1574,28 +2271,26 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         else:
             app.vision_marginal_frame.grid_remove()
             app.vision_marginal_countdown.configure(text="")
-        ibvs_state = read_state("vision_ibvs", {})
-        if hasattr(app, "vision_ibvs_status") and isinstance(ibvs_state, dict):
-            if ibvs_state.get("active"):
-                err = ibvs_state.get("last_err_px", {})
-                cmd = ibvs_state.get("last_cmd_mm", {})
-                app.vision_ibvs_status.configure(
-                    text=(
-                        f"IBVS: {ibvs_state.get('status', 'tracking')} | "
-                        f"err=({err.get('u_err', 0):.1f},{err.get('v_err', 0):.1f}) px | "
-                        f"cmd=({cmd.get('dx', 0):.2f},{cmd.get('dy', 0):.2f}) mm"
-                    )
-                )
-            else:
-                app.vision_ibvs_status.configure(text="IBVS: idle")
-        if getattr(app, "current_menu", "") == "Vision":
-            now = time.monotonic()
-            if now - getattr(app, "_last_vision_image_update", 0) > 0.12:
-                image = vision_manager.latest_frame_image()
-                if image is not None:
-                    app._vision_ctk_image = customtkinter.CTkImage(light_image=image, dark_image=image, size=image.size)
-                    app.vision_feed_label.configure(image=app._vision_ctk_image, text="")
-                app._last_vision_image_update = now
+
+    def start_vision_state_loop(status_label):
+        def update_state_ui():
+            if status_label is not getattr(app, "vision_status", None):
+                return
+            try:
+                if not status_label.winfo_exists():
+                    return
+                _update_vision_ui(read_state("vision", {}))
+                status_label.after(100, update_state_ui)
+            except (tk.TclError, RuntimeError):
+                return
+            except Exception as exc:
+                logging.warning("Vision state refresh failed: %s", exc)
+                try:
+                    status_label.after(250, update_state_ui)
+                except (tk.TclError, RuntimeError):
+                    pass
+
+        status_label.after_idle(update_state_ui)
 
     def _set_tree_rows(tree, rows):
         for item in tree.get_children():
@@ -1650,6 +2345,28 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         app.modbus_block_a_labels["progress"].configure(text=f"progress: {completed}/{target} {'RUNNING' if state.get('running') else 'IDLE'}")
         for key in ["avg_rt_ms", "throughput_rps", "packet_loss_pct", "success_count", "failed_count", "timeout_count"]:
             app.modbus_block_a_labels[key].configure(text=f"{key}: {stats.get(key, '-')}")
+        if hasattr(app, "modbus_block_a_log_tree"):
+            samples = modbus_manager.get_block_a_full_samples()
+            tree = app.modbus_block_a_log_tree
+            rendered = getattr(app, "_modbus_block_a_log_rendered", 0)
+            if len(samples) < rendered:
+                tree.delete(*tree.get_children())
+                rendered = 0
+            new_rows = samples[rendered:]
+            for sample in new_rows:
+                detail = str(sample.get("detail", ""))
+                if len(detail) > 200:
+                    detail = detail[:197] + "..."
+                tree.insert("", "end", values=(
+                    sample.get("n", ""),
+                    _format_modbus_timestamp(sample.get("timestamp")),
+                    sample.get("response_ms", ""),
+                    sample.get("status", ""),
+                    detail,
+                ))
+            if new_rows:
+                tree.yview_moveto(1.0)
+            app._modbus_block_a_log_rendered = len(samples)
 
     def _handle_modbus_block_b(snapshot):
         state = read_state("modbus_block_b", {})
@@ -1693,6 +2410,28 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         app.modbus_block_b_labels["failed_count"].configure(text=f"failed_count: {state.get('failed_count', 0)}")
         for key in ["avg_s", "min_s", "max_s", "std_s"]:
             app.modbus_block_b_labels[key].configure(text=f"{key}: {stats.get(key, '-')}")
+        if hasattr(app, "modbus_block_b_log_tree"):
+            samples = modbus_manager.get_block_b_full_samples()
+            tree = app.modbus_block_b_log_tree
+            rendered = getattr(app, "_modbus_block_b_log_rendered", 0)
+            if len(samples) < rendered:
+                tree.delete(*tree.get_children())
+                rendered = 0
+            new_rows = samples[rendered:]
+            for sample in new_rows:
+                note = str(sample.get("note", ""))
+                if len(note) > 200:
+                    note = note[:197] + "..."
+                tree.insert("", "end", values=(
+                    sample.get("index", ""),
+                    _format_modbus_timestamp(sample.get("timestamp")),
+                    sample.get("status", ""),
+                    sample.get("duration_s", ""),
+                    note,
+                ))
+            if new_rows:
+                tree.yview_moveto(1.0)
+            app._modbus_block_b_log_rendered = len(samples)
 
     def _update_modbus_ui(modbus_state):
         if not hasattr(app, "modbus_status"):
@@ -2198,10 +2937,129 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         #commands frame
         app.commands_frame = customtkinter.CTkFrame(app,height = 100,width = right_frames_width, corner_radius=8, fg_color=UI_SURFACE, border_width=1, border_color=UI_BORDER)
         app.commands_frame.grid(row=1, column=3, rowspan = 3, padx=(5,5), pady=5, sticky="news")
-        app.commands_frame.grid_columnconfigure(0, weight=0)
+        app.commands_frame.grid_columnconfigure(0, weight=1)
+        app.commands_frame.grid_columnconfigure(1, weight=0)
+        app.commands_frame.grid_rowconfigure(2, weight=1)
+
+        command_help = {
+            "Joint_space": ("Joint space", "Pilih command gerak joint. Nilai J1-J6 menggunakan satuan derajat."),
+            "Cartesian_space": ("Cartesian space", "Pilih command gerak Cartesian. Posisi menggunakan x, y, z dan orientasi Rx, Ry, Rz."),
+            "Conditional_stetements": ("Conditional statements", "Kelompok command kondisi. Belum ada command turunan yang tersedia."),
+            "Vision": ("Vision", "Command vision mendeteksi target dan menghitung nilai Z Tool tanpa menggerakkan robot."),
+            "Modbus": ("Modbus", "Gunakan ModbusRead untuk menunggu input dan ModbusWrite untuk mengubah output."),
+            "Research": ("Research", "Gunakan timestamp dan print untuk pencatatan eksperimen dan pesan log."),
+            "Begin": ("Begin()", "Contoh:\nBegin()\n\nRekomendasi:\nWajib menjadi baris pertama program."),
+            "End": ("End()", "Contoh:\nEnd()\n\nRekomendasi:\nGunakan pada baris terakhir untuk menjalankan program satu kali."),
+            "Loop": ("Loop()", "Contoh:\nLoop()\n\nRekomendasi:\nGunakan sebagai pengganti End() agar program mengulang dari awal."),
+            "Delay": ("Delay(seconds)", "Contoh:\nDelay(1.0)\n\nRekomendasi:\nGunakan nilai detik yang lebih besar dari interval kontrol."),
+            "MoveJoint": (
+                "MoveJoint(J1,J2,J3,J4,J5,J6, options)",
+                "Contoh:\n"
+                "MoveJoint(0,-90,180,0,10,180,t=4)\n\n"
+                "Satuan: J1-J6 dalam derajat.\n\n"
+                "Batas nominal (nilai batas tepat ditolak):\n"
+                "J1: -123.046875 < J1 < 123.046875\n"
+                "J2: -145.0088 < J2 < -3.375\n"
+                "J3: 107.866 < J3 < 287.8675\n"
+                "J4: -105.46975 < J4 < 105.46975\n"
+                "J5: -90 < J5 < 90\n"
+                "J6: 0 < J6 < 360\n\n"
+                "Margin operasional yang disarankan:\n"
+                "J1 -122..122, J2 -144..-4, J3 109..286,\n"
+                "J4 -104..104, J5 -89..89, J6 1..359.\n\n"
+                "Opsi gerakan:\n"
+                "t > 0 detik (disarankan >= 0.1), atau v=0..100 dan a=0..100.\n"
+                "Jika t diberikan, v dan a diabaikan. Profil: trap atau poly."
+            ),
+            "MovePose": (
+                "MovePose(x,y,z,Rx,Ry,Rz, options)",
+                "Contoh:\nMovePose(250,0,200,180,0,180,t=4)\n\nRekomendasi:\nGunakan pose yang sudah diverifikasi dapat dicapai robot."
+            ),
+            "MoveCart": (
+                "MoveCart(x,y,z,Rx,Ry,Rz, options)",
+                "Contoh:\n"
+                "MoveCart(250,0,200,180,0,180,t=4,trap)\n\n"
+                "Satuan: x,y,z dalam mm; Rx,Ry,Rz dalam derajat.\n"
+                "Pose bersifat absolut terhadap base robot.\n\n"
+                "Batas Cartesian:\n"
+                "- Tidak ada batas x, y, atau z yang berdiri sendiri.\n"
+                "- Seluruh lintasan harus memiliki solusi IK dan memenuhi batas J1-J6.\n"
+                "- Radius sqrt(x^2+y^2+z^2) normalnya harus di bawah 440 mm.\n"
+                "- Saat J5 mendekati +/-90 derajat, batas radius turun hingga sekitar 395 mm.\n"
+                "- Gunakan radius <= 400 mm sebagai margin operasional.\n"
+                "- Rx,Ry,Rz disarankan dinormalisasi ke -180..180 derajat.\n"
+                "- Hindari pose singular, terutama wrist dengan J5 dekat 0 derajat.\n\n"
+                "Opsi gerakan:\n"
+                "Gunakan t > 0 detik (disarankan >= 0.1). v dan a menerima 0..100,\n"
+                "tetapi perhitungan durasi Cartesian saat ini lebih aman menggunakan t.\n"
+                "Profil: trap atau poly."
+            ),
+            "MoveCartRelTRF": (
+                "MoveCartRelTRF(dx,dy,dz,dRx,dRy,dRz, options)",
+                "Contoh:\n"
+                "MoveCartRelTRF(0,0,20,0,0,0,t=1)\n\n"
+                "Satuan: dx,dy,dz dalam mm; dRx,dRy,dRz dalam derajat.\n"
+                "Gerakan relatif mengikuti sumbu lokal tool, bukan sumbu base.\n\n"
+                "Batas dan rekomendasi:\n"
+                "- Tidak ada batas angka relatif yang tetap karena bergantung pose awal.\n"
+                "- Pose akhir dan seluruh lintasan harus lolos IK serta batas J1-J6.\n"
+                "- Radius terhadap base tetap dibatasi sekitar 395..440 mm.\n"
+                "- Satu langkah disarankan dx,dy,dz antara -20..20 mm.\n"
+                "- Satu langkah rotasi disarankan dRx,dRy,dRz antara -5..5 derajat.\n"
+                "- Bagi perpindahan besar menjadi beberapa command kecil.\n"
+                "- Hindari pose singular, terutama wrist dengan J5 dekat 0 derajat.\n\n"
+                "Opsi gerakan:\n"
+                "Gunakan t > 0 detik (disarankan >= 0.1). v dan a menerima 0..100,\n"
+                "tetapi perhitungan durasi Cartesian saat ini lebih aman menggunakan t.\n"
+                "Profil: trap atau poly."
+            ),
+            "Output": ("Output(channel,state)", "Contoh:\nOutput(1,HIGH)\n\nRekomendasi:\nChannel yang tersedia: 1 atau 2. State: HIGH atau LOW."),
+            "Gripper": ("Gripper(position,speed,current)", "Contoh:\nGripper(255,100,120)\n\nRekomendasi:\nPosition/speed: 0-255. Current: 100-1000."),
+            "Gripper_cal": ("Gripper_cal()", "Contoh:\nGripper_cal()\n\nRekomendasi:\nJalankan kalibrasi sebelum command gripper jika gripper belum dikalibrasi."),
+            "vision": (
+                "vision()",
+                "Contoh:\nvision()\nprint(\"$vision.z_plus\")\n\n"
+                "Menghasilkan $vision.z_plus dan $vision.z_minus. "
+                "Perhitungan berjalan otomatis tanpa menekan tombol GUI. "
+                "Command ini tidak menggerakkan robot dan dapat dijalankan offline."
+            ),
+            "ModbusRead": (
+                "ModbusRead(selector,value,timeout)",
+                "Contoh:\nModbusRead(trigger_pick,HIGH,timeout=5)\n\nRekomendasi:\nTambahkan timeout agar program tidak menunggu tanpa batas."
+            ),
+            "ModbusWrite": (
+                "ModbusWrite(selector,value)",
+                "Contoh:\nModbusWrite(cycle_done,HIGH)\n\nRekomendasi:\nGunakan nama selector yang terdaftar pada konfigurasi Modbus."
+            ),
+            "timestamp": (
+                "timestamp(mode,label)",
+                'Contoh:\ntimestamp(record,label="pick_done")\n\nRekomendasi:\nMode yang tersedia: start, stop, atau record.'
+            ),
+            "print": (
+                "print(message)",
+                'Contoh:\nprint("Z+ Tool = $vision.z_plus mm")\n\n'
+                "Placeholder vision dicetak dengan tiga angka desimal."
+            ),
+        }
+        unsupported_help = {
+            "Home", "Input", "Get_data", "Timeouts", "SpeedJoint", "SpeedCart"
+        }
 
         app.select_current_position = customtkinter.CTkRadioButton(master=app.commands_frame, text="Current position/Pose",  value=2,command = Current_position)
         app.select_current_position.grid(row=0, column=0, pady=10, padx=20, sticky="we")
+
+        app.collapse_commands_button = customtkinter.CTkButton(
+            app.commands_frame,
+            text="▶",
+            width=28,
+            height=28,
+            corner_radius=6,
+            fg_color=UI_ACCENT_SOFT,
+            hover_color=UI_BORDER,
+            text_color=UI_ON_SURFACE,
+            command=lambda: toggle_layout_panel("right"),
+        )
+        app.collapse_commands_button.grid(row=0, column=1, padx=(0, 8), pady=8, sticky="ne")
 
         app.select_custom_position = customtkinter.CTkRadioButton(master=app.commands_frame, text="Custom positon/Pose",  value=2,command = Custom_position)
         app.select_custom_position.grid(row=1, column=0, pady=10, padx=20, sticky="we")
@@ -2240,68 +3098,127 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
                                                     corner_radius=15,
                                                     height=100,
                                                     width=0)
-        
-        app.add_menu_display211.grid(pady=3, padx=5, sticky="nws")
+        app.add_menu_display211.grid(row=2, column=0, pady=3, padx=5, sticky="nsew")
+        app.add_menu_display211.grid_columnconfigure(0, weight=1)
+        app.add_menu_display211.grid_rowconfigure(0, weight=1)
 
         columns = ( 'item')
 
         app.table = ttk.Treeview(master=app.add_menu_display211,
                         columns=columns,
-                        height=30,
+                        height=12,
                         selectmode='browse',
-                        show='headings')
+                        show='tree')
         
-        app.table.column("#0", anchor="c", minwidth=200, width=250)
-        app.table.column("#1", anchor="c", minwidth=200, width=250)
+        app.table.column("#0", anchor="w", minwidth=180, width=250, stretch=True)
+        app.table.column("#1", minwidth=0, width=0, stretch=False)
 
-        app.table.heading('#0', text='test')
-        app.table.heading('#1', text='Commands')
+        app.table.tag_configure("command_group", font=('Inter', 13, 'bold'), foreground=UI_ACCENT)
+        app.table.tag_configure("command_item", font=('JetBrains Mono', 13))
+        app.command_scrollbar = ttk.Scrollbar(
+            app.add_menu_display211,
+            orient="vertical",
+            command=app.table.yview,
+        )
+        app.table.configure(yscrollcommand=app.command_scrollbar.set)
         
 
         #Commands_list = ["Home","Delay","End","Loop","IO","JointVelSet","JointAccSet","JointMove","PoseMove","JointVelMove",
                             #"CartAccSet","CartVelSet","CartLinVelSet","CartAngVelSet","CartMove","CartVelMoveTRF","CartVelMoveWRF"]
         # Commands
-        Joint_space = app.table.insert(parent = '', index ='end',iid = 0,text="Parent",values="Joint_space")
-        Cart_space = app.table.insert(parent = '', index ='end',iid = 1,text="Parent",values="Cartesian_space")
-        Conditional_statements = app.table.insert(parent = '', index ='end',iid = 2,text="Parent",values="Conditional_stetements")
-        Home = app.table.insert(parent = '', index ='end',iid = 3,text="Parent",values="Home")
-        Delay = app.table.insert(parent = '', index ='end',iid = 4,text="Parent",values="Delay")
-        End = app.table.insert(parent = '', index ='end',iid = 5,text="Parent",values="End")
-        Loop = app.table.insert(parent = '', index ='end',iid = 6,text="Parent",values="Loop")
-        Begin_ = app.table.insert(parent = '', index ='end',iid = 7,text="Parent",values="Begin")
-        Input_var_ = app.table.insert(parent = '', index ='end',iid = 8,text="Parent",values="Input")
-        Output_var_ = app.table.insert(parent = '', index ='end',iid = 9,text="Parent",values="Output")
-        Gripper = app.table.insert(parent = '', index ='end',iid = 10,text="Parent",values="Gripper")
-        Gripper_cal = app.table.insert(parent = '', index ='end',iid = 11,text="Parent",values="Gripper_cal")
-        Get_data = app.table.insert(parent = '', index ='end',iid = 12,text="Parent",values="Get_data")
-        Timeouts = app.table.insert(parent = '', index ='end',iid = 13,text="Parent",values="Timeouts")
-        Vision_cmds = app.table.insert(parent = '', index ='end',iid = 14,text="Parent",values="Vision")
-        Modbus_cmds = app.table.insert(parent = '', index ='end',iid = 15,text="Parent",values="Modbus")
-        Research_cmds = app.table.insert(parent = '', index ='end',iid = 16,text="Parent",values="Research")
+        Joint_space = app.table.insert(parent='', index='end', iid=0, text="Joint Space", values="Joint_space", open=True, tags=("command_group",))
+        Cart_space = app.table.insert(parent='', index='end', iid=1, text="Cartesian Space", values="Cartesian_space", open=True, tags=("command_group",))
+        Conditional_statements = app.table.insert(parent='', index='end', iid=2, text="Conditional Statements", values="Conditional_stetements", open=True, tags=("command_group",))
+        Home = app.table.insert(parent='', index='end', iid=3, text="Home", values="Home", tags=("command_item",))
+        Delay = app.table.insert(parent='', index='end', iid=4, text="Delay", values="Delay", tags=("command_item",))
+        End = app.table.insert(parent='', index='end', iid=5, text="End", values="End", tags=("command_item",))
+        Loop = app.table.insert(parent='', index='end', iid=6, text="Loop", values="Loop", tags=("command_item",))
+        Begin_ = app.table.insert(parent='', index='end', iid=7, text="Begin", values="Begin", tags=("command_item",))
+        Input_var_ = app.table.insert(parent='', index='end', iid=8, text="Input", values="Input", tags=("command_item",))
+        Output_var_ = app.table.insert(parent='', index='end', iid=9, text="Output", values="Output", tags=("command_item",))
+        Gripper = app.table.insert(parent='', index='end', iid=10, text="Gripper", values="Gripper", tags=("command_item",))
+        Gripper_cal = app.table.insert(parent='', index='end', iid=11, text="Gripper_cal", values="Gripper_cal", tags=("command_item",))
+        Get_data = app.table.insert(parent='', index='end', iid=12, text="Get_data", values="Get_data", tags=("command_item",))
+        Timeouts = app.table.insert(parent='', index='end', iid=13, text="Timeouts", values="Timeouts", tags=("command_item",))
+        Vision_cmds = app.table.insert(parent='', index='end', iid=14, text="Vision", values="Vision", open=True, tags=("command_group",))
+        Modbus_cmds = app.table.insert(parent='', index='end', iid=15, text="Modbus", values="Modbus", open=True, tags=("command_group",))
+        Research_cmds = app.table.insert(parent='', index='end', iid=16, text="Research", values="Research", open=True, tags=("command_group",))
 
         # Joint space commands
-        v1 = app.table.insert(Joint_space, index ='end',iid = 100,open = True, text="Child",values="MoveJoint")
-        v2 = app.table.insert(Joint_space, index ='end',iid = 101,open = True, text="Child",values="MovePose")
-        v3 = app.table.insert(Joint_space, index ='end',iid = 102,open = True, text="Child",values="SpeedJoint")
+        v1 = app.table.insert(Joint_space, index='end', iid=100, text="MoveJoint", values="MoveJoint", tags=("command_item",))
+        v2 = app.table.insert(Joint_space, index='end', iid=101, text="MovePose", values="MovePose", tags=("command_item",))
+        v3 = app.table.insert(Joint_space, index='end', iid=102, text="SpeedJoint", values="SpeedJoint", tags=("command_item",))
 
     
         # Cart space commands
-        v1 = app.table.insert(Cart_space, index ='end',iid = 110,open = True, text="Child",values="MoveCart")
-        v2 = app.table.insert(Cart_space, index ='end',iid = 120,open = True, text="Child",values="MoveCartRelTRF")
-        v3 = app.table.insert(Cart_space, index ='end',iid = 130,open = True, text="Child",values="SpeedCart")
+        v1 = app.table.insert(Cart_space, index='end', iid=110, text="MoveCart", values="MoveCart", tags=("command_item",))
+        v2 = app.table.insert(Cart_space, index='end', iid=120, text="MoveCartRelTRF", values="MoveCartRelTRF", tags=("command_item",))
+        v3 = app.table.insert(Cart_space, index='end', iid=130, text="SpeedCart", values="SpeedCart", tags=("command_item",))
 
-        app.table.insert(Vision_cmds, index ='end',iid = 140,open = True, text="Child",values="vision")
-        app.table.insert(Modbus_cmds, index ='end',iid = 150,open = True, text="Child",values="ModbusRead")
-        app.table.insert(Modbus_cmds, index ='end',iid = 151,open = True, text="Child",values="ModbusWrite")
-        app.table.insert(Research_cmds, index ='end',iid = 152,open = True, text="Child",values="timestamp")
+        app.table.insert(Vision_cmds, index='end', iid=140, text="vision", values="vision", tags=("command_item",))
+        app.table.insert(Modbus_cmds, index='end', iid=150, text="ModbusRead", values="ModbusRead", tags=("command_item",))
+        app.table.insert(Modbus_cmds, index='end', iid=151, text="ModbusWrite", values="ModbusWrite", tags=("command_item",))
+        app.table.insert(Research_cmds, index='end', iid=152, text="timestamp", values="timestamp", tags=("command_item",))
+        app.table.insert(Research_cmds, index='end', iid=153, text="print", values="print", tags=("command_item",))
 
-        app.table.grid(row=2, column=0, sticky='nsew', padx=8, pady=10)
+        app.table.grid(row=0, column=0, sticky='nsew', padx=(8, 0), pady=8)
+        app.command_scrollbar.grid(row=0, column=1, sticky="ns", padx=(0, 8), pady=8)
+
+        app.command_help_title = customtkinter.CTkLabel(
+            app.commands_frame,
+            text="Contoh & rekomendasi",
+            anchor="w",
+            font=customtkinter.CTkFont(size=14, weight="bold"),
+        )
+        app.command_help_title.grid(row=3, column=0, padx=12, pady=(8, 2), sticky="ew")
+
+        app.command_help_text = customtkinter.CTkTextbox(
+            app.commands_frame,
+            height=150,
+            wrap="word",
+            font=customtkinter.CTkFont(size=12, family="JetBrains Mono"),
+            fg_color=UI_SURFACE_LOW,
+            text_color=UI_ON_SURFACE,
+            border_color=UI_BORDER,
+            border_width=1,
+            corner_radius=6,
+        )
+        app.command_help_text.grid(row=4, column=0, padx=12, pady=(0, 12), sticky="ew")
+
+        def show_command_help(command_name):
+            title, help_text = command_help.get(
+                command_name,
+                (
+                    f"{command_name}()",
+                    "Contoh belum tersedia.\n\nRekomendasi:\nPeriksa dukungan dan format command sebelum menjalankan program.",
+                ),
+            )
+            if command_name in unsupported_help:
+                help_text = (
+                    "Contoh terverifikasi belum tersedia.\n\n"
+                    "Rekomendasi:\nCommand ini belum memiliki handler eksekusi aktif. "
+                    "Jangan gunakan pada program produksi sebelum implementasinya diverifikasi."
+                )
+            app.command_help_title.configure(text=title)
+            app.command_help_text.configure(state="normal")
+            app.command_help_text.delete("1.0", tk.END)
+            app.command_help_text.insert("1.0", help_text)
+            app.command_help_text.configure(state="disabled")
+
+        show_command_help("Begin")
 
         def select(e):
-            selected = app.table.focus()
+            selected = app.table.identify_row(e.y)
+            if not selected:
+                return
+            app.table.focus(selected)
+            app.table.selection_set(selected)
             logging.debug(selected)
             value = app.table.item(selected,'values')
+            if not value:
+                return
             logging.debug(value[0])
+            show_command_help(value[0])
             if value[0] == "Cartesian_space" or value[0] == "Joint_space" or value[0] == "Conditional_stetements" or value[0] == "Vision" or value[0] == "Modbus" or value[0] == "Research":
                 None
                 # Do nothing here because these are the selection menus
@@ -2329,6 +3246,8 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
                     app.textbox_program.insert(tk.INSERT, "ModbusWrite(cycle_done, HIGH)" + "\n")
                 elif value[0] == "timestamp":
                     app.textbox_program.insert(tk.INSERT, "timestamp(label=\"event\", record)" + "\n")
+                elif value[0] == "print":
+                    app.textbox_program.insert(tk.INSERT, "print(\"tes 1\")" + "\n")
                 else:
                     app.textbox_program.insert(tk.INSERT, str(value[0]) + "()" +"\n")
           
@@ -2339,6 +3258,8 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
                     app.textbox_program.insert(tk.INSERT, "ModbusWrite(cycle_done, HIGH)" + "\n")
                 elif value[0] == "timestamp":
                     app.textbox_program.insert(tk.INSERT, "timestamp(label=\"event\", record)" + "\n")
+                elif value[0] == "print":
+                    app.textbox_program.insert(tk.INSERT, "print(\"tes 1\")" + "\n")
                 else:
                     app.textbox_program.insert(tk.INSERT, str(value[0]) + "()" +"\n")
 
@@ -2487,7 +3408,14 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         return getattr(app, "current_menu", "") in ["Vision", "Modbus", "Research"]
 
     def _refresh_layout_buttons():
-        pass
+        expand_button = getattr(app, "expand_commands_button", None)
+        if expand_button is None:
+            return
+        if app.layout_collapsed["right"] and not _active_is_feature():
+            expand_button.grid(row=1, column=3, rowspan=3, padx=(0, 5), pady=5, sticky="nse")
+            expand_button.tkraise()
+        else:
+            expand_button.grid_remove()
 
     def _configure_panel_sizes():
         left_width = 0 if app.layout_collapsed["left"] else app.layout_sizes["left"]
@@ -2596,6 +3524,17 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         app.left_resize_handle = customtkinter.CTkFrame(app, width=7, corner_radius=3, fg_color=UI_HANDLE, cursor="sb_h_double_arrow")
         app.right_resize_handle = customtkinter.CTkFrame(app, width=7, corner_radius=3, fg_color=UI_HANDLE, cursor="sb_h_double_arrow")
         app.bottom_resize_handle = customtkinter.CTkFrame(app, height=7, corner_radius=3, fg_color=UI_HANDLE, cursor="sb_v_double_arrow")
+        app.expand_commands_button = customtkinter.CTkButton(
+            app,
+            text="◀",
+            width=28,
+            height=72,
+            corner_radius=6,
+            fg_color=UI_ACCENT_SOFT,
+            hover_color=UI_BORDER,
+            text_color=UI_ON_SURFACE,
+            command=lambda: toggle_layout_panel("right"),
+        )
 
         def start_resize(panel, event):
             app.resize_state = {
@@ -2655,7 +3594,7 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         logging.debug(name)
 
     def raise_frame_cart():
-        _show_commander_frame(app.jog_frame, "Cart")
+        _show_commander_frame(app.cart_frame, "Cart")
         app.cart_frame.tkraise()
         _place_resize_handles()
         
@@ -2835,6 +3774,8 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
 
     def raise_vision_frame():
         _show_feature_frame(app.vision_frame, "Vision")
+        if vision_window_is_detached():
+            app.vision_detached_window.lift()
 
     def raise_modbus_frame():
         _show_feature_frame(app.modbus_frame, "Modbus")
@@ -2946,6 +3887,27 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         global Joint5_value 
         global Joint6_value 
 
+        if program_log_queue is not None:
+            while True:
+                try:
+                    event = program_log_queue.get_nowait()
+                except queue.Empty:
+                    break
+                except Exception:
+                    break
+                if isinstance(event, dict):
+                    message = str(event.get("message", ""))
+                    event_time = float(event.get("timestamp", time.time()))
+                else:
+                    message = str(event)
+                    event_time = time.time()
+                if not message:
+                    continue
+                time_string = datetime.fromtimestamp(event_time).strftime("%H:%M:%S")
+                app.textbox_response.insert(tk.INSERT, time_string + "--" + message + "\n")
+                app.textbox_response.see(tk.END)
+                prev_string_shared = message
+
         shared_string_string = (shared_string.value).decode('utf-8')
         if shared_string_string != prev_string_shared:
             now = datetime.now()
@@ -2965,9 +3927,9 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         app.OUTPUT_1_LABEL.configure(app.IO_frame, text="OUTPUT 1 is: " + str(InOut_out[2]).rjust(7, ' '), font=customtkinter.CTkFont(size=text_size))
         app.OUTPUT_2_LABEL.configure(app.IO_frame, text="OUTPUT 2 is: " + str(InOut_out[3]).rjust(7, ' '), font=customtkinter.CTkFont(size=text_size))
         if( InOut_in[4] == 0):
-            app.estop_status.configure(app.bottom_select_frame, text="● ESTOP ACTIVE", text_color=UI_DANGER, font=customtkinter.CTkFont(family='Inter', size=15, weight='bold'))
+            app.estop_status.configure(text="\u25cf ESTOP ACTIVE", text_color=UI_DANGER, font=customtkinter.CTkFont(family='Inter', size=15, weight='bold'))
         else:
-            app.estop_status.configure(app.bottom_select_frame, text="● READY", text_color=UI_SUCCESS, font=customtkinter.CTkFont(family='Inter', size=15, weight='bold'))
+            app.estop_status.configure(text="\u25cf READY", text_color=UI_SUCCESS, font=customtkinter.CTkFont(family='Inter', size=15, weight='bold'))
 
 
     
@@ -3085,7 +4047,6 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
 
         highlight_words_response(None)
         highlight_words_program(None)
-        _update_vision_ui(read_state("vision", {}))
         _update_modbus_ui(read_state("modbus", {}))
         _update_research_ui(read_state("research", {}))
         # If tab is joint jog

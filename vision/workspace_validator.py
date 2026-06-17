@@ -38,6 +38,7 @@ class WorkspaceValidator:
         return self.ValidationResult.VALID, "READY TO PICK"
 
     def pixel_to_world(self, u: float, v: float, intrinsic_matrix: np.ndarray, z_mm: float) -> tuple[float, float]:
+        """Legacy camera-plane conversion retained for contour mode."""
         fx = float(intrinsic_matrix[0, 0])
         fy = float(intrinsic_matrix[1, 1])
         cx = float(intrinsic_matrix[0, 2])
@@ -48,7 +49,77 @@ class WorkspaceValidator:
         offset_y = float(self._config.get("vision.offset_y_mm", 0.0))
         return x_mm - offset_x, y_mm - offset_y
 
+    def has_camera_to_base_calibration(
+        self,
+        frame_size: tuple[int, int] | None = None,
+    ) -> bool:
+        calibration = self._config.get("vision.camera_to_base", {})
+        if not isinstance(calibration, dict) or not bool(calibration.get("valid", False)):
+            return False
+        matrix = np.asarray(calibration.get("homography") or [], dtype=np.float64)
+        if matrix.size != 9:
+            return False
+        if abs(float(np.linalg.det(matrix.reshape(3, 3)))) <= 1e-12:
+            return False
+        expected_size = calibration.get("image_size") or []
+        if frame_size is not None and len(expected_size) >= 2:
+            if [int(frame_size[0]), int(frame_size[1])] != [
+                int(expected_size[0]),
+                int(expected_size[1]),
+            ]:
+                return False
+        return True
+
+    def pixel_to_base(
+        self,
+        u: float,
+        v: float,
+        intrinsic_matrix: np.ndarray,
+        distortion: np.ndarray | None = None,
+        frame_size: tuple[int, int] | None = None,
+    ) -> tuple[float, float]:
+        if not self.has_camera_to_base_calibration(frame_size):
+            raise ValueError("Camera-to-Base homography is missing or invalid for this frame size")
+
+        point = np.array([[[float(u), float(v)]]], dtype=np.float64)
+        if distortion is not None and np.asarray(distortion).size > 0:
+            point = cv2.undistortPoints(
+                point,
+                np.asarray(intrinsic_matrix, dtype=np.float64),
+                np.asarray(distortion, dtype=np.float64),
+                P=np.asarray(intrinsic_matrix, dtype=np.float64),
+            )
+        undistorted_u, undistorted_v = point.reshape(2)
+        homography = np.asarray(
+            self._config.get("vision.camera_to_base.homography"),
+            dtype=np.float64,
+        ).reshape(3, 3)
+        mapped = homography @ np.array(
+            [float(undistorted_u), float(undistorted_v), 1.0],
+            dtype=np.float64,
+        )
+        if abs(float(mapped[2])) <= 1e-12:
+            raise ValueError("Camera-to-Base homography produced an invalid point")
+        x_base = float(mapped[0] / mapped[2])
+        y_base = float(mapped[1] / mapped[2])
+        return x_base, y_base
+
     def world_to_pixel(self, x_mm: float, y_mm: float, intrinsic_matrix: np.ndarray, z_mm: float) -> tuple[int, int]:
+        if self.has_camera_to_base_calibration():
+            homography = np.asarray(
+                self._config.get("vision.camera_to_base.homography"),
+                dtype=np.float64,
+            ).reshape(3, 3)
+            inverse = np.linalg.inv(homography)
+            mapped = inverse @ np.array(
+                [float(x_mm), float(y_mm), 1.0],
+                dtype=np.float64,
+            )
+            if abs(float(mapped[2])) > 1e-12:
+                return (
+                    int(round(float(mapped[0] / mapped[2]))),
+                    int(round(float(mapped[1] / mapped[2]))),
+                )
         fx = float(intrinsic_matrix[0, 0])
         fy = float(intrinsic_matrix[1, 1])
         cx = float(intrinsic_matrix[0, 2])

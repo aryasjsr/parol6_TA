@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Sequence
 
 from pathlib import Path
@@ -63,22 +64,231 @@ class CalibrationData:
 
 
 class CameraCalibrationManager:
-    def __init__(self, config: ConfigManager | None = None) -> None:
+    def __init__(
+        self,
+        config: ConfigManager | None = None,
+        snapshot_dir: Path | str | None = None,
+    ) -> None:
         self._config = config or ConfigManager.instance()
         self._snapshots: list[np.ndarray] = []
+        self._snapshot_paths: list[Path] = []
+        self._snapshot_dir_override = Path(snapshot_dir) if snapshot_dir is not None else None
+        self._last_snapshot_valid: bool | None = None
         self._calibration = CalibrationData.from_config(self._config.get("vision.calibration"))
 
     def add_snapshot(self, frame: np.ndarray) -> int:
+        if frame is None or frame.size == 0:
+            raise ValueError("Calibration snapshot frame is empty")
+        calibration_cfg = self._config.get("vision.calibration", {})
+        if not isinstance(calibration_cfg, dict):
+            calibration_cfg = {}
+        pattern_size = self.normalize_chessboard_size(
+            calibration_cfg.get("chessboard_size", (9, 6))
+        )
+        found, _ = self.find_chessboard_corners(frame, pattern_size)
+        snapshot_path = self._save_snapshot_image(frame)
         self._snapshots.append(frame.copy())
-        self._config.set("vision.calibration.snapshots_captured", len(self._snapshots))
+        self._snapshot_paths.append(snapshot_path)
+        self._last_snapshot_valid = found
+        calibration_cfg.update(
+            {
+                "snapshots_captured": len(self._snapshots),
+                "last_snapshot_path": str(snapshot_path),
+                "last_snapshot_valid": bool(found),
+            }
+        )
+        self._config.set("vision.calibration", calibration_cfg)
         return len(self._snapshots)
 
     def clear_snapshots(self) -> None:
         self._snapshots.clear()
-        self._config.set("vision.calibration.snapshots_captured", 0)
+        self._snapshot_paths.clear()
+        self._last_snapshot_valid = None
+        calibration_cfg = self._config.get("vision.calibration", {})
+        if not isinstance(calibration_cfg, dict):
+            calibration_cfg = {}
+        calibration_cfg.update(
+            {
+                "snapshots_captured": 0,
+                "last_snapshot_path": "",
+                "last_snapshot_valid": None,
+            }
+        )
+        self._config.set("vision.calibration", calibration_cfg)
+
+    def reset_intrinsic_calibration(
+        self,
+        delete_snapshot_files: bool = True,
+        intrinsics_path: Path | str | None = None,
+    ) -> dict:
+        calibration_cfg = self._config.get("vision.calibration", {})
+        calibration_cfg = calibration_cfg if isinstance(calibration_cfg, dict) else {}
+        preserved = {
+            key: calibration_cfg[key]
+            for key in (
+                "chessboard_size",
+                "square_size_mm",
+                "preview_enabled",
+                "snapshot_dir",
+            )
+            if key in calibration_cfg
+        }
+        preserved.update(
+            {
+                "snapshots_captured": 0,
+                "last_snapshot_path": "",
+                "last_snapshot_valid": None,
+            }
+        )
+
+        deleted_snapshots = 0
+        if delete_snapshot_files:
+            snapshot_dir = self.snapshot_directory()
+            if snapshot_dir.exists():
+                for path in snapshot_dir.glob("intrinsic_*.jpg"):
+                    if path.is_file():
+                        path.unlink()
+                        deleted_snapshots += 1
+
+        target_intrinsics = (
+            Path(intrinsics_path)
+            if intrinsics_path is not None
+            else self._default_intrinsics_path()
+        )
+        csv_deleted = False
+        if target_intrinsics.exists():
+            target_intrinsics.unlink()
+            csv_deleted = True
+
+        self._snapshots.clear()
+        self._snapshot_paths.clear()
+        self._last_snapshot_valid = None
+        self._calibration = None
+        self._config.set("vision.calibration", preserved)
+        self._config.set(
+            "vision.camera_to_base",
+            {
+                "valid": False,
+                "homography": [],
+                "image_size": [0, 0],
+                "point_count": 0,
+                "rms_error_mm": None,
+                "max_error_mm": None,
+            },
+        )
+        return {
+            "calibrated": False,
+            "deleted_snapshots": deleted_snapshots,
+            "intrinsics_csv_deleted": csv_deleted,
+            **self._snapshot_summary(),
+        }
 
     def snapshot_count(self) -> int:
         return len(self._snapshots)
+
+    def snapshot_directory(self) -> Path:
+        if self._snapshot_dir_override is not None:
+            return self._snapshot_dir_override
+        configured = self._config.get("vision.calibration.snapshot_dir", "")
+        if configured:
+            path = Path(str(configured)).expanduser()
+            if path.is_absolute():
+                return path
+            return self._project_root() / path
+        return self._project_root() / "tools" / "Camera" / "calibration_snapshots"
+
+    @staticmethod
+    def normalize_chessboard_size(chessboard_size: Sequence[int]) -> tuple[int, int]:
+        try:
+            if len(chessboard_size) < 2:
+                raise ValueError
+            pattern_size = (int(chessboard_size[0]), int(chessboard_size[1]))
+        except (TypeError, ValueError, IndexError) as exc:
+            raise ValueError(
+                "Chessboard size must contain integer columns and rows"
+            ) from exc
+        if pattern_size[0] < 2 or pattern_size[1] < 2:
+            raise ValueError("Chessboard size must be at least 2x2 inner corners")
+        return pattern_size
+
+    @staticmethod
+    def find_chessboard_corners(
+        frame: np.ndarray,
+        chessboard_size: Sequence[int],
+        *,
+        fast_check: bool = False,
+    ) -> tuple[bool, np.ndarray | None]:
+        if frame is None or frame.size == 0:
+            return False, None
+        pattern_size = CameraCalibrationManager.normalize_chessboard_size(chessboard_size)
+        gray = (
+            cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if frame.ndim == 3
+            else frame.copy()
+        )
+        flags = cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
+        if fast_check:
+            flags |= cv2.CALIB_CB_FAST_CHECK
+        found, corners = cv2.findChessboardCorners(gray, pattern_size, flags)
+        if not found or corners is None:
+            return False, None
+        criteria = (
+            cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+            30,
+            0.001,
+        )
+        refined = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
+        return True, refined
+
+    @staticmethod
+    def draw_chessboard_corners(
+        frame: np.ndarray,
+        chessboard_size: Sequence[int],
+        corners: np.ndarray | None,
+        found: bool,
+    ) -> np.ndarray:
+        overlay = frame.copy()
+        if found and corners is not None:
+            cv2.drawChessboardCorners(
+                overlay,
+                CameraCalibrationManager.normalize_chessboard_size(chessboard_size),
+                corners,
+                True,
+            )
+        return overlay
+
+    def _save_snapshot_image(self, frame: np.ndarray) -> Path:
+        output_dir = self.snapshot_directory()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        path = output_dir / f"intrinsic_{timestamp}_{len(self._snapshots) + 1:03d}.jpg"
+        if not cv2.imwrite(str(path), frame):
+            raise OSError(f"Could not save calibration snapshot to {path}")
+        return path
+
+    @staticmethod
+    def _project_root() -> Path:
+        return Path(__file__).resolve().parents[1]
+
+    def _snapshot_summary(self) -> dict:
+        configured = self._config.get("vision.calibration", {})
+        configured = configured if isinstance(configured, dict) else {}
+        last_path = (
+            str(self._snapshot_paths[-1])
+            if self._snapshot_paths
+            else str(configured.get("last_snapshot_path", ""))
+        )
+        last_valid = (
+            self._last_snapshot_valid
+            if self._last_snapshot_valid is not None
+            else configured.get("last_snapshot_valid")
+        )
+        return {
+            "snapshots_captured": self.snapshot_count(),
+            "snapshot_dir": str(self.snapshot_directory()),
+            "last_snapshot_path": last_path,
+            "last_snapshot_valid": last_valid,
+        }
 
     def has_calibration(self) -> bool:
         return self._calibration is not None and self._calibration.is_valid
@@ -88,7 +298,7 @@ class CameraCalibrationManager:
 
     def current_summary(self) -> dict:
         if self._calibration is None:
-            return {
+            summary = {
                 "fx": 0.0,
                 "fy": 0.0,
                 "cx": 0.0,
@@ -96,11 +306,12 @@ class CameraCalibrationManager:
                 "distortion": [],
                 "image_size": [640, 480],
                 "rms_error": None,
-                "snapshots_captured": self.snapshot_count(),
                 "calibrated": False,
             }
+            summary.update(self._snapshot_summary())
+            return summary
         summary = self._calibration.summary()
-        summary["snapshots_captured"] = self.snapshot_count()
+        summary.update(self._snapshot_summary())
         summary["calibrated"] = True
         return summary
 
@@ -134,7 +345,9 @@ class CameraCalibrationManager:
         chessboard_size: Sequence[int] = (9, 6),
         square_size_mm: float = 25.0,
     ) -> CalibrationData:
-        pattern_size = (int(chessboard_size[0]), int(chessboard_size[1]))
+        pattern_size = self.normalize_chessboard_size(chessboard_size)
+        if float(square_size_mm) <= 0.0:
+            raise ValueError("Chessboard square size must be greater than 0 mm")
         valid_frames: list[np.ndarray] = []
         object_points: list[np.ndarray] = []
         image_points: list[np.ndarray] = []
@@ -143,24 +356,11 @@ class CameraCalibrationManager:
         base_object_points[:, :2] = np.mgrid[0 : pattern_size[0], 0 : pattern_size[1]].T.reshape(-1, 2)
         base_object_points *= float(square_size_mm)
 
-        criteria = (
-            cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
-            30,
-            0.001,
-        )
-
         for frame in self._snapshots:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            found, corners = cv2.findChessboardCorners(gray, pattern_size, None)
-            if not found:
+            found, refined = self.find_chessboard_corners(frame, pattern_size)
+            if not found or refined is None:
                 continue
-            refined = cv2.cornerSubPix(
-                gray,
-                corners,
-                (11, 11),
-                (-1, -1),
-                criteria,
-            )
             object_points.append(base_object_points.copy())
             image_points.append(refined)
             valid_frames.append(gray)
@@ -185,6 +385,64 @@ class CameraCalibrationManager:
         self.save_calibration(calibration, chessboard_size=pattern_size, square_size_mm=square_size_mm)
         return calibration
 
+    def run_camera_to_base_calibration(
+        self,
+        pixel_points: Sequence[Sequence[float]],
+        base_points_mm: Sequence[Sequence[float]],
+        image_size: tuple[int, int],
+    ) -> dict:
+        if not self.has_calibration():
+            raise ValueError("Intrinsic camera calibration must be completed first")
+        if len(pixel_points) != len(base_points_mm):
+            raise ValueError("Pixel and Base point counts must match")
+        if len(pixel_points) < 9:
+            raise ValueError("At least 9 Camera-to-Base point pairs are required")
+
+        pixels = np.asarray(pixel_points, dtype=np.float64).reshape(-1, 1, 2)
+        base_points = np.asarray(base_points_mm, dtype=np.float64).reshape(-1, 2)
+        calibration = self.current()
+        assert calibration is not None
+        undistorted = cv2.undistortPoints(
+            pixels,
+            calibration.intrinsic_matrix,
+            calibration.distortion,
+            P=calibration.intrinsic_matrix,
+        ).reshape(-1, 2)
+        homography, inlier_mask = cv2.findHomography(
+            undistorted,
+            base_points,
+            method=cv2.RANSAC,
+        )
+        if homography is None:
+            raise ValueError("Camera-to-Base homography could not be solved")
+
+        projected = cv2.perspectiveTransform(
+            undistorted.reshape(-1, 1, 2),
+            homography,
+        ).reshape(-1, 2)
+        errors = np.linalg.norm(projected - base_points, axis=1)
+        rms_error = float(np.sqrt(np.mean(np.square(errors))))
+        max_error = float(np.max(errors))
+        valid = rms_error <= 3.0 and max_error <= 5.0
+        payload = {
+            "valid": valid,
+            "homography": homography.tolist(),
+            "image_size": [int(image_size[0]), int(image_size[1])],
+            "point_count": int(len(pixel_points)),
+            "inlier_count": int(np.sum(inlier_mask)) if inlier_mask is not None else int(len(pixel_points)),
+            "rms_error_mm": rms_error,
+            "max_error_mm": max_error,
+            "pixel_points": undistorted.tolist(),
+            "base_points_mm": base_points.tolist(),
+        }
+        self._config.set("vision.camera_to_base", payload)
+        if not valid:
+            raise ValueError(
+                f"Camera-to-Base validation failed: RMS={rms_error:.3f} mm, "
+                f"max={max_error:.3f} mm"
+            )
+        return payload
+
     def save_calibration(
         self,
         calibration: CalibrationData,
@@ -192,11 +450,14 @@ class CameraCalibrationManager:
         square_size_mm: float = 25.0,
     ) -> None:
         self._calibration = calibration
-        payload = calibration.to_config_dict()
+        existing = self._config.get("vision.calibration", {})
+        payload = dict(existing) if isinstance(existing, dict) else {}
+        payload.update(calibration.to_config_dict())
         payload["chessboard_size"] = [int(chessboard_size[0]), int(chessboard_size[1])]
         payload["square_size_mm"] = float(square_size_mm)
         payload["snapshots_captured"] = self.snapshot_count()
         self._config.set("vision.calibration", payload)
+        self._config.set("vision.camera_to_base.valid", False)
         try:
             self.save_intrinsics_csv(calibration)
         except Exception:

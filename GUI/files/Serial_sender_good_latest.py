@@ -13,6 +13,7 @@ import numpy as np
 from spatialmath import SE3
 from spatialmath.base import trinterp
 from collections import namedtuple
+import ast
 import platform
 import os
 import re
@@ -26,14 +27,21 @@ from spatialmath.base.argcheck import (
     isscalar,
 )
 from Commander_feature_adapters import (
-    build_vision_pick_sequence,
+    emit_program_log,
+    execute_vision_tool_z,
     execute_modbus_read,
     execute_modbus_write,
     execute_timestamp_command,
+    get_vision_runtime,
     modbus_manager,
     read_state,
+    reset_vision_runtime,
     research_logger,
     update_state,
+)
+from vision.tool_z_runtime import (
+    is_vision_diagnostic_program,
+    resolve_vision_placeholders,
 )
 def normalize_angle(angle):
     """Normalize angle to [-pi, pi] range to handle angle wrapping"""
@@ -371,36 +379,41 @@ Program_length = 0
 Program_step = 0
 
 Robot_mode = "Dummy"
+
 # Task for sending data every x ms and performing all calculations, kinematics GUI control logic...
 def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOut_out,Timeout_out,Gripper_data_out,
          Position_in,Speed_in,Homed_in,InOut_in,Temperature_error_in,Position_error_in,Timeout_error,Timing_data_in,
          XTR_data,Gripper_data_in,
-        Joint_jog_buttons,Cart_jog_buttons,Jog_control,General_data,Buttons):
+        Joint_jog_buttons,Cart_jog_buttons,Jog_control,General_data,Buttons,program_log_queue=None):
+    global Robot_mode
     timer = Timer(INTERVAL_S, warnings=False, precise=True)
     cnt = 0
 
     while timer.elapsed_time < 110000:
+        if Buttons[7] == 0 and Robot_mode == "Program":
+            reset_vision_runtime()
+            Robot_mode = "Dummy"
 
-        if ser.is_open == True:
-            logging.debug("Task 1 alive")
-            logging.debug("Data that PC will send to the robot is: ")
-            #s = Pack_data_test() 
-            # This function packs data that we will send to the robot
-            s = Pack_data(Position_out,Speed_out,Command_out,Affected_joint_out,InOut_out,Timeout_out,Gripper_data_out)
-            
-            # Make sure if sending calib to gripper to send it only once
-            if(Gripper_data_out[4] == 1 or Gripper_data_out[4] == 2):
-                Gripper_data_out[4] = 0
+        if ser.is_open == True or Buttons[7] == 1:
+            if ser.is_open == True:
+                logging.debug("Task 1 alive")
+                logging.debug("Data that PC will send to the robot is: ")
+                #s = Pack_data_test()
+                # This function packs data that we will send to the robot
+                s = Pack_data(Position_out,Speed_out,Command_out,Affected_joint_out,InOut_out,Timeout_out,Gripper_data_out)
 
-            logging.debug(s)
-            logging.debug("END of data sent to the ROBOT")
-            len_ = len(s)
-            try:
-                for i in range(len_):
-                    ser.write(s[i])
-            except:
-                logging.debug("NO SERIAL TASK1")
-                    # This function packs data that we will send to the robot
+                # Make sure if sending calib to gripper to send it only once
+                if(Gripper_data_out[4] == 1 or Gripper_data_out[4] == 2):
+                    Gripper_data_out[4] = 0
+
+                logging.debug(s)
+                logging.debug("END of data sent to the ROBOT")
+                len_ = len(s)
+                try:
+                    for i in range(len_):
+                        ser.write(s[i])
+                except:
+                    logging.debug("NO SERIAL TASK1")
     
 
             # Check if any of jog buttons is pressed
@@ -666,6 +679,7 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
             elif Buttons[2] == 1 or InOut_in[4] == 0: # DISABLE COMMAND 0x102
                 Robot_mode = "STOP"
                 Buttons[7] = 0 # program execution button
+                reset_vision_runtime()
                 Command_out.value = 102
                 Buttons[2] = 0
                 shared_string.value = b'Log: Robot disable; button or estop'
@@ -723,7 +737,7 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
                     print(clean_string)
                     
 
-                    clean_string = [re.sub(r'\(.*?\)', '()', command) for command in  clean_string] # remove data between ()
+                    clean_string = [normalize_program_command(command) for command in clean_string]
                     print(clean_string)
                     print(clean_string_commands)
                     # Now with everything clean check for all errors and see if the code is valid.
@@ -737,6 +751,7 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
                             error_state = 1
                             # Set flag, exit program mode
                     program_len = len(clean_string)
+                    reset_vision_runtime()
                     if clean_string[0] != 'Begin()':
                         None
                         shared_string.value = b'Error: program needs to start with Begin()'
@@ -749,8 +764,24 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
                         shared_string.value = b'Error: program needs to end with End() or Loop()'
                         error_state = 1
                         # Set error flag, exit program
+                    diagnostic_program = is_vision_diagnostic_program(clean_string_commands)
+                    endpoint_available = bool(Buttons[5]) or bool(Buttons[4])
+                    if error_state == 0 and not diagnostic_program and not endpoint_available:
+                        emit_program_log(
+                            shared_string,
+                            program_log_queue,
+                            "Error: Program contains actuator commands but no robot or simulator is active",
+                        )
+                        error_state = 1
+                        Buttons[7] = 0
+                        update_state("program_control", {"state": "ERROR", "paused": False, "stop_requested": False, "step_requested": 0, "updated_at": time.time()})
                     if error_state == 0:
-                        shared_string.value = b'Log: program will try to run'
+                        mode_label = "VISION_DIAGNOSTIC" if diagnostic_program else "ROBOT"
+                        emit_program_log(
+                            shared_string,
+                            program_log_queue,
+                            f"Log: program mode={mode_label}",
+                        )
                         control_state = program_control_state()
                         next_state = "STEP" if control_state.get("state") == "STEP" else "RUNNING"
                         update_state("program_control", {"state": next_state, "paused": False, "stop_requested": False, "step_requested": control_state.get("step_requested", 0), "updated_at": time.time()})
@@ -862,6 +893,7 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
                         # Loop command
                         elif clean_string[Program_step] == 'Loop()':
                             logging.debug('Log: Loop() command')
+                            reset_vision_runtime()
                             Program_step = 1
 
                         # MoveJoint command
@@ -1811,7 +1843,7 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
                                         # check the speeds
                                         
                                         for i in range(6):
-                                            if  abs(Speed_out[i] > PAROL6_ROBOT.Joint_max_speed[i]):
+                                            if abs(Speed_out[i]) > PAROL6_ROBOT.Joint_max_speed[i]:
                                                 shared_string.value = b'Error: MoveCart() speed is too big'
                                                 print("error in joint:", i)
                                                 error_state = 1
@@ -1849,7 +1881,24 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
                                 pattern = r'MoveCartRelTRF\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*(?:,\s*v\s*=\s*(-?\d+(?:\.\d+)?))?(?:,\s*a\s*=\s*(-?\d+(?:\.\d+)?))?(?:,\s*t\s*=\s*(-?\d+(?:\.\d+)?))?(?:,\s*(trap|poly))?(?:,\s*(speed))?\s*\)?'
 
                                 # Use re.match to find the pattern in the data packet
-                                match = re.match(pattern, clean_string_commands[Program_step])
+                                try:
+                                    command_text = resolve_motion_vision_placeholders(
+                                        clean_string_commands[Program_step],
+                                        Position_in,
+                                    )
+                                except ValueError as exc:
+                                    reset_vision_runtime()
+                                    emit_program_log(
+                                        shared_string,
+                                        program_log_queue,
+                                        f"Error: MoveCartRelTRF() {exc}",
+                                    )
+                                    error_state = 1
+                                    Buttons[7] = 0
+                                    update_state("program_control", {"state": "ERROR", "paused": False, "stop_requested": False, "step_requested": 0, "updated_at": time.time()})
+                                    match = None
+                                else:
+                                    match = re.match(pattern, command_text)
 
                                 if match:
                                     shared_string.value = b'Log: MoveCartRelTRF() command'
@@ -2102,7 +2151,7 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
                                     # check the speeds
                                     
                                     for i in range(6):
-                                        if  abs(Speed_out[i] > PAROL6_ROBOT.Joint_max_speed[i]):
+                                        if abs(Speed_out[i]) > PAROL6_ROBOT.Joint_max_speed[i]:
                                             shared_string.value = b'Error: MoveCartRelTRF() speed is too big'
                                             print("error in joint:", i)
                                             print("command step is",Command_step)
@@ -2136,17 +2185,9 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
                         # Dummy command (used for testing)
                         elif clean_string[Program_step] == 'vision()':
                             logging.debug('Log: vision() command')
-                            generated_commands = build_vision_pick_sequence(shared_string)
-                            if generated_commands is not None:
-                                generated_clean = [re.sub(r'\(.*?\)', '()', command) for command in generated_commands]
-                                clean_string_commands[Program_step:Program_step + 1] = generated_commands
-                                clean_string[Program_step:Program_step + 1] = generated_clean
-                                program_len = len(clean_string)
+                            if execute_vision_tool_z(shared_string, program_log_queue):
                                 Command_out.value = 255
-                                if len(generated_commands) == 0:
-                                    shared_string.value = b'Log: vision() skipped'
-                                else:
-                                    research_logger.record("vision_sequence_inserted", len(generated_commands))
+                                Program_step = Program_step + 1
                             else:
                                 error_state = 1
                                 Buttons[7] = 0
@@ -2182,6 +2223,51 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
                                 Buttons[7] = 0
                                 update_state("program_control", {"state": "ERROR", "paused": False, "stop_requested": False, "step_requested": 0, "updated_at": time.time()})
 
+                        elif clean_string[Program_step] == 'print()':
+                            Command_out.value = 255
+                            if Command_step == 0:
+                                try:
+                                    message = parse_print_command(clean_string_commands[Program_step])
+                                except ValueError as exc:
+                                    logging.debug("Invalid print() command: %s", exc)
+                                    emit_program_log(
+                                        shared_string,
+                                        program_log_queue,
+                                        'Error: Invalid print() command; use print("text")',
+                                    )
+                                    error_state = 1
+                                    Buttons[7] = 0
+                                    update_state("program_control", {"state": "ERROR", "paused": False, "stop_requested": False, "step_requested": 0, "updated_at": time.time()})
+                                else:
+                                    try:
+                                        message = resolve_vision_placeholders(
+                                            message,
+                                            get_vision_runtime(),
+                                        )
+                                    except ValueError as exc:
+                                        reset_vision_runtime()
+                                        emit_program_log(
+                                            shared_string,
+                                            program_log_queue,
+                                            f"Error: print() {exc}",
+                                        )
+                                        error_state = 1
+                                        Buttons[7] = 0
+                                        update_state("program_control", {"state": "ERROR", "paused": False, "stop_requested": False, "step_requested": 0, "updated_at": time.time()})
+                                    else:
+                                        logging.debug("Log: %s", message)
+                                        emit_program_log(
+                                            shared_string,
+                                            program_log_queue,
+                                            f"Log: {message}",
+                                        )
+                                        Command_step = 1
+                            elif Command_step < math.ceil(0.08 / INTERVAL_S):
+                                Command_step = Command_step + 1
+                            else:
+                                Command_step = 0
+                                Program_step = Program_step + 1
+
                         elif clean_string[Program_step] == 'Dummy()':
                             logging.debug('Log: Dummy() command')
                             Command_out.value = 255 # Set dummy data
@@ -2193,6 +2279,7 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
                             Program_step = 1
                             Robot_mode = "Dummy"
                             Buttons[7] = 0
+                            reset_vision_runtime()
                             update_state("program_control", {"state": "IDLE", "paused": False, "stop_requested": False, "step_requested": 0, "updated_at": time.time()})
                             try:
                                 modbus_manager.write_value("cycle_done", True)
@@ -2314,6 +2401,7 @@ def program_paused():
 def finish_program_stop(Position_out,Speed_out,Command_out,Position_in,Buttons,shared_string, reason="Program stopped"):
     Buttons[7] = 0
     dummy_data(Position_out,Speed_out,Command_out,Position_in)
+    reset_vision_runtime()
     update_state("program_control", {"state": "IDLE", "paused": False, "stop_requested": False, "step_requested": 0, "updated_at": time.time()})
     research_logger.record("program_idle", 1, reason)
     shared_string.value = f"Log: {reason}".encode("utf-8")[:99]
@@ -2324,6 +2412,51 @@ def extract_content_from_command(command):
         return match.group(1)
     else:
         return None
+
+def normalize_program_command(command):
+    stripped = command.strip()
+    if re.fullmatch(r"print\(.*\)", stripped):
+        return "print()"
+    return re.sub(r'\(.*?\)', '()', command)
+
+def parse_print_command(command):
+    match = re.fullmatch(
+        r"""\s*print\(\s*(?P<literal>"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')\s*\)\s*""",
+        command,
+    )
+    if not match:
+        raise ValueError("expected exactly one quoted string")
+
+    try:
+        message = ast.literal_eval(match.group("literal"))
+    except (SyntaxError, ValueError) as exc:
+        raise ValueError("invalid string literal") from exc
+
+    if not isinstance(message, str) or not message:
+        raise ValueError("message cannot be empty")
+    return message
+
+def resolve_motion_vision_placeholders(command, Position_in):
+    runtime = get_vision_runtime()
+    if "$vision.z_plus" in command:
+        reference = list(runtime.get("reference_joint_deg", [])) if isinstance(runtime, dict) else []
+        if len(reference) != 6:
+            raise ValueError("vision reference pose is unavailable")
+        tolerance = float(runtime.get("pose_tolerance_deg", 1.0))
+        actual = [
+            float(PAROL6_ROBOT.STEPS2DEG(Position_in[index], index))
+            for index in range(6)
+        ]
+        violations = [
+            f"J{index + 1}={actual[index]:.3f} deg"
+            for index in range(6)
+            if abs(actual[index] - float(reference[index])) > tolerance
+        ]
+        if violations:
+            raise ValueError(
+                "reference pose guard failed: " + ", ".join(violations)
+            )
+    return resolve_vision_placeholders(command, runtime)
 
 # Task that receives data and saves to the multi proc array
 def Task2(shared_string,Position_in,Speed_in,Homed_in,InOut_in,Temperature_error_in,Position_error_in,Timeout_error,Timing_data_in,
@@ -3066,12 +3199,12 @@ def check_elements(lst):
 def Main(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOut_out,Timeout_out,Gripper_data_out,
          Position_in,Speed_in,Homed_in,InOut_in,Temperature_error_in,Position_error_in,Timeout_error,Timing_data_in,
          XTR_data,Gripper_data_in,
-        Joint_jog_buttons,Cart_jog_buttons,Jog_control,General_data,Buttons,): 
+        Joint_jog_buttons,Cart_jog_buttons,Jog_control,General_data,Buttons,program_log_queue=None):
 
     t1 = threading.Thread(target = Task1, args = (shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOut_out,Timeout_out,Gripper_data_out,
          Position_in,Speed_in,Homed_in,InOut_in,Temperature_error_in,Position_error_in,Timeout_error,Timing_data_in,
          XTR_data,Gripper_data_in,
-        Joint_jog_buttons,Cart_jog_buttons,Jog_control,General_data,Buttons))
+        Joint_jog_buttons,Cart_jog_buttons,Jog_control,General_data,Buttons,program_log_queue))
     
     t2 = threading.Thread(target = Task2, args = (shared_string, Position_in,Speed_in,Homed_in,InOut_in,Temperature_error_in,Position_error_in,Timeout_error,Timing_data_in,
          XTR_data,Gripper_data_in,General_data,))
@@ -3090,12 +3223,12 @@ def Main(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InO
 def GUI_process(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOut_out,Timeout_out,Gripper_data_out,
          Position_in,Speed_in,Homed_in,InOut_in,Temperature_error_in,Position_error_in,Timeout_error,Timing_data_in,
          XTR_data,Gripper_data_in,
-        Joint_jog_buttons,Cart_jog_buttons,Jog_control,General_data,Buttons):
+        Joint_jog_buttons,Cart_jog_buttons,Jog_control,General_data,Buttons,program_log_queue=None):
 
         GUI_PAROL_latest.GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOut_out,Timeout_out,Gripper_data_out,
          Position_in,Speed_in,Homed_in,InOut_in,Temperature_error_in,Position_error_in,Timeout_error,Timing_data_in,
          XTR_data,Gripper_data_in,
-        Joint_jog_buttons,Cart_jog_buttons,Jog_control,General_data,Buttons)
+        Joint_jog_buttons,Cart_jog_buttons,Jog_control,General_data,Buttons,program_log_queue)
 
 
 def SIMULATOR_process(Position_out,Position_in,Position_Sim,Buttons):
@@ -3164,17 +3297,18 @@ if __name__ == '__main__':
     Position_Sim =  multiprocessing.Array("i",[0,0,0,0,0,0], lock=False) 
 
     shared_string = multiprocessing.Array('c', b' ' * 100)  # Create a character array of size 100
+    program_log_queue = multiprocessing.Queue()
 
     # Process
     process1 = multiprocessing.Process(target=Main,args=[shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOut_out,Timeout_out,Gripper_data_out,
          Position_in,Speed_in,Homed_in,InOut_in,Temperature_error_in,Position_error_in,Timeout_error,Timing_data_in,
          XTR_data,Gripper_data_in,
-        Joint_jog_buttons,Cart_jog_buttons,Jog_control,General_data,Buttons,])
+        Joint_jog_buttons,Cart_jog_buttons,Jog_control,General_data,Buttons,program_log_queue])
     
     process2 = multiprocessing.Process(target=GUI_process,args=[shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOut_out,Timeout_out,Gripper_data_out,
          Position_in,Speed_in,Homed_in,InOut_in,Temperature_error_in,Position_error_in,Timeout_error,Timing_data_in,
          XTR_data,Gripper_data_in,
-        Joint_jog_buttons,Cart_jog_buttons,Jog_control,General_data,Buttons,])
+        Joint_jog_buttons,Cart_jog_buttons,Jog_control,General_data,Buttons,program_log_queue])
     
 
     process3 = multiprocessing.Process(target=SIMULATOR_process,args =[Position_out,Position_in,Position_Sim,Buttons])

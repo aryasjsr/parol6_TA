@@ -68,7 +68,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "vision": {
         "video_source": "MOCK",
         "camera_index": 0,
-        "detection_method": "adaptive",
+        "camera_width": 1280,
+        "camera_height": 720,
+        "detection_enabled": True,
+        "detection_method": "model",
         "adaptive_block_size": 11,
         "adaptive_c": 2,
         "canny_threshold1": 50,
@@ -88,14 +91,39 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "model_path": "vision/models/best.onnx",
         "model_conf_threshold": 0.5,
         "model_iou_threshold": 0.45,
-        "safe_pick_margin_pct": 0.15,
+        "safe_pick_margin_pct": 0.25,
+        "safe_pick_left_offset_px": 0.0,
         "marginal_confirm_timeout_s": 2.0,
         "offset_x_mm": 0.0,
         "offset_y_mm": 0.0,
+        "z_tool_offset_mm": 0.0,
+        "camera_to_base": {
+            "valid": False,
+            "homography": [],
+            "image_size": [0, 0],
+            "point_count": 0,
+            "rms_error_mm": None,
+            "max_error_mm": None,
+        },
+        "tool_z": {
+            "reference_joint_deg": [90.0, -88.0, 182.259, 0.0, 3.0, 180.0],
+            "pose_tolerance_deg": 1.0,
+            "x_tool_fixed_mm": -60.0,
+            "y_tool_fixed_mm": 0.0,
+            "z_plus_min_mm": 0.0,
+            "z_plus_max_mm": 78.0,
+            "retreat_margin_mm": 30.0,
+            "sample_count": 5,
+            "detection_max_age_s": 1.0,
+            "runtime_max_age_s": 30.0,
+            "same_object_min_iou": 0.3,
+        },
         "calibration": {
             "snapshots_captured": 0,
             "chessboard_size": [9, 6],
             "square_size_mm": 25.0,
+            "preview_enabled": True,
+            "snapshot_dir": "tools/Camera/calibration_snapshots",
         },
         "auto_pick_enabled": True,
         "pick_pose_rpy_deg": [0.0, 0.0, 0.0],
@@ -206,6 +234,8 @@ def _write_state(state: dict[str, Any]) -> None:
 
 
 _state_lock = threading.Lock()
+_vision_runtime_lock = threading.Lock()
+_vision_runtime_cache: dict[str, Any] = {}
 
 
 def update_state(section: str, payload: dict[str, Any]) -> None:
@@ -225,6 +255,49 @@ def _set_shared(shared_string: Any, message: str) -> None:
         shared_string.value = message.encode("utf-8")[:99]
     except Exception:
         pass
+
+
+def emit_program_log(
+    shared_string: Any,
+    program_log_queue: Any,
+    message: str,
+) -> None:
+    _set_shared(shared_string, message)
+    if program_log_queue is None:
+        return
+    try:
+        program_log_queue.put_nowait(
+            {"timestamp": time.time(), "message": str(message)}
+        )
+    except Exception:
+        pass
+
+
+def set_vision_runtime(runtime: dict[str, Any]) -> None:
+    payload = dict(runtime)
+    with _vision_runtime_lock:
+        _vision_runtime_cache.clear()
+        _vision_runtime_cache.update(payload)
+    update_state("vision_runtime", payload)
+
+
+def get_vision_runtime() -> dict[str, Any]:
+    with _vision_runtime_lock:
+        if _vision_runtime_cache:
+            return dict(_vision_runtime_cache)
+    runtime = read_state("vision_runtime", {})
+    return dict(runtime) if isinstance(runtime, dict) else {}
+
+
+def reset_vision_runtime() -> None:
+    set_vision_runtime(
+        {
+            "valid": False,
+            "status": "EMPTY",
+            "updated_at": time.time(),
+            "expires_at": 0.0,
+        }
+    )
 
 
 def parse_command_values(command_text: str) -> list[Any]:
@@ -579,6 +652,10 @@ class ModbusManager:
         self._block_a_stop = threading.Event()
         self._block_a_thread: threading.Thread | None = None
         self._block_b_lock = threading.Lock()
+        self._block_a_full_samples: list[dict[str, Any]] = []
+        self._block_b_full_samples: list[dict[str, Any]] = []
+        self._block_a_full_meta: dict[str, Any] = {}
+        self._block_b_full_meta: dict[str, Any] = {}
         self._block_b_state = self._new_block_b_state(load_config()["modbus"].get("block_b", {}))
         update_state("modbus_block_a", self._new_block_a_state(load_config()["modbus"].get("block_a", {})))
         update_state("modbus_block_b", dict(self._block_b_state))
@@ -644,6 +721,12 @@ class ModbusManager:
             self._block_b_state["running"] = True
             self._block_b_state["started_at"] = time.time()
             update_state("modbus_block_b", dict(self._block_b_state))
+        self._block_b_full_samples.clear()
+        self._block_b_full_meta = {
+            "started_at": self._block_b_state["started_at"],
+            "settings": dict(settings),
+            "target": int(self._block_b_state["target"]),
+        }
         research_logger.record("modbus_block_b_test_start", int(self._block_b_state["target"]), "cycle time test")
 
     def stop_block_b(self) -> None:
@@ -652,6 +735,12 @@ class ModbusManager:
             self._block_b_state["active_cycle"] = False
             self._block_b_state["updated_at"] = time.time()
             update_state("modbus_block_b", dict(self._block_b_state))
+            self._block_b_full_meta.update({
+                "finished_at": time.time(),
+                "completed": int(self._block_b_state.get("completed", 0)),
+                "stats": dict(self._block_b_state.get("stats", {})),
+                "stopped_early": int(self._block_b_state.get("completed", 0)) < int(self._block_b_state.get("target", 0)),
+            })
         research_logger.record("modbus_block_b_test_stop", int(self._block_b_state.get("completed", 0)))
 
     def block_b_cycle_started(self) -> bool:
@@ -690,6 +779,13 @@ class ModbusManager:
                 self._block_b_state["failed_count"] = int(self._block_b_state.get("failed_count", 0)) + 1
             self._block_b_state["completed"] = int(self._block_b_state.get("completed", 0)) + 1
             self._block_b_state["samples"] = samples[-300:]
+            self._block_b_full_samples.append({
+                "index": int(self._block_b_state.get("active_index", self._block_b_state["completed"])),
+                "timestamp": now,
+                "status": "success" if success else "failed",
+                "duration_s": round(duration, 6),
+                "note": note,
+            })
             stats = _cycle_stats(samples)
             self._block_b_state["stats"] = stats
             self._block_b_state["latest"] = {
@@ -702,6 +798,12 @@ class ModbusManager:
             self._block_b_state["cycle_start_epoch"] = None
             if int(self._block_b_state.get("completed", 0)) >= int(self._block_b_state.get("target", 100)):
                 self._block_b_state["running"] = False
+                self._block_b_full_meta.update({
+                    "finished_at": now,
+                    "completed": int(self._block_b_state.get("completed", 0)),
+                    "stats": dict(self._block_b_state.get("stats", {})),
+                    "stopped_early": False,
+                })
             self._block_b_state["updated_at"] = now
             payload = dict(self._block_b_state)
             update_state("modbus_block_b", payload)
@@ -812,6 +914,12 @@ class ModbusManager:
         state["running"] = True
         state["started_at"] = time.time()
         update_state("modbus_block_a", state)
+        self._block_a_full_samples.clear()
+        self._block_a_full_meta = {
+            "started_at": state["started_at"],
+            "settings": dict(settings),
+            "target": target,
+        }
         research_logger.record("modbus_block_a_test_start", target, str(settings.get("function", "")))
 
         response_times: list[float] = []
@@ -862,6 +970,13 @@ class ModbusManager:
                 research_logger.record("modbus_block_a_failed", 1, f"n={index}; {detail}")
 
             samples.append({"n": index, "response_ms": response_ms, "status": status, "detail": detail})
+            self._block_a_full_samples.append({
+                "n": index,
+                "timestamp": time.time(),
+                "response_ms": response_ms,
+                "status": status,
+                "detail": detail,
+            })
             stats = _protocol_stats(
                 completed=index,
                 success_count=success_count,
@@ -899,6 +1014,12 @@ class ModbusManager:
             "updated_at": time.time(),
         }
         update_state("modbus_block_a", final_state)
+        self._block_a_full_meta.update({
+            "finished_at": time.time(),
+            "completed": completed,
+            "stats": dict(stats),
+            "stopped_early": bool(stop_event.is_set() and completed < target),
+        })
         research_logger.record("modbus_block_a_packet_loss_pct", stats.get("packet_loss_pct", 0.0))
         research_logger.record("modbus_block_a_throughput_rps", stats.get("throughput_rps", 0.0))
         research_logger.record("modbus_block_a_test_finished", completed)
@@ -1073,6 +1194,20 @@ class ModbusManager:
             },
         )
 
+    def get_block_a_full_samples(self) -> list[dict[str, Any]]:
+        return list(self._block_a_full_samples)
+
+    def get_block_b_full_samples(self) -> list[dict[str, Any]]:
+        with self._block_b_lock:
+            return list(self._block_b_full_samples)
+
+    def get_block_a_full_meta(self) -> dict[str, Any]:
+        return dict(self._block_a_full_meta)
+
+    def get_block_b_full_meta(self) -> dict[str, Any]:
+        with self._block_b_lock:
+            return dict(self._block_b_full_meta)
+
 
 def _protocol_stats(
     completed: int,
@@ -1152,14 +1287,24 @@ class VisionManager:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        self._detection_enabled = bool(
+            load_config().get("vision", {}).get("detection_enabled", True)
+        )
         self._latest: dict[str, Any] | None = None
         self._latest_bundle: dict[str, Any] | None = None
+        self._bundle_history: deque[dict[str, Any]] = deque(maxlen=20)
         self._display_frame: Any = None
         self._raw_frame: Any = None
+        self._frame_size: tuple[int, int] = (0, 0)
         self._status = "Stopped"
         self._model_status = "NOT LOADED"
         self._model_detector: Any = None
         self._calibration_manager: Any = None
+        self._chessboard_found = False
+        self._chessboard_corner_count = 0
+        self._chessboard_pattern: tuple[int, int] = (0, 0)
+        self._chessboard_corners: Any = None
+        self._chessboard_last_detection_at = 0.0
         self._model_warned = False
         self._ibvs_controller: Any = None
         self._ibvs_active: bool = False
@@ -1175,6 +1320,28 @@ class VisionManager:
         if workspace:
             cfg.setdefault("workspace", {}).update(workspace)
         save_config(cfg)
+        self._publish()
+
+    def detection_enabled(self) -> bool:
+        with self._lock:
+            return self._detection_enabled
+
+    def set_detection_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        camera_running = self._thread is not None and self._thread.is_alive()
+        with self._lock:
+            self._detection_enabled = enabled
+            if not enabled:
+                self._latest = None
+                self._latest_bundle = None
+                self._bundle_history.clear()
+        cfg = load_config()
+        cfg.setdefault("vision", {})["detection_enabled"] = enabled
+        save_config(cfg)
+        if camera_running:
+            self._status = "Running | Detection ON" if enabled else "Camera running | Detection OFF"
+        else:
+            self._status = "Stopped"
         self._publish()
 
     def available_sources(self, max_index: int = 8) -> list[str]:
@@ -1200,6 +1367,8 @@ class VisionManager:
             cfg["vision"]["video_source"] = str(source)
             save_config(cfg)
         self.stop()
+        with self._lock:
+            self._bundle_history.clear()
         self._stop.clear()
         self._thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._thread.start()
@@ -1220,6 +1389,13 @@ class VisionManager:
         state_bundle = read_state("vision", {}).get("latest_bundle")
         return state_bundle if isinstance(state_bundle, dict) else self._latest_bundle
 
+    def recent_bundles(self) -> list[dict[str, Any]]:
+        state_history = read_state("vision", {}).get("bundle_history")
+        if isinstance(state_history, list):
+            return [item for item in state_history if isinstance(item, dict)]
+        with self._lock:
+            return list(self._bundle_history)
+
     def latest_frame_image(self, max_size: tuple[int, int] = (980, 720)) -> Any:
         with self._lock:
             frame = None if self._display_frame is None else self._display_frame.copy()
@@ -1236,9 +1412,11 @@ class VisionManager:
             return None
 
     def set_mock_detection(self, x_mm: float = 0.0, y_mm: float = 0.0, safety: str = "SAFE") -> None:
+        now = time.time()
         payload = {
             "status": "mock",
             "pick_point_px": [320, 240],
+            "pick_point_base": [float(x_mm), float(y_mm)],
             "pick_point_world": [float(x_mm), float(y_mm)],
             "centroid_px": [320, 240],
             "centroid_world": [float(x_mm), float(y_mm)],
@@ -1248,20 +1426,29 @@ class VisionManager:
             "orientation_deg": 0.0,
             "workspace_status": "valid",
             "workspace_message": "READY TO PICK",
-            "timestamp": time.time(),
+            "timestamp": now,
         }
         bundle = {
             "selongsong_box": [250, 210, 390, 280],
-            "fixture_box": None,
-            "pick_point_px": [320, 240],
+            "fixture_box": [350, 190, 385, 300],
+            "pick_point_px": [300, 245],
+            "pick_point_base": [float(x_mm), float(y_mm)],
             "pick_point_world": [float(x_mm), float(y_mm)],
             "pick_safety": safety,
             "conf_selongsong": 1.0,
-            "conf_fixture": 0.0,
+            "conf_fixture": 1.0,
+            "captured_at": now,
+            "coordinate_frame": "BASE",
+            "mock": True,
         }
         with self._lock:
             self._latest = payload
             self._latest_bundle = bundle
+            self._bundle_history.clear()
+            for index in range(5):
+                sample = dict(bundle)
+                sample["captured_at"] = now - (4 - index) * 0.05
+                self._bundle_history.append(sample)
         self._status = "MOCK detection ready"
         self._publish()
 
@@ -1313,6 +1500,39 @@ class VisionManager:
         self._publish(calibration=manager.current_summary())
         return summary
 
+    def reset_intrinsic_calibration(self, delete_snapshots: bool = True) -> dict[str, Any]:
+        manager = self._get_calibration_manager()
+        summary = manager.reset_intrinsic_calibration(
+            delete_snapshot_files=delete_snapshots,
+        )
+        with self._lock:
+            self._ibvs_controller = None
+            self._ibvs_active = False
+        update_state("vision_ibvs", {"active": False, "status": "intrinsic_reset"})
+        self._publish(calibration=self.calibration_summary())
+        return summary
+
+    def run_camera_to_base_calibration(
+        self,
+        pixel_points: list[list[float]],
+        base_points_mm: list[list[float]],
+    ) -> dict[str, Any]:
+        with self._lock:
+            image_size = self._frame_size
+        if image_size[0] <= 0 or image_size[1] <= 0:
+            state_size = read_state("vision", {}).get("frame_size", [0, 0])
+            image_size = (int(state_size[0]), int(state_size[1]))
+        if image_size[0] <= 0 or image_size[1] <= 0:
+            raise RuntimeError("No active camera frame size is available")
+        manager = self._get_calibration_manager()
+        result = manager.run_camera_to_base_calibration(
+            pixel_points,
+            base_points_mm,
+            image_size,
+        )
+        self._publish(calibration=self.calibration_summary())
+        return result
+
     def start_ibvs(
         self,
         ipc_arrays: dict[str, Any] | None = None,
@@ -1361,7 +1581,10 @@ class VisionManager:
 
     def calibration_summary(self) -> dict[str, Any]:
         try:
-            return self._get_calibration_manager().current_summary()
+            summary = self._get_calibration_manager().current_summary()
+            camera_to_base = load_config().get("vision", {}).get("camera_to_base", {})
+            summary["camera_to_base"] = camera_to_base if isinstance(camera_to_base, dict) else {}
+            return summary
         except Exception:
             return load_config().get("vision", {}).get("calibration", {})
 
@@ -1389,7 +1612,9 @@ class VisionManager:
             return
         self._status = f"Running: {source}"
         self._publish()
-        if str(self.config().get("detection_method", "adaptive")).lower() == "model":
+        if self.detection_enabled() and str(
+            self.config().get("detection_method", "model")
+        ).lower() == "model":
             self.load_model(self.config().get("model_path", ""))
         try:
             while not self._stop.is_set():
@@ -1401,16 +1626,36 @@ class VisionManager:
                     self._stop.wait(0.1)
                     continue
                 frame = self._apply_camera_adjustments(frame)
-                detection, bundle, display_frame = self._process_frame(frame)
+                if self.detection_enabled():
+                    detection, bundle, display_frame = self._process_frame(frame)
+                else:
+                    detection, bundle, display_frame = None, None, frame
+                detection_active = self.detection_enabled()
+                visible_frame = (
+                    display_frame
+                    if detection_active and display_frame is not None
+                    else frame
+                )
+                visible_frame = self._draw_chessboard_preview(frame, visible_frame)
                 with self._lock:
                     self._raw_frame = frame.copy()
-                    self._display_frame = display_frame.copy() if display_frame is not None else frame.copy()
-                    self._latest = detection
-                    self._latest_bundle = bundle
-                self._run_ibvs_step(detection, bundle)
+                    self._frame_size = (int(frame.shape[1]), int(frame.shape[0]))
+                    self._display_frame = visible_frame.copy()
+                    self._latest = detection if detection_active else None
+                    self._latest_bundle = bundle if detection_active else None
+                    if detection_active and isinstance(bundle, dict):
+                        history_item = dict(bundle)
+                        history_item["captured_at"] = time.time()
+                        history_item["coordinate_frame"] = "BASE"
+                        self._bundle_history.append(history_item)
+                if detection_active:
+                    self._run_ibvs_step(detection, bundle)
                 elapsed_ms = (time.perf_counter() - started) * 1000.0
                 research_logger.record("vision_time", round(elapsed_ms, 3))
-                self._status = "Running" if detection or bundle else "No object"
+                if not detection_active:
+                    self._status = "Camera running | Detection OFF"
+                else:
+                    self._status = "Running" if detection or bundle else "No object"
                 self._publish()
                 self._stop.wait(0.05)
         finally:
@@ -1461,13 +1706,29 @@ class VisionManager:
             if sys.platform.startswith("win"):
                 cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
                 if cap.isOpened():
-                    return cap
+                    return self._configure_camera_capture(cap)
                 try:
                     cap.release()
                 except Exception:
                     pass
-            return cv2.VideoCapture(index)
+            return self._configure_camera_capture(cv2.VideoCapture(index))
         return cv2.VideoCapture(source)
+
+    def _configure_camera_capture(self, cap: Any) -> Any:
+        if cap is None or not cap.isOpened():
+            return cap
+        import cv2
+
+        cfg = self.config()
+        width = max(1, int(cfg.get("camera_width", 1280)))
+        height = max(1, int(cfg.get("camera_height", 720)))
+        try:
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        except Exception:
+            pass
+        return cap
 
     def _process_frame(self, frame: Any) -> tuple[dict[str, Any] | None, dict[str, Any] | None, Any]:
         self._ensure_vision_modules()
@@ -1483,6 +1744,7 @@ class VisionManager:
         workspace_validator = WorkspaceValidator(cfg_manager)
         calibration = CameraCalibrationManager(cfg_manager)
         intrinsic = calibration.intrinsic_matrix_for_frame(frame.shape)
+        distortion = calibration.distortion_for_frame()
         z_mm = float(load_config().get("workspace", {}).get("z_fixed_mm", 200.0))
         method = str(load_config().get("vision", {}).get("detection_method", "adaptive")).lower()
         preview_pick_zone = bool(load_config().get("vision", {}).get("preview_pick_zone", True))
@@ -1495,12 +1757,23 @@ class VisionManager:
                 if self._model_detector is None:
                     self.load_model(load_config().get("vision", {}).get("model_path", ""))
                 if self._model_detector is not None and getattr(self._model_detector, "is_loaded", False):
-                    bundles = self._model_detector.detect_bundles(frame, intrinsic, z_mm)
+                    bundles = self._model_detector.detect_bundles(
+                        frame,
+                        intrinsic,
+                        z_mm,
+                        distortion,
+                    )
                     if bundles:
                         bundle = bundles[0]
                         bundle_payload = bundle.as_dict()
                         overlay = self._model_detector.draw_bundle_overlay(overlay, bundle)
-                        result, mask = self._model_detector.detect(frame, intrinsic, z_mm)
+                        result, mask = self._model_detector.detect(
+                            frame,
+                            intrinsic,
+                            z_mm,
+                            distortion,
+                            bundles,
+                        )
                         detection_payload = result.as_dict() if result is not None else None
                 elif not self._model_warned:
                     self._status = "Model mode selected but ONNX is not loaded"
@@ -1549,14 +1822,117 @@ class VisionManager:
         cropped = adjusted[y1:y1 + crop_h, x1:x1 + crop_w]
         return cv2.resize(cropped, (width, height))
 
+    def _draw_chessboard_preview(self, frame: Any, display_frame: Any) -> Any:
+        import cv2
+
+        calibration_cfg = self.config().get("calibration", {})
+        calibration_cfg = calibration_cfg if isinstance(calibration_cfg, dict) else {}
+        if not bool(calibration_cfg.get("preview_enabled", True)):
+            self._chessboard_found = False
+            self._chessboard_corner_count = 0
+            self._chessboard_corners = None
+            return display_frame
+
+        manager = self._get_calibration_manager()
+        try:
+            pattern_size = manager.normalize_chessboard_size(
+                calibration_cfg.get("chessboard_size", (9, 6))
+            )
+        except ValueError:
+            self._chessboard_found = False
+            self._chessboard_corner_count = 0
+            self._chessboard_pattern = (0, 0)
+            self._chessboard_corners = None
+            overlay = display_frame.copy()
+            cv2.rectangle(
+                overlay,
+                (8, 8),
+                (min(420, overlay.shape[1] - 8), 40),
+                (0, 0, 0),
+                -1,
+            )
+            cv2.putText(
+                overlay,
+                "INTRINSIC: INVALID CHESSBOARD SIZE",
+                (16, 31),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.62,
+                (0, 0, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            return overlay
+        now = time.monotonic()
+        should_detect = (
+            pattern_size != self._chessboard_pattern
+            or now - self._chessboard_last_detection_at >= 0.2
+        )
+        if should_detect:
+            found, corners = manager.find_chessboard_corners(
+                frame,
+                pattern_size,
+                fast_check=True,
+            )
+            self._chessboard_pattern = pattern_size
+            self._chessboard_found = bool(found)
+            self._chessboard_corners = corners
+            self._chessboard_corner_count = 0 if corners is None else int(len(corners))
+            self._chessboard_last_detection_at = now
+
+        overlay = manager.draw_chessboard_corners(
+            display_frame,
+            pattern_size,
+            self._chessboard_corners,
+            self._chessboard_found,
+        )
+        status = "FOUND" if self._chessboard_found else "NOT FOUND"
+        color = (0, 210, 0) if self._chessboard_found else (0, 170, 255)
+        text = (
+            f"INTRINSIC {pattern_size[0]}x{pattern_size[1]}: {status} "
+            f"({self._chessboard_corner_count} corners)"
+        )
+        cv2.rectangle(overlay, (8, 8), (min(520, overlay.shape[1] - 8), 40), (0, 0, 0), -1)
+        cv2.putText(
+            overlay,
+            text,
+            (16, 31),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+        return overlay
+
     def _publish(self, calibration: dict[str, Any] | None = None) -> None:
+        with self._lock:
+            bundle_history = list(self._bundle_history)
+            frame_size = [int(self._frame_size[0]), int(self._frame_size[1])]
+            display_frame_size = (
+                [int(self._display_frame.shape[1]), int(self._display_frame.shape[0])]
+                if self._display_frame is not None
+                else [0, 0]
+            )
+        model_shape = getattr(self._model_detector, "input_shape", (0, 0))
+        model_input_size = [
+            int(model_shape[1]),
+            int(model_shape[0]),
+        ] if len(model_shape) == 2 else [0, 0]
         update_state(
             "vision",
             {
                 "status": self._status,
+                "detection_enabled": self.detection_enabled(),
                 "model_status": self._model_status,
+                "model_input_size": model_input_size,
                 "latest": self._latest,
                 "latest_bundle": self._latest_bundle,
+                "bundle_history": bundle_history,
+                "frame_size": frame_size,
+                "display_frame_size": display_frame_size,
+                "chessboard_found": self._chessboard_found,
+                "chessboard_corner_count": self._chessboard_corner_count,
+                "chessboard_pattern": list(self._chessboard_pattern),
                 "calibration": calibration if calibration is not None else self.calibration_summary_safe(),
                 "updated_at": time.time(),
             },
@@ -1602,10 +1978,18 @@ def _workspace_check(x_mm: float, y_mm: float) -> tuple[str, str]:
     return "valid", "READY TO PICK"
 
 
-def _wait_for_marginal_confirmation(timeout_s: float, shared_string: Any) -> bool:
+def _wait_for_marginal_confirmation(
+    timeout_s: float,
+    shared_string: Any,
+    program_log_queue: Any = None,
+) -> bool:
     token = time.time()
     update_state("vision_confirmation", {"status": "pending", "token": token, "decision": "", "updated_at": time.time()})
-    _set_shared(shared_string, "Log: vision() waiting for marginal confirmation")
+    emit_program_log(
+        shared_string,
+        program_log_queue,
+        "Log: vision() waiting for marginal confirmation",
+    )
     deadline = time.time() + max(0.1, timeout_s)
     while time.time() < deadline:
         control = read_state("program_control", {})
@@ -1626,77 +2010,188 @@ def _wait_for_marginal_confirmation(timeout_s: float, shared_string: Any) -> boo
     return False
 
 
-def build_vision_pick_sequence(shared_string: Any) -> list[str] | None:
+def execute_vision_tool_z(
+    shared_string: Any,
+    program_log_queue: Any = None,
+) -> bool:
+    import numpy as np
+    import PAROL6_ROBOT
+    from vision.tool_z_runtime import calculate_tool_z, stable_pick_from_history
+
     cfg = load_config()
     vision_cfg = cfg.get("vision", {})
-    if not bool(vision_cfg.get("auto_pick_enabled", True)):
-        _set_shared(shared_string, "Error: vision() auto pick disabled")
-        research_logger.record("vision_pick_result", 0, "auto pick disabled")
-        return None
-    latest = vision_manager.latest()
-    bundle = vision_manager.latest_bundle()
-    pick_world = None
-    safety = ""
-    if isinstance(bundle, dict):
-        pick_world = bundle.get("pick_point_world")
-        safety = str(bundle.get("pick_safety", "")).upper()
-    if not pick_world and isinstance(latest, dict):
-        pick_world = latest.get("pick_point_world")
-        safety = str(latest.get("workspace_status", "")).upper()
-    if not pick_world:
-        _set_shared(shared_string, "Error: vision() no detection available")
-        research_logger.record("vision_pick_result", 0, "no detection")
-        return None
-    x_mm, y_mm = [float(value) for value in pick_world[:2]]
-    workspace_status, workspace_message = _workspace_check(x_mm, y_mm)
-    if safety == "UNSAFE" or workspace_status == "out":
-        try:
-            modbus_manager.write_value("error_flag", True)
-        except Exception:
-            pass
-        reason = "unsafe pick" if safety == "UNSAFE" else workspace_message
-        _set_shared(shared_string, f"Error: vision() {reason}")
-        research_logger.record("workspace_violation", 1, f"x={x_mm:.3f},y={y_mm:.3f},safety={safety}")
-        research_logger.record("vision_pick_result", 0, reason)
-        return None
+    tool_cfg = vision_cfg.get("tool_z", {})
+    if not bool(vision_cfg.get("detection_enabled", True)):
+        reset_vision_runtime()
+        emit_program_log(
+            shared_string,
+            program_log_queue,
+            "Error: vision() Detection is OFF",
+        )
+        return False
+    history = vision_manager.recent_bundles()
+    samples_are_mock = any(bool(item.get("mock", False)) for item in history[-10:])
+    camera_to_base = vision_cfg.get("camera_to_base", {})
+    if not samples_are_mock and not bool(
+        isinstance(camera_to_base, dict) and camera_to_base.get("valid", False)
+    ):
+        reset_vision_runtime()
+        emit_program_log(
+            shared_string,
+            program_log_queue,
+            "Error: vision() Camera-to-Base calibration is missing",
+        )
+        return False
+
+    try:
+        stable = stable_pick_from_history(
+            history,
+            sample_count=int(tool_cfg.get("sample_count", 5)),
+            max_age_s=float(tool_cfg.get("detection_max_age_s", 1.0)),
+            min_iou=float(tool_cfg.get("same_object_min_iou", 0.3)),
+        )
+    except ValueError as exc:
+        reset_vision_runtime()
+        emit_program_log(shared_string, program_log_queue, f"Error: vision() {exc}")
+        research_logger.record("vision_pick_result", 0, str(exc))
+        return False
+
+    safety = str(stable["pick_safety"]).upper()
+    raw_x_mm, raw_y_mm = [float(value) for value in stable["pick_point_base"]]
+    adjusted_x = raw_x_mm + float(vision_cfg.get("offset_x_mm", 0.0))
+    adjusted_y = raw_y_mm + float(vision_cfg.get("offset_y_mm", 0.0))
+    workspace_status, workspace_message = _workspace_check(adjusted_x, adjusted_y)
+    if workspace_status == "out":
+        reset_vision_runtime()
+        emit_program_log(
+            shared_string,
+            program_log_queue,
+            f"Error: vision() {workspace_message}",
+        )
+        research_logger.record(
+            "workspace_violation",
+            1,
+            f"x={adjusted_x:.3f},y={adjusted_y:.3f},safety={safety}",
+        )
+        return False
     if safety == "MARGINAL":
-        research_logger.record("marginal_event", 1, f"x={x_mm:.3f},y={y_mm:.3f}")
-        confirmed = _wait_for_marginal_confirmation(float(vision_cfg.get("marginal_confirm_timeout_s", 2.0)), shared_string)
+        confirmed = _wait_for_marginal_confirmation(
+            float(vision_cfg.get("marginal_confirm_timeout_s", 2.0)),
+            shared_string,
+            program_log_queue,
+        )
         if not confirmed:
-            _set_shared(shared_string, "Log: vision() marginal pick skipped")
-            research_logger.record("vision_pick_result", 0, "marginal skipped")
-            return []
-    elif safety == "UNKNOWN":
-        _set_shared(shared_string, "Log: vision() fixture unknown, using fallback pick point")
-        research_logger.record("unknown_fixture", 1, f"x={x_mm:.3f},y={y_mm:.3f}")
-    elif workspace_status == "margin":
-        _set_shared(shared_string, "Log: vision() target near workspace boundary")
-        research_logger.record("workspace_warning", 1, f"x={x_mm:.3f},y={y_mm:.3f}")
+            reset_vision_runtime()
+            emit_program_log(
+                shared_string,
+                program_log_queue,
+                "Error: vision() MARGINAL pick was not confirmed",
+            )
+            return False
 
-    z_mm = float(cfg.get("workspace", {}).get("z_fixed_mm", 200.0))
-    rpy = list(vision_cfg.get("pick_pose_rpy_deg", [0.0, 0.0, 0.0]))[:3]
-    while len(rpy) < 3:
-        rpy.append(0.0)
-    pick_time = float(vision_cfg.get("pick_move_time_s", 4.0))
-    descent = float(vision_cfg.get("post_pick_descent_mm", 50.0))
-    descent_time = float(vision_cfg.get("post_pick_move_time_s", 2.0))
-    gripper = list(vision_cfg.get("gripper_close", [255, 100, 120]))[:3]
-    while len(gripper) < 3:
-        gripper.append([255, 100, 120][len(gripper)])
-    commands = [
-        f"MovePose({x_mm:.3f},{y_mm:.3f},{z_mm:.3f},{float(rpy[0]):.3f},{float(rpy[1]):.3f},{float(rpy[2]):.3f},t={pick_time:.3f})",
-        f"MoveCartRelTRF(0,0,{descent:.3f},0,0,0,t={descent_time:.3f})",
-        f"Gripper({int(gripper[0])},{int(gripper[1])},{int(gripper[2])})",
-    ]
-    research_logger.record("vision_pick_target", 1, f"x={x_mm:.3f},y={y_mm:.3f},z={z_mm:.3f},safety={safety or workspace_status}")
-    research_logger.record("vision_sequence_generated", len(commands), "|".join(commands))
-    _set_shared(shared_string, f"Log: vision() target x={x_mm:.1f}, y={y_mm:.1f}")
-    return commands
+    reference_joint_deg = list(
+        tool_cfg.get(
+            "reference_joint_deg",
+            [90.0, -88.0, 182.259, 0.0, 3.0, 180.0],
+        )
+    )[:6]
+    if len(reference_joint_deg) != 6:
+        reset_vision_runtime()
+        emit_program_log(
+            shared_string,
+            program_log_queue,
+            "Error: vision() reference joint pose must contain 6 values",
+        )
+        return False
+    try:
+        reference_transform = PAROL6_ROBOT.robot.fkine(
+            np.deg2rad(np.asarray(reference_joint_deg, dtype=np.float64))
+        )
+        result = calculate_tool_z(
+            [raw_x_mm, raw_y_mm],
+            np.asarray(reference_transform.t, dtype=np.float64) * 1000.0,
+            np.asarray(reference_transform.R, dtype=np.float64),
+            x_tool_fixed_mm=float(tool_cfg.get("x_tool_fixed_mm", -60.0)),
+            y_tool_fixed_mm=float(tool_cfg.get("y_tool_fixed_mm", 0.0)),
+            base_offset_x_mm=float(vision_cfg.get("offset_x_mm", 0.0)),
+            base_offset_y_mm=float(vision_cfg.get("offset_y_mm", 0.0)),
+            z_tool_offset_mm=float(vision_cfg.get("z_tool_offset_mm", 0.0)),
+            z_plus_min_mm=float(tool_cfg.get("z_plus_min_mm", 0.0)),
+            z_plus_max_mm=float(tool_cfg.get("z_plus_max_mm", 78.0)),
+            retreat_margin_mm=float(tool_cfg.get("retreat_margin_mm", 30.0)),
+        )
+    except Exception as exc:
+        reset_vision_runtime()
+        emit_program_log(
+            shared_string,
+            program_log_queue,
+            f"Error: vision() Tool-Z calculation failed: {exc}",
+        )
+        research_logger.record("vision_tool_z_error", 1, str(exc))
+        return False
+
+    now = time.time()
+    runtime = {
+        "valid": True,
+        "status": safety,
+        "pick_point_px": list(stable["pick_point_px"]),
+        "pick_point_base_mm": [
+            result.target_base_x_mm,
+            result.target_base_y_mm,
+        ],
+        "z_raw_mm": result.z_raw_mm,
+        "z_plus_mm": result.z_plus_mm,
+        "z_minus_mm": result.z_minus_mm,
+        "residual_mm": result.residual_mm,
+        "clamped": result.clamped,
+        "sample_count": int(stable["sample_count"]),
+        "reference_joint_deg": [float(value) for value in reference_joint_deg],
+        "pose_tolerance_deg": float(tool_cfg.get("pose_tolerance_deg", 1.0)),
+        "computed_at": now,
+        "updated_at": now,
+        "expires_at": now + float(tool_cfg.get("runtime_max_age_s", 30.0)),
+    }
+    set_vision_runtime(runtime)
+    px_u, px_v = runtime["pick_point_px"]
+    emit_program_log(
+        shared_string,
+        program_log_queue,
+        (
+            f"Log: Vision status={safety} px=({px_u},{px_v}) "
+            f"base=({result.target_base_x_mm:.3f},{result.target_base_y_mm:.3f})"
+        ),
+    )
+    emit_program_log(
+        shared_string,
+        program_log_queue,
+        (
+            f"Log: Zraw={result.z_raw_mm:.3f} Z+={result.z_plus_mm:.3f} "
+            f"Z-={result.z_minus_mm:.3f} residual={result.residual_mm:.3f} "
+            f"clamp={'YES' if result.clamped else 'NO'}"
+        ),
+    )
+    research_logger.record(
+        "vision_tool_z",
+        1,
+        (
+            f"x={result.target_base_x_mm:.3f},y={result.target_base_y_mm:.3f},"
+            f"zplus={result.z_plus_mm:.3f},zminus={result.z_minus_mm:.3f},"
+            f"residual={result.residual_mm:.3f},safety={safety}"
+        ),
+    )
+    return True
 
 
-def execute_vision_command(shared_string: Any) -> bool:
-    sequence = build_vision_pick_sequence(shared_string)
-    return sequence is not None
+def build_vision_pick_sequence(
+    shared_string: Any,
+    program_log_queue: Any = None,
+) -> list[str] | None:
+    """Compatibility wrapper: vision now computes values and injects no motion."""
+    return [] if execute_vision_tool_z(shared_string, program_log_queue) else None
+
+
+def execute_vision_command(shared_string: Any, program_log_queue: Any = None) -> bool:
+    return execute_vision_tool_z(shared_string, program_log_queue)
 
 
 def execute_modbus_read(command_text: str, shared_string: Any) -> bool:

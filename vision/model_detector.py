@@ -187,14 +187,21 @@ class ModelDetector(BaseDetector):
     def is_loaded(self) -> bool:
         return self._session is not None or self._mock_mode
 
+    @property
+    def input_shape(self) -> tuple[int, int]:
+        return self._input_shape
+
     def detect(
         self,
         frame: np.ndarray,
         intrinsic_matrix: np.ndarray,
         z_mm: float,
+        distortion: np.ndarray | None = None,
+        bundles: list[DetectionBundle] | None = None,
     ) -> tuple[DetectionResult | None, np.ndarray]:
         """Run ONNX inference, returning first selongsong as DetectionResult for compat."""
-        bundles = self.detect_bundles(frame, intrinsic_matrix, z_mm)
+        if bundles is None:
+            bundles = self.detect_bundles(frame, intrinsic_matrix, z_mm, distortion)
         mask = np.zeros(frame.shape[:2], dtype=np.uint8)
         if not bundles:
             return None, mask
@@ -210,7 +217,18 @@ class ModelDetector(BaseDetector):
         fy = max(float(intrinsic_matrix[1, 1]), 1.0)
         width_mm = float(w) * float(z_mm) / fx
         height_mm = float(h) * float(z_mm) / fy
-        centroid_world = self._workspace_validator.pixel_to_world(cx, cy, intrinsic_matrix, z_mm)
+        try:
+            centroid_world = self._workspace_validator.pixel_to_base(
+                cx,
+                cy,
+                intrinsic_matrix,
+                distortion,
+                (frame.shape[1], frame.shape[0]),
+            )
+        except ValueError:
+            centroid_world = bundle.pick_point_world
+        if centroid_world is None:
+            return None, mask
         pick_world = bundle.pick_point_world or centroid_world
         workspace_status, workspace_message = self._workspace_validator.check(pick_world[0], pick_world[1])
         result = DetectionResult(
@@ -234,12 +252,13 @@ class ModelDetector(BaseDetector):
         frame: np.ndarray,
         intrinsic_matrix: np.ndarray,
         z_mm: float,
+        distortion: np.ndarray | None = None,
     ) -> list[DetectionBundle]:
         """Full model detection returning list of DetectionBundle."""
         if not self.is_loaded:
             self._lazy_load()
         if self._mock_mode:
-            return self._generate_mock_bundles(frame, intrinsic_matrix, z_mm)
+            return self._generate_mock_bundles(frame, intrinsic_matrix, z_mm, distortion)
         if self._session is None:
             return []
 
@@ -323,15 +342,22 @@ class ModelDetector(BaseDetector):
         from vision.safe_pick_validator import SafePickValidator
 
         validator = SafePickValidator(self._config)
-        margin_pct = float(self._config.get("vision.safe_pick_margin_pct", 0.15))
+        margin_pct = float(self._config.get("vision.safe_pick_margin_pct", 0.25))
         bundles: list[DetectionBundle] = []
         for s_box, s_conf, f_box, f_conf in pairs:
             safety, pick_px = validator.check_pair(s_box, f_box, margin_pct)
             pick_world = None
             if pick_px is not None:
-                pick_world = self._workspace_validator.pixel_to_world(
-                    pick_px[0], pick_px[1], intrinsic_matrix, z_mm,
-                )
+                try:
+                    pick_world = self._workspace_validator.pixel_to_base(
+                        pick_px[0],
+                        pick_px[1],
+                        intrinsic_matrix,
+                        distortion,
+                        (frame.shape[1], frame.shape[0]),
+                    )
+                except ValueError:
+                    pick_world = None
             bundles.append(DetectionBundle(
                 selongsong_box=s_box,
                 fixture_box=f_box,
@@ -409,32 +435,17 @@ class ModelDetector(BaseDetector):
 
     @staticmethod
     def _compute_safe_zone_rect(bundle: DetectionBundle) -> tuple[int, int, int, int] | None:
-        """Reconstruct the largest safe-zone rectangle from the bundle boxes.
-
-        Mirrors the geometry in :class:`SafePickValidator.check_pair`, but
-        only returns the rectangle so the overlay can render it. Returns
-        ``None`` when no meaningful safe zone exists.
-        """
+        """Reconstruct the left-only safe-zone rectangle."""
         if bundle.selongsong_box is None:
             return None
         sx1, sy1, sx2, sy2 = bundle.selongsong_box.astype(float)
         if bundle.fixture_box is None:
             return int(sx1), int(sy1), int(sx2), int(sy2)
-        fx1, fy1, fx2, fy2 = bundle.fixture_box.astype(float)
-        candidates: list[tuple[float, float, float, float]] = []
-        if fx1 > sx1:
-            candidates.append((sx1, sy1, min(sx2, fx1), sy2))
-        if fx2 < sx2:
-            candidates.append((max(sx1, fx2), sy1, sx2, sy2))
-        if fy1 > sy1:
-            candidates.append((sx1, sy1, sx2, min(sy2, fy1)))
-        if fy2 < sy2:
-            candidates.append((sx1, max(sy1, fy2), sx2, sy2))
-        candidates = [c for c in candidates if (c[2] - c[0]) > 0 and (c[3] - c[1]) > 0]
-        if not candidates:
+        fixture_x1 = float(bundle.fixture_box[0])
+        left_edge = min(float(sx2), fixture_x1)
+        if left_edge <= float(sx1):
             return None
-        best = max(candidates, key=lambda c: (c[2] - c[0]) * (c[3] - c[1]))
-        return int(best[0]), int(best[1]), int(best[2]), int(best[3])
+        return int(sx1), int(sy1), int(left_edge), int(sy2)
 
     # ------ private ------
 
@@ -468,6 +479,7 @@ class ModelDetector(BaseDetector):
         frame: np.ndarray,
         intrinsic_matrix: np.ndarray,
         z_mm: float,
+        distortion: np.ndarray | None = None,
     ) -> list[DetectionBundle]:
         """Return a synthetic DetectionBundle for MOCK mode."""
         h, w = frame.shape[:2]
@@ -481,9 +493,9 @@ class ModelDetector(BaseDetector):
         s_box = np.array([sx1, sy1, sx1 + s_w, sy1 + s_h], dtype=np.float64)
 
         # Fixture box — slightly larger, overlapping top
-        fx1 = sx1 - 10
+        fx1 = sx1 + 100
         fy1 = sy1 - 14
-        f_w, f_h = s_w + 20, 14
+        f_w, f_h = 35, s_h + 28
         f_box: np.ndarray | None = np.array([fx1, fy1, fx1 + f_w, fy1 + f_h], dtype=np.float64)
 
         # Randomly remove fixture 10% of the time → UNKNOWN
@@ -493,13 +505,20 @@ class ModelDetector(BaseDetector):
         from vision.safe_pick_validator import SafePickValidator
 
         validator = SafePickValidator(self._config)
-        margin_pct = float(self._config.get("vision.safe_pick_margin_pct", 0.15))
+        margin_pct = float(self._config.get("vision.safe_pick_margin_pct", 0.25))
         safety, pick_px = validator.check_pair(s_box, f_box, margin_pct)
         pick_world = None
         if pick_px is not None:
-            pick_world = self._workspace_validator.pixel_to_world(
-                pick_px[0], pick_px[1], intrinsic_matrix, z_mm,
-            )
+            try:
+                pick_world = self._workspace_validator.pixel_to_base(
+                    pick_px[0],
+                    pick_px[1],
+                    intrinsic_matrix,
+                    distortion,
+                    (frame.shape[1], frame.shape[0]),
+                )
+            except ValueError:
+                pick_world = None
 
         bundle = DetectionBundle(
             selongsong_box=s_box,
