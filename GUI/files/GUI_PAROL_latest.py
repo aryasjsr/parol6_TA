@@ -328,6 +328,8 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
 
         app.COMPORT = customtkinter.CTkEntry(app.bottom_select_frame, width= 150)
         app.COMPORT.grid(row=3, column=5, padx=(0, 0),pady=(3,3),sticky="E")
+        if my_os != "Darwin" and len(General_data) > 0:
+            app.COMPORT.insert(0, str(General_data[0]))
 
         # Add a helpful label for macOS users
         if my_os == "Darwin":
@@ -3334,14 +3336,11 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         
         # For macOS, allow full port paths
         if my_os == "Darwin":
-            # If input looks like a full path, store it as a string in General_data[2]
+            # If input looks like a full path, pass it through shared_string.
             if COMPORT_value.startswith('/dev/'):
-                # Store the full path in a new General_data index for macOS
                 if len(General_data) < 3:
-                    # Extend General_data array if needed
-                    General_data.extend([0])  # Add space for full port path flag
+                    General_data.extend([0])
                 General_data[0] = -1  # Use -1 to indicate full path mode
-                # Store full path in shared_string temporarily for serial functions to access
                 shared_string.value = COMPORT_value.encode('utf-8')
             else:
                 # Try to extract number for backward compatibility
@@ -3362,6 +3361,9 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
                General_data[0] = com_number
             else:
                  General_data[0] = 0  # Default to 0 if no match found
+
+        if len(General_data) > 2:
+            General_data[2] = General_data[2] + 1
 
         print("Port setting:", General_data[0])
         if my_os == "Darwin" and General_data[0] == -1:
@@ -3926,7 +3928,15 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         app.ESTOP_STATUS.configure(app.IO_frame, text="ESTOP: " + str(InOut_in[4]).rjust(7, ' '), font=customtkinter.CTkFont(size=text_size))
         app.OUTPUT_1_LABEL.configure(app.IO_frame, text="OUTPUT 1 is: " + str(InOut_out[2]).rjust(7, ' '), font=customtkinter.CTkFont(size=text_size))
         app.OUTPUT_2_LABEL.configure(app.IO_frame, text="OUTPUT 2 is: " + str(InOut_out[3]).rjust(7, ' '), font=customtkinter.CTkFont(size=text_size))
-        if( InOut_in[4] == 0):
+        robot_connection_state = 0
+        if len(General_data) > 3:
+            robot_connection_state = General_data[3]
+
+        if robot_connection_state == 0:
+            app.estop_status.configure(text="\u25cf NOT CONNECTED", text_color=UI_DANGER, font=customtkinter.CTkFont(family='Inter', size=15, weight='bold'))
+        elif robot_connection_state == 1:
+            app.estop_status.configure(text="\u25cf CONNECTING", text_color=UI_WARN, font=customtkinter.CTkFont(family='Inter', size=15, weight='bold'))
+        elif( InOut_in[4] == 0):
             app.estop_status.configure(text="\u25cf ESTOP ACTIVE", text_color=UI_DANGER, font=customtkinter.CTkFont(family='Inter', size=15, weight='bold'))
         else:
             app.estop_status.configure(text="\u25cf READY", text_color=UI_SUCCESS, font=customtkinter.CTkFont(family='Inter', size=15, weight='bold'))
@@ -4129,7 +4139,7 @@ if __name__ == "__main__":
     # Speed slider, acc slider, WRF/TRF
     Jog_control = [0,0,0,0]
     # COM PORT, BAUD RATE, 
-    General_data = [8,3000000]
+    General_data = [4,3000000,0,0]
     # Home,Enable,Disable,Clear error,Real_robot,Sim_robot,Demo app,Program executions,Park
     Buttons = [0,0,0,0,1,1,0,0,0]
     

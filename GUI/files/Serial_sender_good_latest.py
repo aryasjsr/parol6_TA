@@ -283,7 +283,7 @@ logging.basicConfig(level = logging.DEBUG,
 )
 
 if my_os == "Windows": 
-    STARTING_PORT = 6 # COM3
+    STARTING_PORT = 4 # COM4
 elif my_os == "Darwin":
     STARTING_PORT = 0 # Mac uses different port naming
 else:   
@@ -293,9 +293,25 @@ else:
 # if using mac this will add /dev/tty.usbmodem + 0 ---> /dev/tty.usbmodem0 (placeholder)
 str_port = ''
 logging.disable(logging.DEBUG)
+
+def windows_serial_port_name(port_number):
+    com_name = str(port_number).strip()
+    if not com_name.upper().startswith('COM'):
+        com_name = 'COM' + com_name
+    com_name = com_name.upper()
+    try:
+        if int(com_name[3:]) >= 10:
+            return '\\\\.\\' + com_name
+    except ValueError:
+        pass
+    return com_name
+
+def windows_serial_port_label(com_port):
+    return str(com_port).replace('\\\\.\\', '').upper()
+
 if my_os == "Windows":
     try:
-        str_port = 'COM' + str(STARTING_PORT)
+        str_port = windows_serial_port_name(STARTING_PORT)
         ser = serial.Serial(port=str_port, baudrate=3000000, timeout=0)
     except:
         ser = serial.Serial()
@@ -316,6 +332,131 @@ elif my_os == "Darwin":
 else:
     ser = serial.Serial()
 #ser.open()
+
+serial_reconnect_lock = threading.Lock()
+last_reconnect_request = 0
+last_robot_packet_time = 0.0
+last_serial_open_time = 0.0
+last_no_robot_data_message_time = 0.0
+ROBOT_PACKET_TIMEOUT_S = 1.0
+ROBOT_CONNECT_TIMEOUT_S = 3.0
+GENERAL_CONNECT_REQUEST_INDEX = 2
+GENERAL_CONNECTION_STATE_INDEX = 3
+CONNECTION_DISCONNECTED = 0
+CONNECTION_PORT_OPEN = 1
+CONNECTION_ROBOT_RESPONDING = 2
+
+def selected_serial_port(General_data, shared_string):
+    if my_os == 'Linux':
+        return '/dev/ttyACM' + str(General_data[0])
+    if my_os == 'Windows':
+        return windows_serial_port_name(General_data[0])
+    if my_os == 'Darwin':
+        if General_data[0] == -1:
+            com_port = shared_string.value.decode('utf-8')
+            if not com_port or com_port.isspace():
+                return '/dev/tty.usbmodem0'
+            return com_port
+        if General_data[0] == 0:
+            return '/dev/tty.usbmodem0'
+        return '/dev/tty.usbmodem' + str(General_data[0])
+    return ''
+
+def serial_port_matches(com_port):
+    current_port = getattr(ser, "port", None)
+    if current_port is None:
+        return False
+    if my_os == "Windows":
+        return windows_serial_port_label(current_port) == windows_serial_port_label(com_port)
+    return str(current_port) == str(com_port)
+
+def connect_request_value(General_data):
+    try:
+        if len(General_data) > GENERAL_CONNECT_REQUEST_INDEX:
+            return int(General_data[GENERAL_CONNECT_REQUEST_INDEX])
+    except (IndexError, TypeError):
+        pass
+    return 0
+
+def set_robot_connection_state(General_data, state):
+    try:
+        if len(General_data) > GENERAL_CONNECTION_STATE_INDEX:
+            General_data[GENERAL_CONNECTION_STATE_INDEX] = state
+    except (IndexError, TypeError):
+        pass
+
+def mark_robot_packet_received(General_data):
+    global last_robot_packet_time
+    last_robot_packet_time = time.perf_counter()
+    set_robot_connection_state(General_data, CONNECTION_ROBOT_RESPONDING)
+
+def refresh_robot_connection_state(General_data, shared_string=None):
+    global last_no_robot_data_message_time
+    if not ser.is_open:
+        set_robot_connection_state(General_data, CONNECTION_DISCONNECTED)
+    elif last_robot_packet_time > 0 and time.perf_counter() - last_robot_packet_time <= ROBOT_PACKET_TIMEOUT_S:
+        set_robot_connection_state(General_data, CONNECTION_ROBOT_RESPONDING)
+    elif last_serial_open_time > 0 and time.perf_counter() - last_serial_open_time > ROBOT_CONNECT_TIMEOUT_S:
+        set_robot_connection_state(General_data, CONNECTION_DISCONNECTED)
+        if shared_string is not None and time.perf_counter() - last_no_robot_data_message_time > ROBOT_CONNECT_TIMEOUT_S:
+            com_port = selected_serial_port(General_data, shared_string)
+            display_port = windows_serial_port_label(com_port) if my_os == "Windows" else com_port
+            set_shared_message(shared_string, "Error: No robot data received on " + display_port + "; check robot power/firmware/USB")
+            last_no_robot_data_message_time = time.perf_counter()
+    else:
+        set_robot_connection_state(General_data, CONNECTION_PORT_OPEN)
+
+def set_shared_message(shared_string, message):
+    try:
+        shared_string.value = message.encode("utf-8")[:99]
+    except Exception:
+        pass
+
+def serial_reconnect_requested(General_data):
+    global last_reconnect_request
+    reconnect_request = connect_request_value(General_data)
+    if reconnect_request != last_reconnect_request:
+        last_reconnect_request = reconnect_request
+        return True
+    return False
+
+def reopen_selected_serial(General_data, shared_string, notify=False):
+    global last_serial_open_time, last_no_robot_data_message_time
+    com_port = selected_serial_port(General_data, shared_string)
+    display_port = windows_serial_port_label(com_port) if my_os == "Windows" else com_port
+    print(display_port)
+    with serial_reconnect_lock:
+        try:
+            if ser.is_open:
+                ser.close()
+        except Exception:
+            pass
+
+        try:
+            ser.port = com_port
+            ser.baudrate = General_data[1] if len(General_data) > 1 else 3000000
+            ser.timeout = 0
+            time.sleep(0.5)
+            ser.open()
+            time.sleep(0.5)
+            last_serial_open_time = time.perf_counter()
+            last_no_robot_data_message_time = 0.0
+            set_robot_connection_state(General_data, CONNECTION_PORT_OPEN)
+            if notify:
+                set_shared_message(shared_string, "Log: Serial port open " + display_port + "; waiting for robot data")
+            return True
+        except Exception as exc:
+            try:
+                if ser.is_open:
+                    ser.close()
+            except Exception:
+                pass
+            time.sleep(0.5)
+            set_robot_connection_state(General_data, CONNECTION_DISCONNECTED)
+            if notify:
+                set_shared_message(shared_string, "Error: Serial connect failed on " + display_port + ": " + str(exc))
+            logging.debug("no serial available, reconnecting! %s", exc)
+            return False
 
 # in big endian machines, first byte of binary representation of the multibyte data-type is stored first. 
 int_to_3_bytes = struct.Struct('>I').pack # BIG endian order
@@ -394,6 +535,15 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
             reset_vision_runtime()
             Robot_mode = "Dummy"
 
+        selected_port = selected_serial_port(General_data, shared_string)
+        port_changed = ser.is_open and not serial_port_matches(selected_port)
+        if my_os == "Darwin" and General_data[0] == -1:
+            port_changed = False
+        reconnect_requested = serial_reconnect_requested(General_data)
+        if reconnect_requested or port_changed:
+            reopen_selected_serial(General_data, shared_string, notify=reconnect_requested or port_changed)
+        refresh_robot_connection_state(General_data, shared_string)
+
         if ser.is_open == True or Buttons[7] == 1:
             if ser.is_open == True:
                 logging.debug("Task 1 alive")
@@ -413,6 +563,12 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
                     for i in range(len_):
                         ser.write(s[i])
                 except:
+                    set_robot_connection_state(General_data, CONNECTION_DISCONNECTED)
+                    try:
+                        if ser.is_open:
+                            ser.close()
+                    except Exception:
+                        pass
                     logging.debug("NO SERIAL TASK1")
     
 
@@ -2346,36 +2502,7 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
             
             
         else:
-            try:
-                
-                
-                if my_os == 'Linux':
-                    com_port = '/dev/ttyACM' + str(General_data[0])
-                elif my_os == 'Windows':
-                    com_port = 'COM' + str(General_data[0])
-                elif my_os == 'Darwin':
-                    # For Mac, check if full path mode is enabled
-                    if General_data[0] == -1:
-                        # Use full path from shared_string
-                        com_port = shared_string.value.decode('utf-8')
-                        # Fallback to default if shared_string is empty
-                        if not com_port or com_port.isspace():
-                            com_port = '/dev/tty.usbmodem0'
-                    elif General_data[0] == 0:
-                        com_port = '/dev/tty.usbmodem0'  # Default placeholder
-                    else:
-                        com_port = '/dev/tty.usbmodem' + str(General_data[0])
-                    
-                print(com_port)
-                ser.port = com_port
-                ser.baudrate = 3000000
-                ser.close()
-                time.sleep(0.5)
-                ser.open()
-                time.sleep(0.5)
-            except:
-                time.sleep(0.5)
-                logging.debug("no serial available, reconnecting!")
+            reopen_selected_serial(General_data, shared_string)
 
         timer.checkpt()
 
@@ -2490,40 +2617,14 @@ def Task2(shared_string,Position_in,Speed_in,Homed_in,InOut_in,Temperature_error
         # javiti će to makar je tamo while petlja. ako bi bila if petlja onda bi očitao jedan i radio ostatak koda
         # pa se vratio pročitao jedan itd. tako bi možda pre sporo primali serial ako bi ostatak koda bio spor
         try:
-            Get_data(Position_in,Speed_in,Homed_in,InOut_in,Temperature_error_in,Position_error_in,Timeout_error,Timing_data_in,
-         XTR_data,Gripper_data_in)
+            if Get_data(Position_in,Speed_in,Homed_in,InOut_in,Temperature_error_in,Position_error_in,Timeout_error,Timing_data_in,
+         XTR_data,Gripper_data_in):
+                mark_robot_packet_received(General_data)
+            refresh_robot_connection_state(General_data, shared_string)
             #Get_data_old()
         except:
-            try: 
-                
-                if my_os == 'Linux':
-                    com_port = '/dev/ttyACM' + str(General_data[0])
-                elif my_os == 'Windows':
-                    com_port = 'COM' + str(General_data[0])
-                elif my_os == 'Darwin':
-                    # For Mac, check if full path mode is enabled
-                    if General_data[0] == -1:
-                        # Use full path from shared_string
-                        com_port = shared_string.value.decode('utf-8')
-                        # Fallback to default if shared_string is empty
-                        if not com_port or com_port.isspace():
-                            com_port = '/dev/tty.usbmodem0'
-                    elif General_data[0] == 0:
-                        com_port = '/dev/tty.usbmodem0'  # Default placeholder
-                    else:
-                        com_port = '/dev/tty.usbmodem' + str(General_data[0])
-                    
-                
-                print(com_port)
-                ser.port = com_port
-                ser.baudrate = 3000000
-                ser.close()
-                time.sleep(0.5)
-                ser.open()
-                time.sleep(0.5)
-            except:
-                time.sleep(0.5)
-                logging.debug("no serial available, reconnecting!")
+            set_robot_connection_state(General_data, CONNECTION_DISCONNECTED)
+            reopen_selected_serial(General_data, shared_string)
         #Get_data_old()
         #print("Task 2 alive")
         #time.sleep(2)
@@ -3075,6 +3176,8 @@ def Get_data(Position_in,Speed_in,Homed_in,InOut_in,Temperature_error_in,Positio
     global data_buffer 
     global data_counter
 
+    packet_received = False
+
     while (ser.inWaiting() > 0):
         input_byte = ser.read()
 
@@ -3131,6 +3234,7 @@ def Get_data(Position_in,Speed_in,Homed_in,InOut_in,Temperature_error_in,Positio
                     logging.debug("I UNPACKED RAW DATA RECEIVED FROM THE ROBOT")
                     Unpack_data(data_buffer, Position_in,Speed_in,Homed_in,InOut_in,Temperature_error_in,Position_error_in,Timeout_error,Timing_data_in,
                     XTR_data,Gripper_data_in)
+                    packet_received = True
                     logging.debug("DATA UNPACK FINISHED")
                     # ako su dobri izračunaj crc
                     # if crc dobar raspakiraj podatke
@@ -3149,6 +3253,8 @@ def Get_data(Position_in,Speed_in,Homed_in,InOut_in,Temperature_error_in,Positio
                 data_counter = 0
             else:
                 data_counter = data_counter + 1
+
+    return packet_received
 
 
 # Split data to 3 bytes 
@@ -3287,8 +3393,8 @@ if __name__ == '__main__':
     # Speed slider, acc slider, WRF/TRF 
     Jog_control = multiprocessing.Array("i",[0,0,0,0], lock=False) 
 
-    # COM PORT, BAUD RATE, additional space for macOS full path flag
-    General_data =  multiprocessing.Array("i",[STARTING_PORT,3000000,0], lock=False)
+    # COM port, baud rate, reconnect request, connection state
+    General_data =  multiprocessing.Array("i",[STARTING_PORT,3000000,0,0], lock=False)
 
     # Home,Enable,Disable,Clear error,Real_robot,Sim_robot, demo_app, program execution,
     Buttons =  multiprocessing.Array("i",[0,0,0,0,1,1,0,0,0], lock=False) 
