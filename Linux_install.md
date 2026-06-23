@@ -1,42 +1,118 @@
-# How to install Linux
+# How to install on Linux
 
-    sudo apt install python3
-    ---> CURRENT VERSION INSTALLED: python3 is already the newest version (3.10.6-1~22.04).
-    sudo apt install python3-pip
-    sudo apt-get install git
-    pip3 install git+https://github.com/PCrnjak/s_visual_kinematics.git@main#egg=s_visual_kinematics
-    pip3 install customtkinter
-    pip3 install customtkinter --upgrade
-    pip3 install oclock
-    pip3 install pyserial
-    pip3 install roboticstoolbox-python==1.0.3
-    pip3 install swift-sim==1.0.1
-    sudo apt-get install python3-tk
-    pip3 install pgraph-python
-    pip3 install progress 
-    sudo apt-get install python3-pil python3-pil.imagetk
-    pip3 install numpy==1.23.4
-    pip3 install scipy==1.11.4
+These steps are intended for Ubuntu 24.04 and other recent Ubuntu releases.
+The project has been tested with Python 3.10.x, and some pinned dependencies
+such as `numpy==1.23.4` are not suitable for the system Python 3.12 that ships
+with Ubuntu 24.04.
 
-## Clone
-git clone https://github.com/PCrnjak/PAROL-commander-software.git
+## 1. Install system packages
 
-## To run go to the install directory and
-    python3 Serial_sender_good_latest.py
+```bash
+sudo apt update
+sudo apt install -y git build-essential python3-tk python3-pil python3-pil.imagetk
+```
 
+If you will install Python 3.10 with `pyenv`, also install the Python build
+dependencies:
 
-## If using Visual Studio code
-    install python extension
+```bash
+sudo apt install -y make libssl-dev zlib1g-dev libbz2-dev libreadline-dev \
+    libsqlite3-dev curl libncursesw5-dev xz-utils tk-dev libxml2-dev \
+    libxmlsec1-dev libffi-dev liblzma-dev
+```
 
-## If getting serial errors try (0 might be some other number depending on what com port your robot was assigned to):
-    sudo chmod 666 /dev/ttyACM0 
+## 2. Install Python 3.10
 
-## To find the serial device try this:
-https://askubuntu.com/questions/398941/find-which-tty-device-connected-over-usb
+Use a Python 3.10 interpreter that is separate from the operating system
+Python. One option is `pyenv`:
 
-## If connecting over GUI enter (x is your port number):
-    ttyACMx 
-Press connect multiple times
+```bash
+curl https://pyenv.run | bash
+```
 
-## Troubleshooting
-Check In https://github.com/PCrnjak/PAROL-commander-software/tree/main/Working%20dependency what python module versions were used on working systems
+Follow the shell setup instructions printed by `pyenv`, restart the terminal,
+then install Python 3.10:
+
+```bash
+pyenv install 3.10.14
+```
+
+## 3. Create the virtual environment
+
+From the repository root:
+
+```bash
+cd /home/arya/TA/parol6_TA
+python3.10 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools
+python -m pip install wheel==0.42.0
+pip install -r requirements.txt
+```
+
+If Python 3.10 was installed with `pyenv`, use:
+
+```bash
+~/.pyenv/versions/3.10.14/bin/python -m venv .venv
+```
+
+## 4. Run the application
+
+Use the Linux runner:
+
+```bash
+cd /home/arya/TA/parol6_TA
+./run_linux.sh
+```
+
+Or run the entrypoint manually from `GUI/files`:
+
+```bash
+cd /home/arya/TA/parol6_TA/GUI/files
+../../.venv/bin/python Serial_sender_good_latest.py
+```
+
+Running from `GUI/files` keeps local imports and image/program assets on the
+expected relative path.
+
+## 5. Serial USB access
+
+Connect the PAROL6 control board and check which serial device was assigned:
+
+```bash
+ls -l /dev/ttyACM* /dev/ttyUSB*
+```
+
+If the board appears as `/dev/ttyACM0`, enter `0` in the GUI port field.
+The application will open `/dev/ttyACM0`.
+
+If the board appears as another device, enter the full path, for example:
+
+```text
+/dev/ttyUSB0
+```
+
+To avoid running `chmod` every time, add your user to the serial device group
+and then log out and log back in:
+
+```bash
+sudo usermod -aG dialout arya
+```
+
+For a temporary test only:
+
+```bash
+sudo chmod 666 /dev/ttyACM0
+```
+
+## 6. Quick verification
+
+```bash
+cd /home/arya/TA/parol6_TA
+.venv/bin/python -c "import serial, customtkinter, roboticstoolbox, numpy, PIL"
+source .venv/bin/activate && pip check
+./run_linux.sh
+```
+
+If the GUI opens but the robot does not connect, confirm the USB device path,
+power/firmware state, and serial permissions.

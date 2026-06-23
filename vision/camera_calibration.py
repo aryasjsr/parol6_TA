@@ -176,6 +176,7 @@ class CameraCalibrationManager:
                 "max_error_mm": None,
             },
         )
+        self._config.set("vision.camera_to_base_points", [])
         return {
             "calibrated": False,
             "deleted_snapshots": deleted_snapshots,
@@ -432,6 +433,7 @@ class CameraCalibrationManager:
             "inlier_count": int(np.sum(inlier_mask)) if inlier_mask is not None else int(len(pixel_points)),
             "rms_error_mm": rms_error,
             "max_error_mm": max_error,
+            "raw_pixel_points": np.asarray(pixel_points, dtype=np.float64).reshape(-1, 2).tolist(),
             "pixel_points": undistorted.tolist(),
             "base_points_mm": base_points.tolist(),
         }

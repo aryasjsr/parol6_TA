@@ -14,6 +14,61 @@ from vision.workspace_validator import WorkspaceValidator
 _log = logging.getLogger(__name__)
 
 
+def _normalise_runtime(value: object) -> str:
+    runtime = str(value or "auto").strip().lower()
+    aliases = {
+        "auto": "auto",
+        "cuda": "cuda",
+        "gpu": "cuda",
+        "nvidia": "cuda",
+        "cpu": "cpu",
+    }
+    return aliases.get(runtime, "auto")
+
+
+def _select_onnx_providers(ort_module: object, runtime: str) -> list[str]:
+    available = set(ort_module.get_available_providers())
+    cpu_provider = "CPUExecutionProvider"
+    cuda_provider = "CUDAExecutionProvider"
+
+    if runtime == "cpu":
+        if cpu_provider not in available:
+            raise RuntimeError("CPUExecutionProvider is not available in ONNX Runtime")
+        return [cpu_provider]
+
+    providers: list[str] = []
+    if cuda_provider in available:
+        providers.append(cuda_provider)
+    elif runtime == "cuda":
+        available_text = ", ".join(sorted(available)) or "none"
+        raise RuntimeError(
+            "CUDAExecutionProvider is not available. Install onnxruntime-gpu "
+            "and make sure the NVIDIA driver is active. "
+            f"Available providers: {available_text}"
+        )
+
+    if cpu_provider in available:
+        providers.append(cpu_provider)
+    if not providers:
+        available_text = ", ".join(sorted(available)) or "none"
+        raise RuntimeError(f"No supported ONNX Runtime provider available: {available_text}")
+    return providers
+
+
+def _preload_onnx_cuda(ort_module: object) -> None:
+    preload = getattr(ort_module, "preload_dlls", None)
+    if preload is None:
+        return
+    try:
+        preload()
+    except Exception as exc:
+        _log.debug("ONNX CUDA preload failed: %s", exc)
+        try:
+            preload(directory="")
+        except Exception as fallback_exc:
+            _log.debug("ONNX CUDA preload from NVIDIA packages failed: %s", fallback_exc)
+
+
 # ---------------------------------------------------------------------------
 # Letterbox helpers
 # ---------------------------------------------------------------------------
@@ -141,6 +196,7 @@ class ModelDetector(BaseDetector):
         self._mock_frame_idx = 0
         self._input_name: str = "images"
         self._input_shape: tuple[int, int] = (640, 640)
+        self._execution_provider: str = ""
 
     # ------ public API ------
 
@@ -155,6 +211,7 @@ class ModelDetector(BaseDetector):
         if path.strip().upper() == "MOCK":
             self._session = None
             self._mock_mode = True
+            self._execution_provider = "MOCK"
             _log.info("ModelDetector running in MOCK mode")
             return
 
@@ -165,23 +222,42 @@ class ModelDetector(BaseDetector):
         # bounding boxes — exactly the "bbox in a black frame" symptom.
         self._session = None
         self._mock_mode = False
+        self._execution_provider = ""
 
         import onnxruntime as ort
 
         resolved = self._resolve_model_path(path)
         if not resolved or not resolved.is_file():
             raise ModelNotFoundError(f"ONNX model not found: {path}")
+        runtime = _normalise_runtime(self._config.get("vision.model_runtime", "auto"))
+        providers = _select_onnx_providers(ort, runtime)
+        if "CUDAExecutionProvider" in providers:
+            _preload_onnx_cuda(ort)
         self._session = ort.InferenceSession(
             str(resolved),
-            providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+            providers=providers,
         )
+        active_providers = self._session.get_providers()
+        if runtime == "cuda" and "CUDAExecutionProvider" not in active_providers:
+            active_text = ", ".join(active_providers) or "none"
+            self._session = None
+            raise RuntimeError(
+                "CUDA runtime was requested, but ONNX Runtime did not activate "
+                f"CUDAExecutionProvider. Active providers: {active_text}"
+            )
+        self._execution_provider = active_providers[0] if active_providers else ""
         meta = self._session.get_inputs()[0]
         self._input_name = meta.name
         shape = meta.shape  # e.g. [1, 3, 640, 640]
         if len(shape) == 4:
             self._input_shape = (int(shape[2]), int(shape[3]))
         self._mock_mode = False
-        _log.info("ONNX model loaded: %s (input %s)", path, self._input_shape)
+        _log.info(
+            "ONNX model loaded: %s (input %s, provider %s)",
+            path,
+            self._input_shape,
+            self._execution_provider or "unknown",
+        )
 
     @property
     def is_loaded(self) -> bool:
@@ -190,6 +266,10 @@ class ModelDetector(BaseDetector):
     @property
     def input_shape(self) -> tuple[int, int]:
         return self._input_shape
+
+    @property
+    def execution_provider(self) -> str:
+        return self._execution_provider
 
     def detect(
         self,
@@ -455,6 +535,7 @@ class ModelDetector(BaseDetector):
         except (ModelNotFoundError, ImportError, Exception) as exc:
             _log.warning("Model lazy-load failed: %s", exc)
             self._session = None
+            self._execution_provider = ""
 
     @staticmethod
     def _resolve_model_path(path: str) -> Path | None:

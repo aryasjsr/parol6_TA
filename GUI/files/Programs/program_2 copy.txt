@@ -1,0 +1,29 @@
+Begin()
+print("pick start")
+Output(1,HIGH)
+Output(2,LOW)
+MoveJoint(90,-88,182.259,0,3,180,t=4)
+vision()
+print("Z+ Tool = $vision.z_plus mm")
+print("Z- Tool = $vision.z_minus mm")
+MoveCartRelTRF(-50,0,$vision.z_plus,0,0,0,t=4)
+Delay(1)
+Output(1,LOW)
+Output(2,HIGH)
+Delay(1)
+MoveCartRelTRF(0,0,-165,0,0,0,t=4)
+print("SAfe J2,J3,J5")
+MoveJoint(89.016,-144.38,133.901,-0.084,-60.919,179.966)
+print("move base")
+MoveJoint(-60.363,-144.38,133.901,-0.084,-60.919,179.966)
+print("move j5,J3,J1")
+MoveJoint(-47.584,-140.754,143.025,-0.084,-34.284,179.966)
+
+
+
+
+
+End()
+
+
+

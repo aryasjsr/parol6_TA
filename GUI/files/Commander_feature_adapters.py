@@ -89,10 +89,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "pick_inset_x_mm": 10.0,
         "pick_inset_y_mm": 8.0,
         "model_path": "vision/models/best.onnx",
+        "model_runtime": "cuda",
         "model_conf_threshold": 0.5,
         "model_iou_threshold": 0.45,
         "safe_pick_margin_pct": 0.25,
         "safe_pick_left_offset_px": 0.0,
+        "pick_accuracy_test": {
+            "enabled": False,
+            "threshold_mm": 3.0,
+            "log_path": "logs/pick_accuracy_trials.json",
+        },
         "marginal_confirm_timeout_s": 2.0,
         "offset_x_mm": 0.0,
         "offset_y_mm": 0.0,
@@ -105,6 +111,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "rms_error_mm": None,
             "max_error_mm": None,
         },
+        "camera_to_base_points": [],
+        "camera_to_base_points_visible": True,
         "tool_z": {
             "reference_joint_deg": [90.0, -88.0, 182.259, 0.0, 3.0, 180.0],
             "pose_tolerance_deg": 1.0,
@@ -122,7 +130,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "snapshots_captured": 0,
             "chessboard_size": [9, 6],
             "square_size_mm": 25.0,
-            "preview_enabled": True,
+            "preview_enabled": False,
             "snapshot_dir": "tools/Camera/calibration_snapshots",
         },
         "auto_pick_enabled": True,
@@ -1310,6 +1318,8 @@ class VisionManager:
         self._ibvs_active: bool = False
         self._ibvs_ipc: dict[str, Any] | None = None
         self._ibvs_dispatch: bool = False
+        self._last_publish_at = 0.0
+        self._last_vision_time_log_at = 0.0
 
     def config(self) -> dict[str, Any]:
         return load_config()["vision"]
@@ -1464,7 +1474,8 @@ class VisionManager:
             if self._model_detector is None:
                 self._model_detector = ModelDetector(cfg, validator)
             self._model_detector.load_model(model_path or self.config().get("model_path", ""))
-            self._model_status = "LOADED"
+            provider = str(getattr(self._model_detector, "execution_provider", "") or "").strip()
+            self._model_status = f"LOADED ({provider})" if provider else "LOADED"
             self._model_warned = False
         except Exception as exc:
             self._model_status = f"ERROR: {exc}"
@@ -1651,12 +1662,15 @@ class VisionManager:
                 if detection_active:
                     self._run_ibvs_step(detection, bundle)
                 elapsed_ms = (time.perf_counter() - started) * 1000.0
-                research_logger.record("vision_time", round(elapsed_ms, 3))
+                now = time.monotonic()
+                if now - self._last_vision_time_log_at >= 1.0:
+                    research_logger.record("vision_time", round(elapsed_ms, 3))
+                    self._last_vision_time_log_at = now
                 if not detection_active:
                     self._status = "Camera running | Detection OFF"
                 else:
                     self._status = "Running" if detection or bundle else "No object"
-                self._publish()
+                self._publish(rate_limited=True)
                 self._stop.wait(0.05)
         finally:
             try:
@@ -1827,7 +1841,7 @@ class VisionManager:
 
         calibration_cfg = self.config().get("calibration", {})
         calibration_cfg = calibration_cfg if isinstance(calibration_cfg, dict) else {}
-        if not bool(calibration_cfg.get("preview_enabled", True)):
+        if not bool(calibration_cfg.get("preview_enabled", False)):
             self._chessboard_found = False
             self._chessboard_corner_count = 0
             self._chessboard_corners = None
@@ -1868,11 +1882,29 @@ class VisionManager:
             or now - self._chessboard_last_detection_at >= 0.2
         )
         if should_detect:
+            detection_frame = frame
+            scale_x = 1.0
+            scale_y = 1.0
+            height, width = frame.shape[:2]
+            max_detection_side = 640
+            if max(width, height) > max_detection_side:
+                resize_scale = max_detection_side / float(max(width, height))
+                resized_size = (
+                    max(1, int(width * resize_scale)),
+                    max(1, int(height * resize_scale)),
+                )
+                detection_frame = cv2.resize(frame, resized_size, interpolation=cv2.INTER_AREA)
+                scale_x = width / float(detection_frame.shape[1])
+                scale_y = height / float(detection_frame.shape[0])
             found, corners = manager.find_chessboard_corners(
-                frame,
+                detection_frame,
                 pattern_size,
                 fast_check=True,
             )
+            if corners is not None and (scale_x != 1.0 or scale_y != 1.0):
+                corners = corners.copy()
+                corners[:, :, 0] *= scale_x
+                corners[:, :, 1] *= scale_y
             self._chessboard_pattern = pattern_size
             self._chessboard_found = bool(found)
             self._chessboard_corners = corners
@@ -1904,7 +1936,15 @@ class VisionManager:
         )
         return overlay
 
-    def _publish(self, calibration: dict[str, Any] | None = None) -> None:
+    def _publish(
+        self,
+        calibration: dict[str, Any] | None = None,
+        rate_limited: bool = False,
+    ) -> None:
+        now = time.monotonic()
+        if rate_limited and now - self._last_publish_at < 0.2:
+            return
+        self._last_publish_at = now
         with self._lock:
             bundle_history = list(self._bundle_history)
             frame_size = [int(self._frame_size[0]), int(self._frame_size[1])]
@@ -1918,12 +1958,14 @@ class VisionManager:
             int(model_shape[1]),
             int(model_shape[0]),
         ] if len(model_shape) == 2 else [0, 0]
+        model_provider = str(getattr(self._model_detector, "execution_provider", "") or "")
         update_state(
             "vision",
             {
                 "status": self._status,
                 "detection_enabled": self.detection_enabled(),
                 "model_status": self._model_status,
+                "model_provider": model_provider,
                 "model_input_size": model_input_size,
                 "latest": self._latest,
                 "latest_bundle": self._latest_bundle,
@@ -2010,6 +2052,31 @@ def _wait_for_marginal_confirmation(
     return False
 
 
+def camera_to_base_is_usable(camera_to_base: Any) -> bool:
+    """Return True if a real 3x3 homography is present.
+
+    The calibration is treated as usable based on the actual homography data,
+    not the ``valid`` flag alone. The GUI flips ``valid`` to False whenever
+    vision settings are re-saved (see save_vision_settings), which would
+    otherwise drop a perfectly good calibration. As long as a proper 3x3
+    numeric homography exists, the pixel->base mapping still works.
+    """
+    if not isinstance(camera_to_base, dict):
+        return False
+    if bool(camera_to_base.get("valid", False)):
+        return True
+    homography = camera_to_base.get("homography")
+    if not isinstance(homography, list) or len(homography) != 3:
+        return False
+    for row in homography:
+        if not isinstance(row, list) or len(row) != 3:
+            return False
+        for value in row:
+            if not isinstance(value, (int, float)):
+                return False
+    return True
+
+
 def execute_vision_tool_z(
     shared_string: Any,
     program_log_queue: Any = None,
@@ -2032,9 +2099,7 @@ def execute_vision_tool_z(
     history = vision_manager.recent_bundles()
     samples_are_mock = any(bool(item.get("mock", False)) for item in history[-10:])
     camera_to_base = vision_cfg.get("camera_to_base", {})
-    if not samples_are_mock and not bool(
-        isinstance(camera_to_base, dict) and camera_to_base.get("valid", False)
-    ):
+    if not samples_are_mock and not camera_to_base_is_usable(camera_to_base):
         reset_vision_runtime()
         emit_program_log(
             shared_string,

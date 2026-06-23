@@ -53,6 +53,46 @@ text_size = 14
 customtkinter.set_appearance_mode("Dark")  # Modes: "System" (standard), "Dark", "Light"
 customtkinter.set_default_color_theme("blue")  # Themes: "blue" (standard), "green", "dark-blue"
 
+# --- Unified Modern Typography System ---
+FONT_FAMILY_MAIN = "Inter" if my_os != "Windows" else "Segoe UI"
+
+_orig_CTkFont = customtkinter.CTkFont
+
+class UnifiedCTkFont(_orig_CTkFont):
+    def __init__(self, family=None, size=None, weight=None, slant=None, underline=None, overstrike=None):
+        # 1. Map requested font families to modern, high-quality, OS-adapted defaults
+        if family is None or family == 'TkDefaultFont':
+            family_mapped = FONT_FAMILY_MAIN
+        else:
+            family_mapped = family
+            
+        # 2. Rescale font sizes proportionally to avoid overlapping/truncating
+        if size is not None:
+            if size >= 15:
+                size_mapped = 14
+            else:
+                size_mapped = size
+        else:
+            size_mapped = 13
+            
+        kwargs = {}
+        if family_mapped is not None:
+            kwargs['family'] = family_mapped
+        if size_mapped is not None:
+            kwargs['size'] = size_mapped
+        if weight is not None:
+            kwargs['weight'] = weight
+        if slant is not None:
+            kwargs['slant'] = slant
+        if underline is not None:
+            kwargs['underline'] = underline
+        if overstrike is not None:
+            kwargs['overstrike'] = overstrike
+        super().__init__(**kwargs)
+
+# Apply monkey patch to customtkinter globally
+customtkinter.CTkFont = UnifiedCTkFont
+
 
 def GUI(Position_out,Position_in,Position_Sim,Buttons):
 

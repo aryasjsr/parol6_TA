@@ -40,7 +40,6 @@ from Commander_feature_adapters import (
     update_state,
 )
 from vision.tool_z_runtime import (
-    is_vision_diagnostic_program,
     resolve_vision_placeholders,
 )
 def normalize_angle(angle):
@@ -334,26 +333,31 @@ else:
 #ser.open()
 
 serial_reconnect_lock = threading.Lock()
-last_reconnect_request = 0
+serial_io_lock = threading.Lock()
 last_robot_packet_time = 0.0
 last_serial_open_time = 0.0
 last_no_robot_data_message_time = 0.0
-ROBOT_PACKET_TIMEOUT_S = 1.0
-ROBOT_CONNECT_TIMEOUT_S = 3.0
-GENERAL_CONNECT_REQUEST_INDEX = 2
+selected_full_serial_path = ""
+ROBOT_BAUDRATE = 3000000
 GENERAL_CONNECTION_STATE_INDEX = 3
 CONNECTION_DISCONNECTED = 0
-CONNECTION_PORT_OPEN = 1
-CONNECTION_ROBOT_RESPONDING = 2
+CONNECTION_CONNECTING = 1
+CONNECTION_CONNECTED = 2
 
 def selected_serial_port(General_data, shared_string):
+    global selected_full_serial_path
     if my_os == 'Linux':
         return '/dev/ttyACM' + str(General_data[0])
     if my_os == 'Windows':
         return windows_serial_port_name(General_data[0])
     if my_os == 'Darwin':
         if General_data[0] == -1:
-            com_port = shared_string.value.decode('utf-8')
+            com_port = shared_string.value.decode('utf-8').strip()
+            if com_port.startswith('/dev/'):
+                selected_full_serial_path = com_port
+                return com_port
+            if selected_full_serial_path:
+                return selected_full_serial_path
             if not com_port or com_port.isspace():
                 return '/dev/tty.usbmodem0'
             return com_port
@@ -361,22 +365,6 @@ def selected_serial_port(General_data, shared_string):
             return '/dev/tty.usbmodem0'
         return '/dev/tty.usbmodem' + str(General_data[0])
     return ''
-
-def serial_port_matches(com_port):
-    current_port = getattr(ser, "port", None)
-    if current_port is None:
-        return False
-    if my_os == "Windows":
-        return windows_serial_port_label(current_port) == windows_serial_port_label(com_port)
-    return str(current_port) == str(com_port)
-
-def connect_request_value(General_data):
-    try:
-        if len(General_data) > GENERAL_CONNECT_REQUEST_INDEX:
-            return int(General_data[GENERAL_CONNECT_REQUEST_INDEX])
-    except (IndexError, TypeError):
-        pass
-    return 0
 
 def set_robot_connection_state(General_data, state):
     try:
@@ -388,23 +376,14 @@ def set_robot_connection_state(General_data, state):
 def mark_robot_packet_received(General_data):
     global last_robot_packet_time
     last_robot_packet_time = time.perf_counter()
-    set_robot_connection_state(General_data, CONNECTION_ROBOT_RESPONDING)
+    set_robot_connection_state(General_data, CONNECTION_CONNECTED)
 
 def refresh_robot_connection_state(General_data, shared_string=None):
-    global last_no_robot_data_message_time
     if not ser.is_open:
         set_robot_connection_state(General_data, CONNECTION_DISCONNECTED)
-    elif last_robot_packet_time > 0 and time.perf_counter() - last_robot_packet_time <= ROBOT_PACKET_TIMEOUT_S:
-        set_robot_connection_state(General_data, CONNECTION_ROBOT_RESPONDING)
-    elif last_serial_open_time > 0 and time.perf_counter() - last_serial_open_time > ROBOT_CONNECT_TIMEOUT_S:
-        set_robot_connection_state(General_data, CONNECTION_DISCONNECTED)
-        if shared_string is not None and time.perf_counter() - last_no_robot_data_message_time > ROBOT_CONNECT_TIMEOUT_S:
-            com_port = selected_serial_port(General_data, shared_string)
-            display_port = windows_serial_port_label(com_port) if my_os == "Windows" else com_port
-            set_shared_message(shared_string, "Error: No robot data received on " + display_port + "; check robot power/firmware/USB")
-            last_no_robot_data_message_time = time.perf_counter()
-    else:
-        set_robot_connection_state(General_data, CONNECTION_PORT_OPEN)
+        return
+
+    set_robot_connection_state(General_data, CONNECTION_CONNECTED)
 
 def set_shared_message(shared_string, message):
     try:
@@ -412,50 +391,39 @@ def set_shared_message(shared_string, message):
     except Exception:
         pass
 
-def serial_reconnect_requested(General_data):
-    global last_reconnect_request
-    reconnect_request = connect_request_value(General_data)
-    if reconnect_request != last_reconnect_request:
-        last_reconnect_request = reconnect_request
-        return True
-    return False
-
 def reopen_selected_serial(General_data, shared_string, notify=False):
-    global last_serial_open_time, last_no_robot_data_message_time
+    global ser, last_serial_open_time, last_no_robot_data_message_time
     com_port = selected_serial_port(General_data, shared_string)
     display_port = windows_serial_port_label(com_port) if my_os == "Windows" else com_port
     print(display_port)
     with serial_reconnect_lock:
+        set_robot_connection_state(General_data, CONNECTION_CONNECTING)
         try:
-            if ser.is_open:
-                ser.close()
-        except Exception:
-            pass
-
-        try:
-            ser.port = com_port
-            ser.baudrate = General_data[1] if len(General_data) > 1 else 3000000
-            ser.timeout = 0
-            time.sleep(0.5)
-            ser.open()
+            with serial_io_lock:
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                time.sleep(0.5)
+                ser = serial.Serial(port=com_port, baudrate=ROBOT_BAUDRATE, timeout=0)
+                try:
+                    ser.reset_input_buffer()
+                    ser.reset_output_buffer()
+                except Exception:
+                    pass
             time.sleep(0.5)
             last_serial_open_time = time.perf_counter()
             last_no_robot_data_message_time = 0.0
-            set_robot_connection_state(General_data, CONNECTION_PORT_OPEN)
+            set_robot_connection_state(General_data, CONNECTION_CONNECTED)
             if notify:
-                set_shared_message(shared_string, "Log: Serial port open " + display_port + "; waiting for robot data")
+                set_shared_message(shared_string, "Log: Serial port open " + display_port)
             return True
         except Exception as exc:
-            try:
-                if ser.is_open:
-                    ser.close()
-            except Exception:
-                pass
             time.sleep(0.5)
             set_robot_connection_state(General_data, CONNECTION_DISCONNECTED)
             if notify:
                 set_shared_message(shared_string, "Error: Serial connect failed on " + display_port + ": " + str(exc))
-            logging.debug("no serial available, reconnecting! %s", exc)
+            logging.debug("no serial available, reconnecting!")
             return False
 
 # in big endian machines, first byte of binary representation of the multibyte data-type is stored first. 
@@ -521,6 +489,221 @@ Program_step = 0
 
 Robot_mode = "Dummy"
 
+# ---------------------------------------------------------------------------
+# Offline program execution (no robot connected)
+# ---------------------------------------------------------------------------
+# When the serial port to the robot is not open, the normal program interpreter
+# (inside "if ser.is_open == True") never runs, so even software-only programs
+# (print/vision diagnostics) appear to do nothing. The helpers below run such
+# programs offline so the user gets feedback in the response log, while programs
+# that need the physical robot are refused with a clear error.
+
+# Commands that physically move the robot or drive its I/O. A program that uses
+# any of these cannot run without a connected robot.
+OFFLINE_HARDWARE_COMMANDS = {
+    "Home()", "MoveJoint()", "MovePose()", "SpeedJoint()",
+    "MoveCart()", "MoveCartRelTRF()", "Gripper()", "Gripper_cal()",
+    "Output()", "Input()",
+}
+
+# How long (in INTERVAL_S ticks) a log message lingers so the ~66 ms GUI poll
+# can pick it up. Mirrors the dwell the online print() handler uses.
+OFFLINE_DWELL_TICKS = max(1, math.ceil(0.08 / INTERVAL_S))
+# Safety cap so an offline Loop() program cannot spin forever.
+OFFLINE_MAX_LOOPS = 1000
+
+
+def offline_program_reset(state):
+    state["loaded"] = False
+    state["clean"] = []
+    state["raw"] = []
+    state["step"] = 1
+    state["len"] = 0
+    state["dwell"] = 0
+    state["loops"] = 0
+
+
+def offline_program_finish(state, Buttons, status, reason, shared_string, program_log_queue):
+    Buttons[7] = 0
+    offline_program_reset(state)
+    reset_vision_runtime()
+    update_state("program_control", {
+        "state": status, "paused": False, "stop_requested": False,
+        "step_requested": 0, "updated_at": time.time(),
+    })
+    if reason:
+        emit_program_log(shared_string, program_log_queue, reason)
+
+
+def offline_program_tick(state, shared_string, Buttons, program_log_queue):
+    """Advance one step of an offline (no-robot) program per call."""
+    global Robot_mode
+    Robot_mode = "Program"
+
+    # Load + validate the script once, on the first tick.
+    if not state["loaded"]:
+        try:
+            with open(Image_path + "/Programs/execute_script.txt", 'r') as text_file:
+                code_string = text_file.readlines()
+        except OSError as exc:
+            offline_program_finish(state, Buttons, "ERROR",
+                                   f"Error: cannot open program file ({exc})",
+                                   shared_string, program_log_queue)
+            return
+
+        raw = [line.rstrip("\n") for line in code_string if line.strip() != ""]
+        clean = [normalize_program_command(command) for command in raw]
+        valid_commands = PAROL6_ROBOT.Commands_list_true
+
+        if not clean:
+            offline_program_finish(state, Buttons, "ERROR",
+                                   "Error: program is empty",
+                                   shared_string, program_log_queue)
+            return
+        invalid = [c for c in clean if c not in valid_commands]
+        if invalid:
+            offline_program_finish(state, Buttons, "ERROR",
+                                   "Error: has invalid commands!",
+                                   shared_string, program_log_queue)
+            return
+        if clean[0] != "Begin()":
+            offline_program_finish(state, Buttons, "ERROR",
+                                   "Error: program needs to start with Begin()",
+                                   shared_string, program_log_queue)
+            return
+        if clean[-1] not in ("End()", "Loop()"):
+            offline_program_finish(state, Buttons, "ERROR",
+                                   "Error: program needs to end with End() or Loop()",
+                                   shared_string, program_log_queue)
+            return
+
+        # Refuse the whole program up front if it needs the physical robot.
+        hardware_used = [c for c in clean if c in OFFLINE_HARDWARE_COMMANDS]
+        if hardware_used:
+            names = ", ".join(sorted({c[:-2] for c in hardware_used}))
+            offline_program_finish(state, Buttons, "ERROR",
+                                   f"Error: robot not connected; {names} needs the robot",
+                                   shared_string, program_log_queue)
+            return
+
+        state["raw"] = raw
+        state["clean"] = clean
+        state["len"] = len(clean)
+        state["step"] = 1
+        state["dwell"] = 0
+        state["loops"] = 0
+        state["loaded"] = True
+        reset_vision_runtime()
+        emit_program_log(shared_string, program_log_queue,
+                         "Log: program will run offline (robot not connected)")
+        return
+
+    # Let the previous message linger long enough for the GUI to display it.
+    if state["dwell"] > 0:
+        state["dwell"] -= 1
+        return
+
+    if state["step"] >= state["len"]:
+        offline_program_finish(state, Buttons, "IDLE",
+                               "Log: program finished (offline)",
+                               shared_string, program_log_queue)
+        return
+
+    command = state["clean"][state["step"]]
+    raw = state["raw"][state["step"]]
+
+    if command == "End()":
+        offline_program_finish(state, Buttons, "IDLE",
+                               "Log: End() command",
+                               shared_string, program_log_queue)
+        return
+
+    if command == "Loop()":
+        state["loops"] += 1
+        if state["loops"] > OFFLINE_MAX_LOOPS:
+            offline_program_finish(state, Buttons, "IDLE",
+                                   "Log: Loop() stopped after offline limit",
+                                   shared_string, program_log_queue)
+            return
+        reset_vision_runtime()
+        state["step"] = 1
+        return
+
+    if command in ("Begin()", "Dummy()"):
+        state["step"] += 1
+        return
+
+    if command == "Delay()":
+        content = extract_content_from_command(raw)
+        try:
+            seconds = float(content)
+        except (TypeError, ValueError):
+            offline_program_finish(state, Buttons, "ERROR",
+                                   "Error: Invalid Delay() command",
+                                   shared_string, program_log_queue)
+            return
+        emit_program_log(shared_string, program_log_queue, "Log: Delay() command")
+        state["dwell"] = max(OFFLINE_DWELL_TICKS, int(seconds / INTERVAL_S))
+        state["step"] += 1
+        return
+
+    if command == "print()":
+        try:
+            message = parse_print_command(raw)
+            message = resolve_vision_placeholders(message, get_vision_runtime())
+        except ValueError as exc:
+            offline_program_finish(state, Buttons, "ERROR",
+                                   f"Error: print() {exc}",
+                                   shared_string, program_log_queue)
+            return
+        emit_program_log(shared_string, program_log_queue, f"Log: {message}")
+        state["step"] += 1
+        state["dwell"] = OFFLINE_DWELL_TICKS
+        return
+
+    if command == "vision()":
+        if execute_vision_tool_z(shared_string, program_log_queue):
+            state["step"] += 1
+            state["dwell"] = OFFLINE_DWELL_TICKS
+        else:
+            # execute_vision_tool_z already logged the error.
+            offline_program_finish(state, Buttons, "ERROR", None,
+                                   shared_string, program_log_queue)
+        return
+
+    if command == "ModbusRead()":
+        if execute_modbus_read(raw, shared_string):
+            state["step"] += 1
+            state["dwell"] = OFFLINE_DWELL_TICKS
+        else:
+            offline_program_finish(state, Buttons, "ERROR", None,
+                                   shared_string, program_log_queue)
+        return
+
+    if command == "ModbusWrite()":
+        if execute_modbus_write(raw, shared_string):
+            state["step"] += 1
+            state["dwell"] = OFFLINE_DWELL_TICKS
+        else:
+            offline_program_finish(state, Buttons, "ERROR", None,
+                                   shared_string, program_log_queue)
+        return
+
+    if command == "timestamp()":
+        if execute_timestamp_command(raw, shared_string):
+            state["step"] += 1
+            state["dwell"] = OFFLINE_DWELL_TICKS
+        else:
+            offline_program_finish(state, Buttons, "ERROR", None,
+                                   shared_string, program_log_queue)
+        return
+
+    # Any remaining valid command is not supported offline.
+    offline_program_finish(state, Buttons, "ERROR",
+                           f"Error: {command} cannot run offline",
+                           shared_string, program_log_queue)
+
+
 # Task for sending data every x ms and performing all calculations, kinematics GUI control logic...
 def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOut_out,Timeout_out,Gripper_data_out,
          Position_in,Speed_in,Homed_in,InOut_in,Temperature_error_in,Position_error_in,Timeout_error,Timing_data_in,
@@ -529,47 +712,48 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
     global Robot_mode
     timer = Timer(INTERVAL_S, warnings=False, precise=True)
     cnt = 0
+    clean_string = []
+    clean_string_commands = []
+    program_len = 0
+    Program_step = 1
+    Command_step = 0
+    Command_len = 0
+    error_state = 0
+    offline_state = {}
+    offline_program_reset(offline_state)
 
     while timer.elapsed_time < 110000:
         if Buttons[7] == 0 and Robot_mode == "Program":
             reset_vision_runtime()
             Robot_mode = "Dummy"
 
-        selected_port = selected_serial_port(General_data, shared_string)
-        port_changed = ser.is_open and not serial_port_matches(selected_port)
-        if my_os == "Darwin" and General_data[0] == -1:
-            port_changed = False
-        reconnect_requested = serial_reconnect_requested(General_data)
-        if reconnect_requested or port_changed:
-            reopen_selected_serial(General_data, shared_string, notify=reconnect_requested or port_changed)
-        refresh_robot_connection_state(General_data, shared_string)
+        if ser.is_open == True:
+            refresh_robot_connection_state(General_data, shared_string)
+            logging.debug("Task 1 alive")
+            logging.debug("Data that PC will send to the robot is: ")
+            #s = Pack_data_test()
+            # This function packs data that we will send to the robot
+            s = Pack_data(Position_out,Speed_out,Command_out,Affected_joint_out,InOut_out,Timeout_out,Gripper_data_out)
 
-        if ser.is_open == True or Buttons[7] == 1:
-            if ser.is_open == True:
-                logging.debug("Task 1 alive")
-                logging.debug("Data that PC will send to the robot is: ")
-                #s = Pack_data_test()
-                # This function packs data that we will send to the robot
-                s = Pack_data(Position_out,Speed_out,Command_out,Affected_joint_out,InOut_out,Timeout_out,Gripper_data_out)
+            # Make sure if sending calib to gripper to send it only once
+            if(Gripper_data_out[4] == 1 or Gripper_data_out[4] == 2):
+                Gripper_data_out[4] = 0
 
-                # Make sure if sending calib to gripper to send it only once
-                if(Gripper_data_out[4] == 1 or Gripper_data_out[4] == 2):
-                    Gripper_data_out[4] = 0
-
-                logging.debug(s)
-                logging.debug("END of data sent to the ROBOT")
-                len_ = len(s)
-                try:
+            logging.debug(s)
+            logging.debug("END of data sent to the ROBOT")
+            len_ = len(s)
+            try:
+                with serial_io_lock:
                     for i in range(len_):
                         ser.write(s[i])
-                except:
-                    set_robot_connection_state(General_data, CONNECTION_DISCONNECTED)
-                    try:
-                        if ser.is_open:
-                            ser.close()
-                    except Exception:
-                        pass
-                    logging.debug("NO SERIAL TASK1")
+            except Exception as exc:
+                set_robot_connection_state(General_data, CONNECTION_DISCONNECTED)
+                try:
+                    if ser.is_open:
+                        ser.close()
+                except Exception:
+                    pass
+                logging.debug("NO SERIAL TASK1 %s", exc)
     
 
             # Check if any of jog buttons is pressed
@@ -907,7 +1091,6 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
                             error_state = 1
                             # Set flag, exit program mode
                     program_len = len(clean_string)
-                    reset_vision_runtime()
                     if clean_string[0] != 'Begin()':
                         None
                         shared_string.value = b'Error: program needs to start with Begin()'
@@ -920,28 +1103,8 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
                         shared_string.value = b'Error: program needs to end with End() or Loop()'
                         error_state = 1
                         # Set error flag, exit program
-                    diagnostic_program = is_vision_diagnostic_program(clean_string_commands)
-                    endpoint_available = bool(Buttons[5]) or bool(Buttons[4])
-                    if error_state == 0 and not diagnostic_program and not endpoint_available:
-                        emit_program_log(
-                            shared_string,
-                            program_log_queue,
-                            "Error: Program contains actuator commands but no robot or simulator is active",
-                        )
-                        error_state = 1
-                        Buttons[7] = 0
-                        update_state("program_control", {"state": "ERROR", "paused": False, "stop_requested": False, "step_requested": 0, "updated_at": time.time()})
                     if error_state == 0:
-                        mode_label = "VISION_DIAGNOSTIC" if diagnostic_program else "ROBOT"
-                        emit_program_log(
-                            shared_string,
-                            program_log_queue,
-                            f"Log: program mode={mode_label}",
-                        )
-                        control_state = program_control_state()
-                        next_state = "STEP" if control_state.get("state") == "STEP" else "RUNNING"
-                        update_state("program_control", {"state": next_state, "paused": False, "stop_requested": False, "step_requested": control_state.get("step_requested", 0), "updated_at": time.time()})
-                        research_logger.record("program_started", program_len, Image_path + "/Programs/execute_script.txt")
+                        shared_string.value = b'Log: program will try to run'
 
                     # Check if first and last commands are valid
                 Robot_mode = "Program"
@@ -2502,7 +2665,20 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
             
             
         else:
-            reopen_selected_serial(General_data, shared_string)
+            # No robot connected. Run software-only programs offline so the user
+            # still gets feedback in the response log; refuse anything that needs
+            # the physical robot. Otherwise keep trying to reconnect.
+            if Buttons[7] == 1 and program_stop_requested():
+                offline_program_finish(offline_state, Buttons, "IDLE",
+                                       "Log: Program stopped", shared_string, program_log_queue)
+            elif Buttons[7] == 1 and program_paused():
+                shared_string.value = b'Log: Program paused'
+            elif Buttons[7] == 1:
+                offline_program_tick(offline_state, shared_string, Buttons, program_log_queue)
+            else:
+                if offline_state["loaded"] or offline_state["step"] != 1:
+                    offline_program_reset(offline_state)
+                reopen_selected_serial(General_data, shared_string, notify=True)
 
         timer.checkpt()
 
@@ -2616,15 +2792,27 @@ def Task2(shared_string,Position_in,Speed_in,Homed_in,InOut_in,Temperature_error
         # isto kao i gore ako je data pre spor serial.available će javiti da nema ničega i idemo dalje 
         # javiti će to makar je tamo while petlja. ako bi bila if petlja onda bi očitao jedan i radio ostatak koda
         # pa se vratio pročitao jedan itd. tako bi možda pre sporo primali serial ako bi ostatak koda bio spor
+        if not ser.is_open or serial_reconnect_lock.locked():
+            time.sleep(0.01)
+            continue
+
         try:
-            if Get_data(Position_in,Speed_in,Homed_in,InOut_in,Temperature_error_in,Position_error_in,Timeout_error,Timing_data_in,
-         XTR_data,Gripper_data_in):
+            with serial_io_lock:
+                packet_received = Get_data(Position_in,Speed_in,Homed_in,InOut_in,Temperature_error_in,Position_error_in,Timeout_error,Timing_data_in,
+         XTR_data,Gripper_data_in)
+            if packet_received:
                 mark_robot_packet_received(General_data)
             refresh_robot_connection_state(General_data, shared_string)
             #Get_data_old()
-        except:
+        except Exception as exc:
             set_robot_connection_state(General_data, CONNECTION_DISCONNECTED)
-            reopen_selected_serial(General_data, shared_string)
+            try:
+                if ser.is_open:
+                    ser.close()
+            except Exception:
+                pass
+            logging.debug("NO SERIAL TASK2 %s", exc)
+            time.sleep(0.01)
         #Get_data_old()
         #print("Task 2 alive")
         #time.sleep(2)
@@ -3417,22 +3605,32 @@ if __name__ == '__main__':
         Joint_jog_buttons,Cart_jog_buttons,Jog_control,General_data,Buttons,program_log_queue])
     
 
-    process3 = multiprocessing.Process(target=SIMULATOR_process,args =[Position_out,Position_in,Position_Sim,Buttons])
+    # The 3D robot simulator uses a continuously-redrawing matplotlib animation,
+    # which is CPU-heavy and makes the main GUI feel sluggish. Set this to True
+    # only when you actually need the 3D visualization.
+    LAUNCH_SIMULATOR = False
+
+    process3 = None
+    if LAUNCH_SIMULATOR:
+        process3 = multiprocessing.Process(target=SIMULATOR_process,args =[Position_out,Position_in,Position_Sim,Buttons])
 
 
     process1.start()
     time.sleep(1)
     process2.start()
     time.sleep(1)
-    
-    process3.start()
-    
+
+    if process3 is not None:
+        process3.start()
+
     # Join processes
     process1.join()
     process2.join()
-    process3.join()
+    if process3 is not None:
+        process3.join()
 
     # Terminate processes
     process1.terminate()
     process2.terminate()
-    process3.terminate()
+    if process3 is not None:
+        process3.terminate()

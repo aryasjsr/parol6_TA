@@ -16,6 +16,7 @@ runtime_state.*.tmp
 # Generated logs
 logs/
 tools/Camera/calibration_snapshots/
+backups/
 
 # Local program files
 program/

@@ -17,7 +17,6 @@ from tkinter.messagebox import showinfo
 from tkinter import messagebox
 import random
 import multiprocessing
-import queue
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.animation as animation
 #from visual_kinematics.RobotSerial import *
@@ -58,6 +57,10 @@ else:
 logging.debug(Image_path)
 
 text_size = 14
+PROGRAM_TEXT_FONT_SIZE = 24
+LOG_TEXT_FONT_SIZE = 24
+COMMAND_TREE_FONT_SIZE = 11
+COMMAND_HELP_FONT_SIZE = 14
 
 # Globals
 current_menu = "Jog"
@@ -88,9 +91,102 @@ Joint4_value = ""
 Joint5_value = ""
 Joint6_value = ""
 
+
+def _set_text(widget, text):
+    """Update a widget's text only when it actually changed.
+
+    Every customtkinter widget is a Canvas that repaints its rounded corners on
+    each ``configure``. Stuff_To_Update runs ~15x/s, so re-applying identical
+    text dozens of times per tick caused needless redraws (very noticeable when
+    the window is maximized/fullscreen). Caching the last value skips that work.
+    """
+    if getattr(widget, "_last_text_cache", None) != text:
+        widget._last_text_cache = text
+        widget.configure(text=text)
+
+
 #customtkinter.set_appearance_mode("Light")  # Modes: "System" (standard), "Dark", "Light"
 customtkinter.set_appearance_mode("Dark")  # Industrial Precision HMI — dark variant
 customtkinter.set_default_color_theme("blue")  # Themes: "blue" (standard), "green", "dark-blue"
+
+# --- Unified Modern Typography System ---
+FONT_FAMILY_MAIN = "Segoe UI" if my_os == "Windows" else "Helvetica"
+FONT_FAMILY_MONO = "Consolas" if my_os == "Windows" else "monospace"
+_fonts_resolved = False
+
+def _lazy_resolve_fonts():
+    """Resolve best available system fonts lazily (only when a Tk root already exists)."""
+    global FONT_FAMILY_MAIN, FONT_FAMILY_MONO, _fonts_resolved
+    if _fonts_resolved:
+        return
+    _fonts_resolved = True
+    try:
+        import tkinter.font as tkfont
+        available = [f.lower() for f in tkfont.families()]
+        # Best available sans-serif fonts
+        for sans in ["inter", "segoe ui", "ubuntu", "liberation sans", "dejavu sans", "helvetica", "arial"]:
+            if sans in available:
+                idx = available.index(sans)
+                FONT_FAMILY_MAIN = list(tkfont.families())[idx]
+                break
+        # Best available monospace fonts
+        for mono in ["jetbrains mono", "consolas", "ubuntu mono", "liberation mono", "dejavu sans mono", "courier new"]:
+            if mono in available:
+                idx = available.index(mono)
+                FONT_FAMILY_MONO = list(tkfont.families())[idx]
+                break
+    except Exception:
+        pass
+
+_orig_CTkFont = customtkinter.CTkFont
+
+class UnifiedCTkFont(_orig_CTkFont):
+    def __init__(self, family=None, size=None, weight=None, slant=None, underline=None, overstrike=None):
+        # Lazily resolve system fonts on first use (Tk root already exists at this point)
+        _lazy_resolve_fonts()
+
+        # 1. Map requested font families to modern, high-quality, OS-adapted defaults
+        if family is None or family == 'TkDefaultFont' or family == 'Segoe UI Symbol':
+            family_mapped = FONT_FAMILY_MAIN
+        elif family in ('JetBrains Mono', 'monospace', 'Consolas', 'Liberation Mono', 'DejaVu Sans Mono', 'Courier New'):
+            family_mapped = FONT_FAMILY_MONO
+        else:
+            family_mapped = family
+
+        # 2. Rescale font sizes proportionally (integers only for Tcl compatibility)
+        if size is not None:
+            if size >= 24:
+                size_mapped = 18
+            elif size >= 18:
+                size_mapped = 15
+            elif size >= 14:
+                size_mapped = 12
+            elif size >= 12:
+                size_mapped = 10
+            elif size >= 10:
+                size_mapped = 9
+            else:
+                size_mapped = int(size)
+        else:
+            size_mapped = 11  # Clean default body size
+
+        kwargs = {}
+        if family_mapped is not None:
+            kwargs['family'] = family_mapped
+        if size_mapped is not None:
+            kwargs['size'] = size_mapped
+        if weight is not None:
+            kwargs['weight'] = weight
+        if slant is not None:
+            kwargs['slant'] = slant
+        if underline is not None:
+            kwargs['underline'] = underline
+        if overstrike is not None:
+            kwargs['overstrike'] = overstrike
+        super().__init__(**kwargs)
+
+# Apply monkey patch to customtkinter globally
+customtkinter.CTkFont = UnifiedCTkFont
 
 left_jog_buttons = [0,0,0,0,0,0]
 right_jog_buttons  =[0,0,0,0,0,0]
@@ -186,6 +282,7 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
 
 
     app = customtkinter.CTk()
+
     customtkinter.set_widget_scaling(0.85)
     app.current_menu = "Jog"
     shared_string.value = b'PAROL6 commander v1.0'
@@ -328,10 +425,7 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
 
         app.COMPORT = customtkinter.CTkEntry(app.bottom_select_frame, width= 150)
         app.COMPORT.grid(row=3, column=5, padx=(0, 0),pady=(3,3),sticky="E")
-        if my_os != "Darwin" and len(General_data) > 0:
-            app.COMPORT.insert(0, str(General_data[0]))
-
-        # Add a helpful label for macOS users
+        # Add a helpful label for the current platform.
         if my_os == "Darwin":
             app.COMPORT_label = customtkinter.CTkLabel(app.bottom_select_frame, text="Port (e.g., /dev/tty.usbmodem*)", font=customtkinter.CTkFont(size=10))
             app.COMPORT_label.grid(row=2, column=5, padx=(0, 0), pady=(3,0), sticky="E")
@@ -691,6 +785,288 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
             store[label] = (entry, cast)
         return entry
 
+    VISION_RUNTIME_OPTIONS = {
+        "cuda": "GPU (CUDA)",
+        "cpu": "CPU",
+        "auto": "Auto",
+    }
+
+    def _vision_runtime_value(value):
+        text = str(value or "auto").strip().lower()
+        aliases = {
+            "gpu (cuda)": "cuda",
+            "gpu": "cuda",
+            "cuda": "cuda",
+            "nvidia": "cuda",
+            "cpu": "cpu",
+            "auto": "auto",
+        }
+        return aliases.get(text, "auto")
+
+    def _vision_runtime_label(value):
+        return VISION_RUNTIME_OPTIONS.get(_vision_runtime_value(value), VISION_RUNTIME_OPTIONS["auto"])
+
+    # ------------------------------------------------------------------
+    # Test Accuracy Pick Point (Test B) — self-contained, on/off via config.
+    # Reuses vision/pick_accuracy_validator.py; never touches the live path.
+    # ------------------------------------------------------------------
+    def _pick_acc_make_validator():
+        from vision.pick_accuracy_validator import PickAccuracyValidator
+        return PickAccuracyValidator()
+
+    def _pick_acc_safe_float(text, default=0.0):
+        try:
+            text = str(text).strip()
+            return float(text) if text != "" else default
+        except Exception:
+            return default
+
+    def _pick_acc_pair(seq):
+        try:
+            if seq is None:
+                return None
+            values = list(seq)
+            if len(values) < 2:
+                return None
+            return (float(values[0]), float(values[1]))
+        except Exception:
+            return None
+
+    def _pick_acc_parse_box(text):
+        try:
+            parts = [p for p in str(text).replace(";", ",").split(",") if p.strip() != ""]
+            if len(parts) != 4:
+                return None
+            return [float(p) for p in parts]
+        except Exception:
+            return None
+
+    def _pick_acc_calibration():
+        cal = load_config().get("vision", {}).get("calibration", {})
+        intr = cal.get("intrinsic_matrix")
+        dist = cal.get("distortion")
+        img = cal.get("image_size")
+        intrinsic = np.array(intr, dtype=float) if intr else None
+        distortion = np.array(dist, dtype=float) if dist else None
+        frame_size = (int(img[0]), int(img[1])) if img and len(img) >= 2 else None
+        return intrinsic, distortion, frame_size
+
+    def _pick_acc_reference_distance(bundle):
+        """Program distance (mm): selongsong tip -> pick point, from a live bundle."""
+        sel_box = bundle.get("selongsong_box") if bundle else None
+        pick_base = bundle.get("pick_point_base") if bundle else None
+        if sel_box is None or pick_base is None:
+            return None
+        intrinsic, distortion, frame_size = _pick_acc_calibration()
+        if intrinsic is None:
+            return None
+        try:
+            return _pick_acc_make_validator().reference_distance(
+                sel_box, pick_base, intrinsic, distortion, frame_size
+            )
+        except Exception:
+            return None
+
+    def pick_acc_is_enabled():
+        return bool(
+            load_config().get("vision", {}).get("pick_accuracy_test", {}).get("enabled", False)
+        )
+
+    def _pick_acc_refresh_enabled_ui():
+        enabled = pick_acc_is_enabled()
+        btn = getattr(app, "pick_acc_enable_btn", None)
+        if btn is not None:
+            btn.configure(
+                text=f"Test: {'ON' if enabled else 'OFF'}",
+                fg_color=UI_SUCCESS if enabled else UI_SURFACE_HIGH,
+            )
+        state = "normal" if enabled else "disabled"
+        for widget in getattr(app, "pick_acc_widgets", []):
+            try:
+                widget.configure(state=state)
+            except Exception:
+                pass
+
+    def _pick_acc_persist_threshold():
+        cfg = load_config()
+        block = cfg.setdefault("vision", {}).setdefault("pick_accuracy_test", {})
+        entry = app.pick_acc_entries.get("Success threshold (mm)")
+        if entry is not None:
+            block["threshold_mm"] = _pick_acc_safe_float(entry[0].get(), block.get("threshold_mm", 3.0))
+        save_config(cfg)
+
+    def toggle_pick_accuracy_test():
+        cfg = load_config()
+        block = cfg.setdefault("vision", {}).setdefault("pick_accuracy_test", {})
+        block["enabled"] = not bool(block.get("enabled", False))
+        entry = app.pick_acc_entries.get("Success threshold (mm)")
+        if entry is not None:
+            block["threshold_mm"] = _pick_acc_safe_float(entry[0].get(), block.get("threshold_mm", 3.0))
+        save_config(cfg)
+        _pick_acc_refresh_enabled_ui()
+
+    def _pick_acc_set_ref_label(distance):
+        app._pick_acc_ref_distance = distance
+        ref_label = getattr(app, "pick_acc_ref_label", None)
+        if ref_label is not None:
+            ref_label.configure(
+                text=(
+                    f"Program ujung→pick: {distance:.1f} mm"
+                    if distance is not None
+                    else "Program ujung→pick: -"
+                )
+            )
+
+    def pick_acc_capture_detection():
+        bundle = vision_manager.latest_bundle()
+        label = getattr(app, "pick_acc_detect_label", None)
+        if label is None:
+            return bundle
+        if not bundle:
+            label.configure(text="Deteksi: (belum ada) — Start Camera + Detection ON dulu")
+            _pick_acc_set_ref_label(None)
+            return None
+        status = str(bundle.get("pick_safety", "UNKNOWN"))
+        px = _pick_acc_pair(bundle.get("pick_point_px"))
+        base = _pick_acc_pair(bundle.get("pick_point_base"))
+        px_s = f"({px[0]:.0f},{px[1]:.0f})px" if px else "-"
+        base_s = f"({base[0]:.1f},{base[1]:.1f})mm" if base else "-"
+        label.configure(text=f"Deteksi: {status} • {px_s} • {base_s}")
+        _pick_acc_set_ref_label(_pick_acc_reference_distance(bundle))
+        return bundle
+
+    def pick_acc_add_trial():
+        if not pick_acc_is_enabled():
+            messagebox.showwarning(
+                "Test Accuracy Pick Point",
+                "Fitur masih OFF. Tekan tombol 'Test: OFF' supaya jadi ON dulu.",
+            )
+            return
+        bundle = vision_manager.latest_bundle()
+        if not bundle:
+            messagebox.showwarning(
+                "Test Accuracy Pick Point",
+                "Belum ada deteksi. Start Camera, Detection ON, arahkan ke objek, lalu coba lagi.",
+            )
+            return
+        _pick_acc_persist_threshold()
+        entries = app.pick_acc_entries
+        label = entries["Object label"][0].get().strip()
+        orientation = _pick_acc_safe_float(entries["Orientation (deg)"][0].get(), 0.0)
+        measured_raw = entries["Measured tip→tool (mm)"][0].get().strip()
+        gt_sel = _pick_acc_parse_box(entries["GT selongsong box"][0].get())
+        gt_fix = _pick_acc_parse_box(entries["GT fixture box"][0].get())
+        measured_distance = _pick_acc_safe_float(measured_raw, None) if measured_raw != "" else None
+
+        det_sel = bundle.get("selongsong_box")
+        det_fix = bundle.get("fixture_box")
+        intrinsic, distortion, frame_size = _pick_acc_calibration()
+
+        trial_id = f"T{len(app._pick_acc_trials) + 1:03d}"
+        try:
+            validator = _pick_acc_make_validator()
+            if det_sel is not None and intrinsic is not None:
+                trial = validator.build_trial(
+                    trial_id,
+                    detected_selongsong_box=det_sel,
+                    detected_fixture_box=det_fix,
+                    ground_truth_selongsong_box=gt_sel,
+                    ground_truth_fixture_box=gt_fix,
+                    intrinsic_matrix=intrinsic,
+                    distortion=distortion,
+                    frame_size=frame_size,
+                    measured_distance_mm=measured_distance,
+                    object_label=label,
+                    orientation_deg=orientation,
+                )
+            else:
+                from vision.pick_accuracy_validator import PickTrial
+                trial = PickTrial(
+                    trial_id=trial_id,
+                    object_label=label,
+                    orientation_deg=orientation,
+                    detected_pick_px=_pick_acc_pair(bundle.get("pick_point_px")),
+                    detected_pick_base=_pick_acc_pair(bundle.get("pick_point_base")),
+                    detected_status=str(bundle.get("pick_safety", "UNKNOWN")),
+                    measured_distance_mm=measured_distance,
+                )
+        except RuntimeError as exc:
+            messagebox.showwarning("Test Accuracy Pick Point", str(exc))
+            return
+        except Exception as exc:
+            messagebox.showerror("Test Accuracy Pick Point", f"Gagal menambah trial: {exc}")
+            return
+
+        app._pick_acc_trials.append(trial)
+        try:
+            validator.save_trials(app._pick_acc_trials)
+        except Exception:
+            pass
+        for key in ("Measured tip→tool (mm)", "GT selongsong box", "GT fixture box"):
+            entries[key][0].delete(0, "end")
+        pick_acc_capture_detection()
+        pick_acc_show_report()
+
+    def pick_acc_show_report():
+        _pick_acc_persist_threshold()
+        try:
+            validator = _pick_acc_make_validator()
+            report = validator.analyze(app._pick_acc_trials)
+            text = validator.format_report(report)
+        except Exception as exc:
+            text = f"Report error: {exc}"
+            report = None
+        box = getattr(app, "pick_acc_report_box", None)
+        if box is not None:
+            box.configure(state="normal")
+            box.delete("1.0", "end")
+            box.insert("1.0", text)
+            box.configure(state="disabled")
+        status = getattr(app, "pick_acc_status", None)
+        if status is not None and report is not None:
+            status.configure(
+                text=f"{report.trial_count} trial • diukur {report.measured_trial_count} "
+                f"• sukses {report.success_count}/{report.measured_trial_count}"
+            )
+
+    def pick_acc_export_csv():
+        if not app._pick_acc_trials:
+            messagebox.showwarning("Export CSV", "Belum ada trial untuk diexport.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")],
+            initialfile="pick_accuracy_trials.csv",
+        )
+        if not path:
+            return
+        try:
+            _pick_acc_make_validator().export_csv(app._pick_acc_trials, path)
+        except Exception as exc:
+            messagebox.showerror("Export CSV", f"Gagal export: {exc}")
+            return
+        messagebox.showinfo("Export CSV", f"Tersimpan ke:\n{path}")
+
+    def pick_acc_load_log():
+        try:
+            loaded = _pick_acc_make_validator().load_trials()
+        except Exception as exc:
+            messagebox.showerror("Load Log", f"Gagal memuat log: {exc}")
+            return
+        app._pick_acc_trials = list(loaded)
+        pick_acc_show_report()
+        messagebox.showinfo("Load Log", f"Memuat {len(loaded)} trial dari log.")
+
+    def pick_acc_clear_trials():
+        if not app._pick_acc_trials:
+            return
+        if not messagebox.askyesno(
+            "Clear Trials", f"Hapus {len(app._pick_acc_trials)} trial dari sesi ini?"
+        ):
+            return
+        app._pick_acc_trials = []
+        pick_acc_show_report()
+
     def vision_frame(host=None):
         host = host or app.vision_frame
         for child in host.winfo_children():
@@ -832,10 +1208,17 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         app.vision_model_entry.grid(row=1, column=1, padx=6, pady=4, sticky="we")
         customtkinter.CTkButton(model.content_frame, text="Browse", width=70, command=browse_vision_model).grid(row=1, column=2, padx=6, pady=4)
         customtkinter.CTkButton(model.content_frame, text="Load", width=70, command=load_vision_model).grid(row=1, column=3, padx=6, pady=4)
-        _grid_labeled_entry(model.content_frame, 2, 0, "Conf", cfg.get("model_conf_threshold", 0.5), store=app.vision_entries, cast=float)
-        _grid_labeled_entry(model.content_frame, 2, 2, "IoU", cfg.get("model_iou_threshold", 0.45), store=app.vision_entries, cast=float)
+        customtkinter.CTkLabel(model.content_frame, text="Runtime").grid(row=2, column=0, padx=6, pady=4, sticky="w")
+        app.vision_model_runtime_menu = customtkinter.CTkOptionMenu(
+            model.content_frame,
+            values=list(VISION_RUNTIME_OPTIONS.values()),
+        )
+        app.vision_model_runtime_menu.set(_vision_runtime_label(cfg.get("model_runtime", "auto")))
+        app.vision_model_runtime_menu.grid(row=2, column=1, columnspan=3, padx=6, pady=4, sticky="we")
+        _grid_labeled_entry(model.content_frame, 3, 0, "Conf", cfg.get("model_conf_threshold", 0.5), store=app.vision_entries, cast=float)
+        _grid_labeled_entry(model.content_frame, 3, 2, "IoU", cfg.get("model_iou_threshold", 0.45), store=app.vision_entries, cast=float)
         app.vision_model_status = customtkinter.CTkLabel(model.content_frame, text="Model: NOT LOADED", anchor="w")
-        app.vision_model_status.grid(row=3, column=0, columnspan=4, padx=6, pady=4, sticky="we")
+        app.vision_model_status.grid(row=4, column=0, columnspan=4, padx=6, pady=4, sticky="we")
 
         info = CollapsibleFrame(side, title="Object Info")
         info.grid(row=2, column=0, padx=4, pady=6, sticky="ew")
@@ -898,11 +1281,29 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         calibration.content_frame.grid_columnconfigure((1, 3), weight=1)
         cal_cfg = cfg.get("calibration", {})
         camera_base_points = list(getattr(app, "camera_base_points", []))
+        if not camera_base_points:
+            camera_base_points = load_camera_base_points_from_config()
         camera_base_pending_pixel = getattr(app, "camera_base_pending_pixel", None)
         camera_base_calibration_active = bool(
             getattr(app, "camera_base_calibration_active", False)
         )
+        camera_base_points_visible = bool(
+            getattr(
+                app,
+                "camera_base_points_visible",
+                cfg.get("camera_to_base_points_visible", True),
+            )
+        )
+        camera_base_selected_index = getattr(app, "camera_base_selected_index", None)
+        if (
+            not isinstance(camera_base_selected_index, int)
+            or camera_base_selected_index < 0
+            or camera_base_selected_index >= len(camera_base_points)
+        ):
+            camera_base_selected_index = None
         app.camera_base_calibration_active = camera_base_calibration_active
+        app.camera_base_points_visible = camera_base_points_visible
+        app.camera_base_selected_index = camera_base_selected_index
         app.camera_calibration_toggle = customtkinter.CTkButton(
             calibration.content_frame,
             text=f"Calibration Click: {'ON' if camera_base_calibration_active else 'OFF'}",
@@ -941,10 +1342,25 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
             pady=6,
             sticky="w",
         )
-        if bool(cal_cfg.get("preview_enabled", True)):
+        if bool(cal_cfg.get("preview_enabled", False)) or camera_base_calibration_active:
             app.vision_chessboard_preview.select()
+        app.camera_base_points_visible_checkbox = customtkinter.CTkCheckBox(
+            calibration.content_frame,
+            text="Show Camera-to-Base points",
+            command=toggle_camera_base_points_visibility,
+        )
+        app.camera_base_points_visible_checkbox.grid(
+            row=4,
+            column=0,
+            columnspan=4,
+            padx=6,
+            pady=(0, 6),
+            sticky="w",
+        )
+        if camera_base_points_visible:
+            app.camera_base_points_visible_checkbox.select()
         app.vision_calibration = customtkinter.CTkLabel(calibration.content_frame, text="Calibration: -", anchor="w", justify="left")
-        app.vision_calibration.grid(row=4, column=0, columnspan=4, padx=6, pady=4, sticky="we")
+        app.vision_calibration.grid(row=5, column=0, columnspan=4, padx=6, pady=4, sticky="we")
         app.camera_base_points = camera_base_points
         app.camera_base_pending_pixel = camera_base_pending_pixel
         app.camera_base_point_status = customtkinter.CTkLabel(
@@ -956,15 +1372,91 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
             anchor="w",
             justify="left",
         )
-        app.camera_base_point_status.grid(row=5, column=0, columnspan=4, padx=6, pady=4, sticky="we")
-        customtkinter.CTkButton(calibration.content_frame, text="Add TCP/Base Point", command=add_camera_base_point).grid(row=6, column=0, padx=6, pady=6, sticky="we")
-        customtkinter.CTkButton(calibration.content_frame, text="Reset 9 Points", command=reset_camera_base_points).grid(row=6, column=1, padx=6, pady=6, sticky="we")
-        customtkinter.CTkButton(calibration.content_frame, text="Solve Camera-to-Base", command=solve_camera_to_base).grid(row=6, column=2, columnspan=2, padx=6, pady=6, sticky="we")
+        app.camera_base_point_status.grid(row=6, column=0, columnspan=4, padx=6, pady=4, sticky="we")
+        customtkinter.CTkButton(calibration.content_frame, text="Add / Overwrite TCP", command=add_camera_base_point).grid(row=7, column=0, padx=6, pady=6, sticky="we")
+        customtkinter.CTkButton(calibration.content_frame, text="Delete Selected", command=delete_selected_camera_base_point).grid(row=7, column=1, padx=6, pady=6, sticky="we")
+        customtkinter.CTkButton(calibration.content_frame, text="Reset 9 Points", command=reset_camera_base_points).grid(row=7, column=2, padx=6, pady=6, sticky="we")
+        customtkinter.CTkButton(calibration.content_frame, text="Solve Camera-to-Base", command=solve_camera_to_base).grid(row=7, column=3, padx=6, pady=6, sticky="we")
         app.camera_base_points_text = customtkinter.CTkTextbox(calibration.content_frame, height=120)
-        app.camera_base_points_text.grid(row=7, column=0, columnspan=4, padx=6, pady=6, sticky="we")
+        app.camera_base_points_text.grid(row=8, column=0, columnspan=4, padx=6, pady=6, sticky="we")
+        app.camera_base_points_text.bind("<ButtonRelease-1>", select_camera_base_point_from_text)
         refresh_camera_base_points()
+
+        # ---- Test Accuracy Pick Point (Test B) ----
+        pa_cfg = cfg.get("pick_accuracy_test", {})
+        if not hasattr(app, "_pick_acc_trials"):
+            app._pick_acc_trials = []
+        pick_acc = CollapsibleFrame(side, title="Test Accuracy Pick Point")
+        pick_acc.grid(row=7, column=0, padx=4, pady=6, sticky="ew")
+        pa = pick_acc.content_frame
+        pa.grid_columnconfigure((1, 3), weight=1)
+        app.pick_acc_entries = {}
+
+        pa_enabled = bool(pa_cfg.get("enabled", False))
+        app.pick_acc_enable_btn = customtkinter.CTkButton(
+            pa,
+            text=f"Test: {'ON' if pa_enabled else 'OFF'}",
+            fg_color=UI_SUCCESS if pa_enabled else UI_SURFACE_HIGH,
+            command=toggle_pick_accuracy_test,
+        )
+        app.pick_acc_enable_btn.grid(row=0, column=0, padx=6, pady=(6, 4), sticky="we")
+        _grid_labeled_entry(pa, 0, 2, "Success threshold (mm)", pa_cfg.get("threshold_mm", 3.0), store=app.pick_acc_entries, cast=float)
+
+        app.pick_acc_detect_label = customtkinter.CTkLabel(pa, text="Deteksi: (tekan Refresh)", anchor="w", justify="left")
+        app.pick_acc_detect_label.grid(row=1, column=0, columnspan=3, padx=6, pady=4, sticky="we")
+        pa_refresh = customtkinter.CTkButton(pa, text="Refresh", width=70, command=pick_acc_capture_detection)
+        pa_refresh.grid(row=1, column=3, padx=6, pady=4, sticky="we")
+
+        app.pick_acc_ref_label = customtkinter.CTkLabel(pa, text="Program ujung→pick: -", anchor="w", justify="left")
+        app.pick_acc_ref_label.grid(row=2, column=0, columnspan=4, padx=6, pady=(0, 4), sticky="we")
+
+        _grid_labeled_entry(pa, 3, 0, "Object label", "", store=app.pick_acc_entries)
+        _grid_labeled_entry(pa, 3, 2, "Orientation (deg)", "0", store=app.pick_acc_entries, cast=float)
+        _grid_labeled_entry(pa, 4, 0, "Measured tip→tool (mm)", "", store=app.pick_acc_entries, cast=float)
+        _grid_labeled_entry(pa, 5, 0, "GT selongsong box", "", width=150, store=app.pick_acc_entries)
+        _grid_labeled_entry(pa, 5, 2, "GT fixture box", "", width=150, store=app.pick_acc_entries)
+        customtkinter.CTkLabel(
+            pa,
+            text=("Wajib (B2): ukur caliper ujung-1 selongsong → ujung tool, ketik di 'Measured tip→tool'.\n"
+                  "Program hitung ujung-1 → pick point; error = |measured − program|.\n"
+                  "Opsional (B1): GT box x1,y1,x2,y2 = error seleksi deteksi."),
+            anchor="w",
+            justify="left",
+            font=customtkinter.CTkFont(size=10),
+        ).grid(row=6, column=0, columnspan=4, padx=6, pady=(0, 4), sticky="we")
+
+        pa_add = customtkinter.CTkButton(pa, text="Add Trial", command=pick_acc_add_trial)
+        pa_add.grid(row=7, column=0, padx=6, pady=6, sticky="we")
+        pa_report = customtkinter.CTkButton(pa, text="Show Report", command=pick_acc_show_report)
+        pa_report.grid(row=7, column=1, padx=6, pady=6, sticky="we")
+        pa_export = customtkinter.CTkButton(pa, text="Export CSV", command=pick_acc_export_csv)
+        pa_export.grid(row=7, column=2, padx=6, pady=6, sticky="we")
+        pa_load = customtkinter.CTkButton(pa, text="Load Log", command=pick_acc_load_log)
+        pa_load.grid(row=7, column=3, padx=6, pady=6, sticky="we")
+
+        pa_clear = customtkinter.CTkButton(pa, text="Clear Trials", fg_color=UI_DANGER, hover_color="#9F1239", command=pick_acc_clear_trials)
+        pa_clear.grid(row=8, column=0, padx=6, pady=(0, 6), sticky="we")
+        app.pick_acc_status = customtkinter.CTkLabel(pa, text="0 trial", anchor="w")
+        app.pick_acc_status.grid(row=8, column=1, columnspan=3, padx=6, pady=(0, 6), sticky="we")
+
+        app.pick_acc_report_box = customtkinter.CTkTextbox(pa, height=210)
+        app.pick_acc_report_box.grid(row=9, column=0, columnspan=4, padx=6, pady=6, sticky="we")
+        app.pick_acc_report_box.configure(state="disabled")
+
+        app.pick_acc_widgets = [
+            pa_refresh, pa_add, pa_report, pa_export, pa_load, pa_clear,
+            app.pick_acc_entries["Object label"][0],
+            app.pick_acc_entries["Orientation (deg)"][0],
+            app.pick_acc_entries["Measured tip→tool (mm)"][0],
+            app.pick_acc_entries["GT selongsong box"][0],
+            app.pick_acc_entries["GT fixture box"][0],
+        ]
+        _pick_acc_refresh_enabled_ui()
+        if app._pick_acc_trials:
+            pick_acc_show_report()
+
         app.vision_status = customtkinter.CTkLabel(side, text="Status: stopped", anchor="w", justify="left")
-        app.vision_status.grid(row=7, column=0, padx=6, pady=8, sticky="we")
+        app.vision_status.grid(row=8, column=0, padx=6, pady=8, sticky="we")
         app._last_vision_image_update = 0
         start_vision_feed_loop(app.vision_feed_label)
         start_vision_state_loop(app.vision_status)
@@ -1120,7 +1612,7 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         columns = ("name", "type", "address", "rw", "desc")
         app.modbus_table = ttk.Treeview(mapping.content_frame, columns=columns, show="headings", height=14)
         headings = {"name": "Name", "type": "Type", "address": "Address", "rw": "RW", "desc": "Description"}
-        widths = {"name": 130, "type": 110, "address": 80, "rw": 80, "desc": 260}
+        widths = {"name": 140, "type": 90, "address": 90, "rw": 80, "desc": 280}
         for column in columns:
             app.modbus_table.heading(column, text=headings[column])
             app.modbus_table.column(column, width=widths[column], stretch=column == "desc")
@@ -1313,11 +1805,18 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
 
     def build_vision_settings():
         entries = getattr(app, "vision_entries", {})
+        runtime_menu = getattr(app, "vision_model_runtime_menu", None)
+        runtime_value = _vision_runtime_value(
+            runtime_menu.get()
+            if runtime_menu is not None
+            else load_config().get("vision", {}).get("model_runtime", "auto")
+        )
         settings = {
             "video_source": app.vision_source_menu.get(),
             "detection_enabled": vision_manager.detection_enabled(),
             "detection_method": "model",
             "model_path": app.vision_model_entry.get().strip(),
+            "model_runtime": runtime_value,
         }
         key_map = {
             "Brightness": "brightness",
@@ -1367,6 +1866,21 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         settings["calibration"]["preview_enabled"] = bool(
             getattr(app, "vision_chessboard_preview", None)
             and app.vision_chessboard_preview.get()
+        )
+        points_visible_checkbox = getattr(app, "camera_base_points_visible_checkbox", None)
+        settings["camera_to_base_points_visible"] = (
+            bool(points_visible_checkbox.get())
+            if points_visible_checkbox is not None
+            else bool(
+                getattr(
+                    app,
+                    "camera_base_points_visible",
+                    load_config().get("vision", {}).get(
+                        "camera_to_base_points_visible",
+                        True,
+                    ),
+                )
+            )
         )
         settings.setdefault("tool_z", {})["reference_joint_deg"] = _parse_float_list(
             entries["Reference joints"][0].get(),
@@ -1421,7 +1935,7 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         save_vision_settings()
         status = vision_manager.load_model(app.vision_model_entry.get().strip())
         app.vision_model_status.configure(text="Model: " + str(status))
-        research_logger.record("vision_model_load", 1 if status == "LOADED" else 0, status)
+        research_logger.record("vision_model_load", 1 if str(status).startswith("LOADED") else 0, status)
 
     def start_vision_camera():
         save_vision_settings()
@@ -1521,9 +2035,31 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         update_state("vision_confirmation", {"status": decision, "token": token, "decision": decision, "updated_at": time.time()})
         research_logger.record("marginal_" + decision, 1)
 
+    def set_chessboard_preview_for_camera_base_calibration(enabled):
+        checkbox = getattr(app, "vision_chessboard_preview", None)
+        if checkbox is not None:
+            try:
+                if enabled:
+                    checkbox.select()
+                else:
+                    checkbox.deselect()
+            except (tk.TclError, RuntimeError):
+                pass
+
+        cfg = load_config()
+        vision_cfg = cfg.setdefault("vision", {})
+        calibration_cfg = vision_cfg.get("calibration", {})
+        if not isinstance(calibration_cfg, dict):
+            calibration_cfg = {}
+            vision_cfg["calibration"] = calibration_cfg
+        if bool(calibration_cfg.get("preview_enabled", False)) != bool(enabled):
+            calibration_cfg["preview_enabled"] = bool(enabled)
+            save_config(cfg)
+
     def toggle_camera_base_calibration():
         active = not bool(getattr(app, "camera_base_calibration_active", False))
         app.camera_base_calibration_active = active
+        set_chessboard_preview_for_camera_base_calibration(active)
         app.camera_calibration_toggle.configure(
             text=f"Calibration Click: {'ON' if active else 'OFF'}",
             fg_color=UI_SUCCESS if active else UI_SURFACE_HIGH,
@@ -1550,6 +2086,21 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
             )
         app._last_vision_image_update = 0
         research_logger.record("camera_base_click_mode", 1 if active else 0)
+
+    def toggle_camera_base_points_visibility():
+        checkbox = getattr(app, "camera_base_points_visible_checkbox", None)
+        visible = bool(checkbox.get()) if checkbox is not None else True
+        app.camera_base_points_visible = visible
+
+        cfg = load_config()
+        cfg.setdefault("vision", {})["camera_to_base_points_visible"] = visible
+        save_config(cfg)
+
+        app._last_vision_image_update = 0
+        update_camera_base_point_status(
+            f"Camera-to-Base points {'shown' if visible else 'hidden'}"
+        )
+        research_logger.record("camera_base_points_visible", 1 if visible else 0)
 
     def capture_camera_base_pixel(event):
         if not bool(getattr(app, "camera_base_calibration_active", False)):
@@ -1591,16 +2142,38 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         pixel_u = local_x * composed_w / display_w
         pixel_v = local_y * composed_h / display_h
         app.camera_base_pending_pixel = [pixel_u, pixel_v]
+        selected_index = selected_camera_base_point_index()
+        point_count = len(getattr(app, "camera_base_points", []))
+        target_text = (
+            f"overwrite P{selected_index + 1}"
+            if selected_index is not None
+            else "select a saved point to overwrite"
+            if point_count >= 9
+            else f"add P{point_count + 1}"
+        )
         app.camera_base_point_status.configure(
             text=(
                 f"Pending pixel=({pixel_u:.1f},{pixel_v:.1f}); "
-                "jog TCP/pointer to the same physical point, then Add"
+                f"jog TCP/pointer to the same physical point, then {target_text}"
             )
         )
         app._last_vision_image_update = 0
 
     def draw_camera_base_calibration_overlay(image, frame_size, display_frame_size):
-        if not bool(getattr(app, "camera_base_calibration_active", False)):
+        points_visible = bool(getattr(app, "camera_base_points_visible", True))
+        visible_points = (
+            getattr(app, "camera_base_points", [])
+            if points_visible
+            else []
+        )
+        pending = (
+            getattr(app, "camera_base_pending_pixel", None)
+            if bool(getattr(app, "camera_base_calibration_active", False))
+            else None
+        )
+        has_points = bool(visible_points)
+        has_pending = pending is not None
+        if not has_points and not has_pending:
             return image
         if len(frame_size) < 2 or int(frame_size[0]) <= 0 or int(frame_size[1]) <= 0:
             return image
@@ -1630,12 +2203,14 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
             draw.line((x, y - radius * 1.4, x, y + radius * 1.4), fill=color, width=line_width)
             draw.text((x + radius + 4, y - radius), label, fill=color)
 
-        for index, point in enumerate(getattr(app, "camera_base_points", []), start=1):
+        selected_index = getattr(app, "camera_base_selected_index", None)
+        for index, point in enumerate(visible_points, start=1):
             pixel = point.get("pixel") if isinstance(point, dict) else None
             if pixel is not None and len(pixel) >= 2:
-                draw_marker(pixel, (0, 255, 255), f"P{index}")
+                color = (255, 128, 0) if selected_index == index - 1 else (0, 255, 255)
+                label = f"P{index}*" if selected_index == index - 1 else f"P{index}"
+                draw_marker(pixel, color, label)
 
-        pending = getattr(app, "camera_base_pending_pixel", None)
         if pending is not None and len(pending) >= 2:
             draw_marker(pending, (255, 215, 0), "PENDING")
         return marked
@@ -1697,54 +2272,237 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
     def refresh_camera_base_points():
         if not hasattr(app, "camera_base_points_text"):
             return
+        selected_index = getattr(app, "camera_base_selected_index", None)
+        points = getattr(app, "camera_base_points", [])
+        if (
+            not isinstance(selected_index, int)
+            or selected_index < 0
+            or selected_index >= len(points)
+        ):
+            selected_index = None
+            app.camera_base_selected_index = None
+        try:
+            app.camera_base_points_text.configure(state="normal")
+        except (tk.TclError, RuntimeError):
+            pass
         app.camera_base_points_text.delete("1.0", tk.END)
-        for index, point in enumerate(getattr(app, "camera_base_points", []), start=1):
+        try:
+            app.camera_base_points_text.tag_config(
+                "selected_point",
+                background="#1f6aa5",
+                foreground="#ffffff",
+            )
+        except (tk.TclError, RuntimeError):
+            pass
+        for index, point in enumerate(points, start=1):
             pixel = point["pixel"]
             base = point["base"]
+            marker = ">" if selected_index == index - 1 else " "
             app.camera_base_points_text.insert(
                 tk.END,
                 (
-                    f"{index:02d}: pixel=({pixel[0]:.1f},{pixel[1]:.1f}) "
+                    f"{marker}{index:02d}: pixel=({pixel[0]:.1f},{pixel[1]:.1f}) "
                     f"Base=({base[0]:.3f},{base[1]:.3f})\n"
                 ),
             )
+            if selected_index == index - 1:
+                try:
+                    app.camera_base_points_text.tag_add(
+                        "selected_point",
+                        f"{index}.0",
+                        f"{index}.end",
+                    )
+                except (tk.TclError, RuntimeError):
+                    pass
+        try:
+            app.camera_base_points_text.configure(state="disabled")
+        except (tk.TclError, RuntimeError):
+            pass
 
-    def add_camera_base_point():
-        pending = getattr(app, "camera_base_pending_pixel", None)
-        if pending is None:
-            shared_string.value = b'Error: Click a camera point before adding Base point'
-            return
+    def normalize_camera_base_points(points):
+        normalized = []
+        for point in points if isinstance(points, list) else []:
+            if not isinstance(point, dict):
+                continue
+            pixel = point.get("pixel")
+            base = point.get("base")
+            if pixel is None and "pixel_point" in point:
+                pixel = point.get("pixel_point")
+            if base is None and "base_point_mm" in point:
+                base = point.get("base_point_mm")
+            if (
+                isinstance(pixel, (list, tuple))
+                and isinstance(base, (list, tuple))
+                and len(pixel) >= 2
+                and len(base) >= 2
+            ):
+                try:
+                    normalized.append(
+                        {
+                            "pixel": [float(pixel[0]), float(pixel[1])],
+                            "base": [float(base[0]), float(base[1])],
+                        }
+                    )
+                except (TypeError, ValueError):
+                    pass
+        return normalized[:9]
+
+    def load_camera_base_points_from_config():
+        vision_cfg = load_config().get("vision", {})
+        points = normalize_camera_base_points(vision_cfg.get("camera_to_base_points", []))
+        if points:
+            return points
+
+        camera_to_base = vision_cfg.get("camera_to_base", {})
+        if not isinstance(camera_to_base, dict):
+            return []
+        pixel_points = camera_to_base.get("raw_pixel_points") or camera_to_base.get("pixel_points") or []
+        base_points = camera_to_base.get("base_points_mm") or []
+        rebuilt = []
+        for pixel, base in zip(pixel_points, base_points):
+            rebuilt.append({"pixel": pixel, "base": base})
+        return normalize_camera_base_points(rebuilt)
+
+    def save_camera_base_points_to_config():
+        cfg = load_config()
+        vision_cfg = cfg.setdefault("vision", {})
+        vision_cfg["camera_to_base_points"] = normalize_camera_base_points(
+            list(getattr(app, "camera_base_points", []))
+        )
+        save_config(cfg)
+
+    def selected_camera_base_point_index():
+        index = getattr(app, "camera_base_selected_index", None)
+        points = getattr(app, "camera_base_points", [])
+        if isinstance(index, int) and 0 <= index < len(points):
+            return index
+        app.camera_base_selected_index = None
+        return None
+
+    def camera_base_current_tcp_xy():
         q_current = np.array(
             [PAROL6_ROBOT.STEPS2RADS(Position_in[index], index) for index in range(6)],
             dtype=float,
         )
         transform = PAROL6_ROBOT.robot.fkine(q_current)
         tcp_mm = np.asarray(transform.t, dtype=float) * 1000.0
-        app.camera_base_points.append(
-            {
-                "pixel": [float(pending[0]), float(pending[1])],
-                "base": [float(tcp_mm[0]), float(tcp_mm[1])],
-            }
-        )
-        app.camera_base_pending_pixel = None
+        return [float(tcp_mm[0]), float(tcp_mm[1])]
+
+    def update_camera_base_point_status(message=None):
+        if not hasattr(app, "camera_base_point_status"):
+            return
+        if message is not None:
+            app.camera_base_point_status.configure(text=message)
+            return
+        selected_index = selected_camera_base_point_index()
+        selected_text = f"; selected P{selected_index + 1}" if selected_index is not None else ""
         app.camera_base_point_status.configure(
             text=(
                 f"Calibration click {'ON' if app.camera_base_calibration_active else 'OFF'}; "
-                f"{len(app.camera_base_points)}/9 points saved"
+                f"{len(getattr(app, 'camera_base_points', []))}/9 points saved"
+                f"{selected_text}"
             )
         )
+
+    def select_camera_base_point_from_text(event):
+        if not hasattr(app, "camera_base_points_text"):
+            return
+        points = getattr(app, "camera_base_points", [])
+        if not points:
+            app.camera_base_selected_index = None
+            update_camera_base_point_status()
+            return
+        try:
+            text_index = app.camera_base_points_text.index(f"@{event.x},{event.y}")
+            line_index = int(str(text_index).split(".")[0]) - 1
+        except (ValueError, tk.TclError, RuntimeError):
+            return
+        if 0 <= line_index < len(points):
+            if selected_camera_base_point_index() == line_index:
+                app.camera_base_selected_index = None
+                update_camera_base_point_status("Point selection cleared")
+            else:
+                app.camera_base_selected_index = line_index
+                update_camera_base_point_status(
+                    (
+                        f"Selected P{line_index + 1}; click a new pixel if needed, "
+                        "then Add / Overwrite TCP"
+                    )
+                )
+        else:
+            app.camera_base_selected_index = None
+            update_camera_base_point_status()
+        refresh_camera_base_points()
+        app._last_vision_image_update = 0
+
+    def add_camera_base_point():
+        pending = getattr(app, "camera_base_pending_pixel", None)
+        selected_index = selected_camera_base_point_index()
+        points = getattr(app, "camera_base_points", [])
+        if pending is None and selected_index is None:
+            shared_string.value = b'Error: Click a camera point before adding Base point'
+            return
+        if pending is None and selected_index is not None:
+            pending = points[selected_index].get("pixel")
+        if len(points) >= 9 and selected_index is None:
+            shared_string.value = b'Error: 9 points saved; select a point to overwrite or delete one'
+            update_camera_base_point_status(
+                "9/9 points saved; select a point to overwrite or delete one"
+            )
+            return
+
+        point = {
+            "pixel": [float(pending[0]), float(pending[1])],
+            "base": camera_base_current_tcp_xy(),
+        }
+        if selected_index is not None:
+            points[selected_index] = point
+            action = f"Overwrote P{selected_index + 1}"
+        else:
+            points.append(point)
+            app.camera_base_selected_index = None
+            action = f"Added P{len(points)}"
+        app.camera_base_points = points
+        app.camera_base_pending_pixel = None
+        update_camera_base_point_status(
+            (
+                f"{action}; {len(app.camera_base_points)}/9 points saved. "
+                "Select a point to overwrite or delete"
+            )
+        )
+        save_camera_base_points_to_config()
+        refresh_camera_base_points()
+        app._last_vision_image_update = 0
+
+    def delete_selected_camera_base_point():
+        selected_index = selected_camera_base_point_index()
+        if selected_index is None:
+            shared_string.value = b'Error: Select a Camera-to-Base point before deleting'
+            update_camera_base_point_status("Select a point in the list before deleting")
+            return
+        points = list(getattr(app, "camera_base_points", []))
+        deleted_number = selected_index + 1
+        del points[selected_index]
+        app.camera_base_points = points
+        app.camera_base_pending_pixel = None
+        app.camera_base_selected_index = (
+            selected_index if selected_index < len(points) else len(points) - 1
+        )
+        if app.camera_base_selected_index < 0:
+            app.camera_base_selected_index = None
+        update_camera_base_point_status(
+            f"Deleted P{deleted_number}; {len(app.camera_base_points)}/9 points saved"
+        )
+        save_camera_base_points_to_config()
         refresh_camera_base_points()
         app._last_vision_image_update = 0
 
     def reset_camera_base_points():
         app.camera_base_points = []
         app.camera_base_pending_pixel = None
-        app.camera_base_point_status.configure(
-            text=(
-                f"Calibration click {'ON' if app.camera_base_calibration_active else 'OFF'}; "
-                "0/9 points saved"
-            )
-        )
+        app.camera_base_selected_index = None
+        update_camera_base_point_status()
+        save_camera_base_points_to_config()
         refresh_camera_base_points()
         app._last_vision_image_update = 0
 
@@ -1768,6 +2526,7 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
                 f"max={result['max_error_mm']:.3f} mm"
             )
         )
+        save_camera_base_points_to_config()
         shared_string.value = b'Log: Camera-to-Base calibration complete'
         research_logger.record("camera_to_base_calibration", 1, str(result))
 
@@ -1816,6 +2575,8 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
             summary = vision_manager.reset_intrinsic_calibration(delete_snapshots=True)
             app.camera_base_points = []
             app.camera_base_pending_pixel = None
+            app.camera_base_selected_index = None
+            save_camera_base_points_to_config()
             refresh_camera_base_points()
             app.camera_base_point_status.configure(
                 text="Calibration click OFF; 0/9 points saved"
@@ -2836,7 +3597,74 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
 
 
         
+    def _program_file_display_name():
+        if Now_open_txt:
+            return os.path.basename(Now_open_txt)
+        return "No .txt file opened"
+
+    def _update_open_txt_preview():
+        label = getattr(app, "program_file_label", None)
+        if label is None:
+            return
+
+        display_name = _program_file_display_name()
+        saved_content = getattr(app, "_program_saved_content", None)
+        textbox = getattr(app, "textbox_program", None)
+        if textbox is not None and saved_content is not None:
+            try:
+                if textbox.get("1.0", tk.END) != saved_content:
+                    display_name += " *"
+            except Exception:
+                pass
+        _set_text(label, "File: " + display_name)
+
+    def _mark_program_saved():
+        app._program_saved_content = app.textbox_program.get("1.0", tk.END)
+        _update_open_txt_preview()
+
+    def _write_program_file(file_path):
+        with open(file_path, "w") as text_file:
+            text_file.write(app.textbox_program.get("1.0", tk.END))
+        _mark_program_saved()
+
+    def _confirm_save_current_program():
+        global Now_open_txt
+
+        if not Now_open_txt:
+            return save_as_txt()
+
+        filename = os.path.basename(Now_open_txt)
+        if not messagebox.askyesno("Confirm Save", f"Save changes to {filename}?"):
+            return False
+
+        _write_program_file(Now_open_txt)
+        return True
+
+    def _confirm_discard_or_save_changes():
+        saved_content = getattr(app, "_program_saved_content", None)
+        if saved_content is None or app.textbox_program.get("1.0", tk.END) == saved_content:
+            return True
+
+        answer = messagebox.askyesnocancel(
+            "Unsaved Changes",
+            "Save changes before opening another .txt file?",
+        )
+        if answer is None:
+            return False
+        if answer:
+            return _confirm_save_current_program()
+        return True
+
     def highlight_words_program(event):
+        # Re-tagging scans the whole textbox for every command word, so only do
+        # it when the content actually changed. The periodic Stuff_To_Update
+        # calls this 15x/s; without the cache it rescans the full text each tick
+        # (a big slowdown, especially when the window is maximized/fullscreen).
+        content = app.textbox_program.get("1.0", tk.END)
+        if getattr(app, "_program_highlight_cache", None) == content:
+            return
+        app._program_highlight_cache = content
+
         app.textbox_program.tag_config("green", foreground="green")
         words = PAROL6_ROBOT.Commands_list
 
@@ -2850,7 +3678,16 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
                 app.textbox_program.tag_add("green", start, end)
                 start = end
 
+        _update_open_txt_preview()
+
     def highlight_words_response(event):
+        # Same idea as highlight_words_program: skip the full rescan unless the
+        # response log text changed since the last highlight pass.
+        content = app.textbox_response.get("1.0", tk.END)
+        if getattr(app, "_response_highlight_cache", None) == content:
+            return
+        app._response_highlight_cache = content
+
         app.textbox_response.tag_config("red", foreground="red")
         words = ["Warrning", "Error", "Log"]
         for word in words:
@@ -2876,10 +3713,14 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         app.program_label = customtkinter.CTkLabel(app.program_frame, text="Program:", font=customtkinter.CTkFont(size=16))
         app.program_label.grid(row=0, column=0, padx=(10,10), pady=5, sticky="w")
 
-        app.textbox_program = customtkinter.CTkTextbox(app.program_frame, font=customtkinter.CTkFont(size=15, family='JetBrains Mono'), fg_color=UI_SURFACE_LOW, text_color=UI_ON_SURFACE, border_color=UI_BORDER, border_width=1, corner_radius=6)
+        app.program_file_label = customtkinter.CTkLabel(app.program_frame, text="File: No .txt file opened", font=customtkinter.CTkFont(size=14), anchor="e")
+        app.program_file_label.grid(row=0, column=1, padx=(10, 20), pady=5, sticky="e")
+
+        app.textbox_program = customtkinter.CTkTextbox(app.program_frame, font=customtkinter.CTkFont(size=PROGRAM_TEXT_FONT_SIZE, family='JetBrains Mono'), fg_color=UI_SURFACE_LOW, text_color=UI_ON_SURFACE, border_color=UI_BORDER, border_width=1, corner_radius=6)
         app.textbox_program.grid(row=1, column=0,columnspan=2, padx=(20, 20), pady=(5, 20), sticky="nsew")
 
         app.textbox_program.bind("<KeyRelease>", highlight_words_program)
+        _mark_program_saved()
 
 
     def start_stop_frame():
@@ -2915,6 +3756,14 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
     # dodaj slikice kao iz meca studio
     def response_log_frames():
         #response log frame
+        def clear_response_log():
+            global prev_string_shared
+            app.textbox_response.delete("1.0", tk.END)
+            try:
+                prev_string_shared = (shared_string.value).decode("utf-8", errors="ignore")
+            except Exception:
+                prev_string_shared = ""
+
         app.response_frame = customtkinter.CTkFrame(app,height = 100, corner_radius=8, fg_color=UI_SURFACE, border_width=1, border_color=UI_BORDER)
         app.response_frame.grid(row=3, column=1, columnspan=2, padx=(5,0), pady=5, sticky="nsew")
         app.response_frame.grid_columnconfigure(0, weight=1)
@@ -2925,11 +3774,14 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         app.program_label = customtkinter.CTkLabel(app.response_frame, text="Response log:", font=customtkinter.CTkFont(size=16))
         app.program_label.grid(row=0, column=0, padx=(10,10), pady=5, sticky="w")
 
-        app.Show_rec_frame = customtkinter.CTkButton(app.response_frame,text="Show received frame", font = customtkinter.CTkFont(size=16, family='TkDefaultFont'))
-        app.Show_rec_frame.grid(row=0, column=1, padx=20,pady = 5,sticky="w")
+        app.clear_response_log = customtkinter.CTkButton(app.response_frame,text="Clear log", width=80, font = customtkinter.CTkFont(size=16, family='TkDefaultFont'), command=clear_response_log)
+        app.clear_response_log.grid(row=0, column=1, padx=(8, 4),pady = 5,sticky="e")
 
-        app.textbox_response = customtkinter.CTkTextbox(app.response_frame, font=customtkinter.CTkFont(size=14, family='JetBrains Mono'), fg_color=UI_SURFACE_LOW, text_color=UI_ON_SURFACE, border_color=UI_BORDER, border_width=1, corner_radius=6)
-        app.textbox_response.grid(row=1, column=0,columnspan=2, padx=(20, 20), pady=(5, 20), sticky="nsew")
+        app.Show_rec_frame = customtkinter.CTkButton(app.response_frame,text="Show received frame", font = customtkinter.CTkFont(size=16, family='TkDefaultFont'))
+        app.Show_rec_frame.grid(row=0, column=2, padx=(4, 20),pady = 5,sticky="w")
+
+        app.textbox_response = customtkinter.CTkTextbox(app.response_frame, font=customtkinter.CTkFont(size=LOG_TEXT_FONT_SIZE, family='JetBrains Mono'), fg_color=UI_SURFACE_LOW, text_color=UI_ON_SURFACE, border_color=UI_BORDER, border_width=1, corner_radius=6)
+        app.textbox_response.grid(row=1, column=0,columnspan=3, padx=(20, 20), pady=(5, 20), sticky="nsew")
         app.textbox_response.bind("<KeyRelease>", highlight_words_response)
 
 
@@ -3075,26 +3927,26 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         style.configure("Treeview",
                         background=UI_SURFACE_LOW,
                         foreground=UI_ON_SURFACE,
-                        rowheight=40,
+                        rowheight=30,
                         fieldbackground=UI_SURFACE_LOW,
                         bordercolor=UI_BORDER,
                         borderwidth=0,
-                        font=('JetBrains Mono',13))
+                        font=(FONT_FAMILY_MAIN, COMMAND_TREE_FONT_SIZE))
 
         style.map('Treeview',
                   background=[('selected', UI_ACCENT)],
                   foreground=[('selected', '#ffffff')])
 
         style.configure("Treeview.Heading",
-                        background=UI_ACCENT,
-                        foreground="#ffffff",
+                        background=UI_SURFACE_ALT,
+                        foreground=UI_ON_SURFACE,
                         relief="flat",
-                        font=('Inter',13,'bold'),
+                        font=(FONT_FAMILY_MAIN, COMMAND_TREE_FONT_SIZE,'bold'),
                         )
 
 
         style.map("Treeview.Heading",
-                    background=[('active', UI_ACCENT_DEEP)])
+                    background=[('active', UI_SURFACE_HIGH)])
 
         app.add_menu_display211 = customtkinter.CTkFrame(master=app.commands_frame,
                                                     corner_radius=15,
@@ -3115,8 +3967,8 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         app.table.column("#0", anchor="w", minwidth=180, width=250, stretch=True)
         app.table.column("#1", minwidth=0, width=0, stretch=False)
 
-        app.table.tag_configure("command_group", font=('Inter', 13, 'bold'), foreground=UI_ACCENT)
-        app.table.tag_configure("command_item", font=('JetBrains Mono', 13))
+        app.table.tag_configure("command_group", font=(FONT_FAMILY_MAIN, COMMAND_TREE_FONT_SIZE, 'bold'), foreground=UI_ACCENT)
+        app.table.tag_configure("command_item", font=(FONT_FAMILY_MONO, COMMAND_TREE_FONT_SIZE))
         app.command_scrollbar = ttk.Scrollbar(
             app.add_menu_display211,
             orient="vertical",
@@ -3178,7 +4030,7 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
             app.commands_frame,
             height=150,
             wrap="word",
-            font=customtkinter.CTkFont(size=12, family="JetBrains Mono"),
+            font=customtkinter.CTkFont(size=COMMAND_HELP_FONT_SIZE, family="JetBrains Mono"),
             fg_color=UI_SURFACE_LOW,
             text_color=UI_ON_SURFACE,
             border_color=UI_BORDER,
@@ -3333,41 +4185,15 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
     def Set_comm_port():
 
         COMPORT_value = app.COMPORT.get()
-        
-        # For macOS, allow full port paths
-        if my_os == "Darwin":
-            # If input looks like a full path, pass it through shared_string.
-            if COMPORT_value.startswith('/dev/'):
-                if len(General_data) < 3:
-                    General_data.extend([0])
-                General_data[0] = -1  # Use -1 to indicate full path mode
-                shared_string.value = COMPORT_value.encode('utf-8')
-            else:
-                # Try to extract number for backward compatibility
-                pattern = re.compile(r'\D*(\d+)\D*')
-                match = pattern.match(COMPORT_value)
-                if match:
-                    com_number = int(match.group(1))
-                    General_data[0] = com_number
-                else:
-                    # Default to 0 if no match found
-                    General_data[0] = 0
+        pattern = re.compile(r'\D*(\d+)\D*')
+        match = pattern.match(COMPORT_value)
+        if match:
+            com_number = int(match.group(1))
+            General_data[0] = com_number
         else:
-            # For Windows and Linux, keep existing behavior
-            pattern = re.compile(r'\D*(\d+)\D*')
-            match = pattern.match(COMPORT_value)
-            if match:
-               com_number = int(match.group(1))
-               General_data[0] = com_number
-            else:
-                 General_data[0] = 0  # Default to 0 if no match found
+            None
 
-        if len(General_data) > 2:
-            General_data[2] = General_data[2] + 1
-
-        print("Port setting:", General_data[0])
-        if my_os == "Darwin" and General_data[0] == -1:
-            print("Full path mode for macOS:", COMPORT_value)
+        print(General_data[0])
         
         
 
@@ -3636,42 +4462,38 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         global Now_open_txt
         logging.debug("Open txt")
         logging.debug(Now_open_txt)
-        app.textbox_program.delete('1.0', tk.END)
-        text_file = filedialog.askopenfilename(initialdir = Image_path + "/Programs",title = "open text file", filetypes= (("Text Files",".txt"),))
+        if not _confirm_discard_or_save_changes():
+            return
+
+        text_file = filedialog.askopenfilename(initialdir = Image_path + "/Programs",title = "open text file", filetypes= (("Text Files","*.txt"),))
+        if not text_file:
+            return
+
         logging.debug(text_file)
         Now_open_txt = text_file
-        text_file = open(text_file,'r+')
-        temp_var = text_file.read()
+        app.textbox_program.delete('1.0', tk.END)
+        with open(text_file, 'r') as opened_file:
+            temp_var = opened_file.read()
         app.textbox_program.insert(tk.END,temp_var)
-        text_file.close()
+        _mark_program_saved()
+        app._program_highlight_cache = None
+        highlight_words_program(None)
 
     def execute_program():
         # When program start button is pressed:
-        # save the current file and save its content to execute_script.txt file
+        # copy the editor content to execute_script.txt without overwriting
+        # the .txt file currently opened in the editor.
         # set Button[7] flag to 1
         logging.debug("Execute program")
         global Now_open_txt
         logging.debug(Now_open_txt)
-        # If program was blank or execute script
-        if Now_open_txt == '' or Now_open_txt == Image_path + "/Programs/execute_script.txt":
-            Now_open_txt = Image_path + "/Programs/execute_script.txt"
-            text_file = open(Now_open_txt,'w+')
+        runtime_file = Image_path + "/Programs/execute_script.txt"
+        with open(runtime_file, 'w') as text_file:
             text_file.write(app.textbox_program.get(1.0,tk.END))
-            text_file.close()
-        # If program was saved under some name.
-        # Save it again with that name and transfer content of the file to the execute script.
-        else:
-            text_file = open(Now_open_txt,'w+')
-            text_file.write(app.textbox_program.get(1.0,tk.END))
-            text_file.close()
-            x = Image_path + "/Programs/execute_script.txt"
-            text_file = open(x,'w+')
-            text_file.write(app.textbox_program.get(1.0,tk.END))
-            text_file.close()
             
         # Set flag to 1. Program will try to run
         update_state("program_control", {"state": "RUNNING", "paused": False, "stop_requested": False, "step_requested": 0, "updated_at": time.time()})
-        research_logger.record("program_run", 1, Now_open_txt)
+        research_logger.record("program_run", 1, Now_open_txt or "unsaved_editor")
         Buttons[7] = 1
         
 
@@ -3698,25 +4520,29 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         logging.debug("Save txt")
         global Now_open_txt
         logging.debug(Now_open_txt)
-        if Now_open_txt != '':
-            #print("done")
-            text_file = open(Now_open_txt,'w+')
-            text_file.write(app.textbox_program.get(1.0,tk.END))
-            text_file.close()
-        else:
-            Now_open_txt = Image_path + "/Programs/execute_script.txt"
-            text_file = open(Now_open_txt,'w+')
-            text_file.write(app.textbox_program.get(1.0,tk.END))
-            text_file.close() 
+        _confirm_save_current_program()
         
     def save_as_txt():
         logging.debug("Save as txt")
+        global Now_open_txt
 
-        file_path = filedialog.asksaveasfilename(defaultextension=".txt")
+        file_path = filedialog.asksaveasfilename(
+            initialdir=Image_path + "/Programs",
+            defaultextension=".txt",
+            filetypes=(("Text Files", "*.txt"),),
+            confirmoverwrite=False,
+        )
         if file_path:
-            with open(file_path, "w") as file:
-                content = app.textbox_program.get("1.0", tk.END)
-                file.write(content)
+            filename = os.path.basename(file_path)
+            if os.path.exists(file_path):
+                if not messagebox.askyesno("Confirm Overwrite", f"Overwrite {filename}?"):
+                    return False
+            elif not messagebox.askyesno("Confirm Save", f"Save current program as {filename}?"):
+                return False
+            Now_open_txt = file_path
+            _write_program_file(file_path)
+            return True
+        return False
 
     def Select_simulator():
         global Robot_sim
@@ -3820,11 +4646,11 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
             style.configure("Treeview",
                             background="#202630",
                             foreground="white",
-                            rowheight=40,
+                            rowheight=30,
                             fieldbackground="#202630",
                             bordercolor="#2f3844",
                             borderwidth=0,
-                            font=('JetBrains Mono',13))
+                            font=(FONT_FAMILY_MAIN, COMMAND_TREE_FONT_SIZE))
 
             style.map('Treeview',
                       background=[('selected', UI_ACCENT)],
@@ -3834,38 +4660,38 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
                             background="#2f3844",
                             foreground="white",
                             relief="flat",
-                            font=('Inter',13,'bold'),
+                            font=(FONT_FAMILY_MAIN, COMMAND_TREE_FONT_SIZE,'bold'),
                             )
 
             style.map("Treeview.Heading",
-                        background=[('active', UI_ACCENT_DEEP)])
+                        background=[('active', "#3a4254")])
 
         if(new_appearance_mode == "Light"):
             style = ttk.Style()
             style.theme_use("default")
 
             style.configure("Treeview",
-                            background=UI_SURFACE_LOW,
-                            foreground=UI_ON_SURFACE,
-                            rowheight=40,
-                            fieldbackground=UI_SURFACE_LOW,
-                            bordercolor=UI_BORDER,
+                            background="#e0e0e0",
+                            foreground="black",
+                            rowheight=30,
+                            fieldbackground="#e0e0e0",
+                            bordercolor="#cccccc",
                             borderwidth=0,
-                            font=('JetBrains Mono',13))
+                            font=(FONT_FAMILY_MAIN, COMMAND_TREE_FONT_SIZE))
 
             style.map('Treeview',
                       background=[('selected', UI_ACCENT)],
                       foreground=[('selected', '#ffffff')])
 
             style.configure("Treeview.Heading",
-                            background=UI_ACCENT,
-                            foreground="#ffffff",
+                            background="#d0d0d0",
+                            foreground="black",
                             relief="flat",
-                            font=('Inter',13,'bold'),
+                            font=(FONT_FAMILY_MAIN, COMMAND_TREE_FONT_SIZE,'bold'),
                             )
 
             style.map("Treeview.Heading",
-                        background=[('active', UI_ACCENT_DEEP)])
+                        background=[('active', "#c0c0c0")])
 
 
 
@@ -3874,7 +4700,6 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         
         #logging.debug("test")
         global prev_string_shared
-
         global x_value 
         global y_value 
         global z_value 
@@ -3889,114 +4714,137 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         global Joint5_value 
         global Joint6_value 
 
+        # Drain the program log queue first. This is the reliable channel for
+        # program output (print/vision/...): every message is delivered exactly
+        # once, independent of how fast the program runs or the 66 ms poll rate,
+        # so no lines are skipped.
+        drained_last = None
         if program_log_queue is not None:
-            while True:
+            for _ in range(100):  # bounded so the UI stays responsive
                 try:
-                    event = program_log_queue.get_nowait()
-                except queue.Empty:
-                    break
+                    entry = program_log_queue.get_nowait()
                 except Exception:
                     break
-                if isinstance(event, dict):
-                    message = str(event.get("message", ""))
-                    event_time = float(event.get("timestamp", time.time()))
+                if isinstance(entry, dict):
+                    message = str(entry.get("message", ""))
+                    stamp = entry.get("timestamp")
                 else:
-                    message = str(event)
-                    event_time = time.time()
+                    message = str(entry)
+                    stamp = None
                 if not message:
                     continue
-                time_string = datetime.fromtimestamp(event_time).strftime("%H:%M:%S")
+                try:
+                    time_string = datetime.fromtimestamp(stamp).strftime("%H:%M:%S") if stamp else datetime.now().strftime("%H:%M:%S")
+                except Exception:
+                    time_string = datetime.now().strftime("%H:%M:%S")
                 app.textbox_response.insert(tk.INSERT, time_string + "--" + message + "\n")
+                drained_last = message
+            if drained_last is not None:
                 app.textbox_response.see(tk.END)
-                prev_string_shared = message
 
-        shared_string_string = (shared_string.value).decode('utf-8')
-        if shared_string_string != prev_string_shared:
-            now = datetime.now()
-            time_string = now.strftime("%H:%M:%S")
+        shared_string_string = (shared_string.value).decode('UTF-8')
+        # Suppress the shared_string echo of a message already shown via the
+        # queue, otherwise program logs would appear twice.
+        if drained_last is not None and shared_string_string == drained_last:
             prev_string_shared = shared_string_string
-
+        elif shared_string_string != prev_string_shared:
+            prev_string_shared = shared_string_string
+            time_string = datetime.now().strftime("%H:%M:%S")
             app.textbox_response.insert(tk.INSERT,time_string + "--" + shared_string_string + "\n")
-            app.textbox_response.see(tk.END)
-        else: 
+        else:
             prev_string_shared = shared_string_string
+
+        # Keep the response log bounded. It is appended to forever otherwise,
+        # which makes the periodic highlight rescan and Tk redraw progressively
+        # slower (most noticeable once the window is fullscreen).
+        RESPONSE_LOG_MAX_LINES = 400
+        line_count = int(app.textbox_response.index("end-1c").split(".")[0])
+        if line_count > RESPONSE_LOG_MAX_LINES:
+            app.textbox_response.delete("1.0", f"{line_count - RESPONSE_LOG_MAX_LINES}.0")
 
         #app.textbox_response.insert(tk.INSERT,"tesT\n")
 
-        app.Input1.configure(app.IO_frame, text="INPUT 1: " + str(InOut_in[0]).rjust(7, ' '), font=customtkinter.CTkFont(size=text_size))
-        app.Input2.configure(app.IO_frame, text="INPUT 2: " + str(InOut_in[1]).rjust(7, ' '), font=customtkinter.CTkFont(size=text_size))
-        app.ESTOP_STATUS.configure(app.IO_frame, text="ESTOP: " + str(InOut_in[4]).rjust(7, ' '), font=customtkinter.CTkFont(size=text_size))
-        app.OUTPUT_1_LABEL.configure(app.IO_frame, text="OUTPUT 1 is: " + str(InOut_out[2]).rjust(7, ' '), font=customtkinter.CTkFont(size=text_size))
-        app.OUTPUT_2_LABEL.configure(app.IO_frame, text="OUTPUT 2 is: " + str(InOut_out[3]).rjust(7, ' '), font=customtkinter.CTkFont(size=text_size))
+        _set_text(app.Input1, "INPUT 1: " + str(InOut_in[0]).rjust(7, ' '))
+        _set_text(app.Input2, "INPUT 2: " + str(InOut_in[1]).rjust(7, ' '))
+        _set_text(app.ESTOP_STATUS, "ESTOP: " + str(InOut_in[4]).rjust(7, ' '))
+        _set_text(app.OUTPUT_1_LABEL, "OUTPUT 1 is: " + str(InOut_out[2]).rjust(7, ' '))
+        _set_text(app.OUTPUT_2_LABEL, "OUTPUT 2 is: " + str(InOut_out[3]).rjust(7, ' '))
         robot_connection_state = 0
         if len(General_data) > 3:
             robot_connection_state = General_data[3]
 
-        if robot_connection_state == 0:
-            app.estop_status.configure(text="\u25cf NOT CONNECTED", text_color=UI_DANGER, font=customtkinter.CTkFont(family='Inter', size=15, weight='bold'))
-        elif robot_connection_state == 1:
-            app.estop_status.configure(text="\u25cf CONNECTING", text_color=UI_WARN, font=customtkinter.CTkFont(family='Inter', size=15, weight='bold'))
-        elif( InOut_in[4] == 0):
-            app.estop_status.configure(text="\u25cf ESTOP ACTIVE", text_color=UI_DANGER, font=customtkinter.CTkFont(family='Inter', size=15, weight='bold'))
-        else:
-            app.estop_status.configure(text="\u25cf READY", text_color=UI_SUCCESS, font=customtkinter.CTkFont(family='Inter', size=15, weight='bold'))
+        # Only touch the connection banner when the state changes (it also swaps
+        # text colour, so it cannot use the plain _set_text helper).
+        if getattr(app, "_conn_state_cache", None) != robot_connection_state:
+            app._conn_state_cache = robot_connection_state
+            _conn_font = customtkinter.CTkFont(family='Inter', size=15, weight='bold')
+            if robot_connection_state == 0:
+                app.estop_status.configure(text="\u25cf NOT CONNECTED", text_color=UI_DANGER, font=_conn_font)
+            elif robot_connection_state == 1:
+                app.estop_status.configure(text="\u25cf CONNECTING", text_color=UI_WARN, font=_conn_font)
+            else:
+                app.estop_status.configure(text="\u25cf CONNECTED", text_color=UI_SUCCESS, font=_conn_font)
 
 
     
     # Tool positions
-    # Use ik to calculate 
+    # Use ik to calculate
 
-        # Array of current joint positions in radians
-        q1 = np.array([PAROL6_ROBOT.STEPS2RADS(Position_in[0],0),
-                       PAROL6_ROBOT.STEPS2RADS(Position_in[1],1),
-                       PAROL6_ROBOT.STEPS2RADS(Position_in[2],2),
-                       PAROL6_ROBOT.STEPS2RADS(Position_in[3],3),
-                       PAROL6_ROBOT.STEPS2RADS(Position_in[4],4),
-                       PAROL6_ROBOT.STEPS2RADS(Position_in[5],5),])
-        # Get SE3 matrix of current joint positions
-        T = PAROL6_ROBOT.robot.fkine(q1)
-        b = T.t # get translation component
-        #print(b*1000)
-        robot_pose[0] = b[0] * 1000 #  X in mm
-        robot_pose[1] = b[1] * 1000 #  Y in mm
-        robot_pose[2] = b[2] * 1000 #  Z in mm
+        # The forward kinematics (fkine) + rpy below is the single most expensive
+        # thing in this 15x/s loop. The joint readout only changes while the robot
+        # is actually moving, so skip the whole recompute + label redraw when the
+        # incoming joint positions are unchanged from the previous tick.
+        position_changed = any(Position_in[i] != prev_positions[i] for i in range(6))
+        if position_changed:
+            # Array of current joint positions in radians
+            q1 = np.array([PAROL6_ROBOT.STEPS2RADS(Position_in[0],0),
+                           PAROL6_ROBOT.STEPS2RADS(Position_in[1],1),
+                           PAROL6_ROBOT.STEPS2RADS(Position_in[2],2),
+                           PAROL6_ROBOT.STEPS2RADS(Position_in[3],3),
+                           PAROL6_ROBOT.STEPS2RADS(Position_in[4],4),
+                           PAROL6_ROBOT.STEPS2RADS(Position_in[5],5),])
+            # Get SE3 matrix of current joint positions
+            T = PAROL6_ROBOT.robot.fkine(q1)
+            b = T.t # get translation component
+            #print(b*1000)
+            robot_pose[0] = b[0] * 1000 #  X in mm
+            robot_pose[1] = b[1] * 1000 #  Y in mm
+            robot_pose[2] = b[2] * 1000 #  Z in mm
 
-        # - ``'xyz'``, rotate by yaw about the x-axis, then by pitch about the new y-axis,
-        # then by roll about the new z-axis. Convention for a robot gripper with z-axis forward
-        # and y-axis between the gripper fingers.
-        robot_pose[3:] = T.rpy('deg','xyz') # get rotation component
-  
-        x_value = str(round(robot_pose[0],3))
-        y_value = str(round(robot_pose[1],3))
-        z_value = str(round(robot_pose[2],3))
-        Rx_pos = str(round(robot_pose[3],3))
-        Ry_pos = str(round(robot_pose[4],3))
-        Rz_pos = str(round(robot_pose[5],3)) 
+            # - ``'xyz'``, rotate by yaw about the x-axis, then by pitch about the new y-axis,
+            # then by roll about the new z-axis. Convention for a robot gripper with z-axis forward
+            # and y-axis between the gripper fingers.
+            robot_pose[3:] = T.rpy('deg','xyz') # get rotation component
 
-        app.x_pos.configure(text="X: "+ x_value.rjust(7, ' '))	
-        app.y_pos.configure( text="Y: "+ y_value.rjust(7, ' '))	
-        app.z_pos.configure(text="Z: "+ z_value.rjust(7, ' '))	
-        app.Rx_pos.configure(text="Rx: "+ Rx_pos.rjust(7, ' '))	
-        app.Ry_pos.configure(text="Ry: "+ Ry_pos.rjust(7, ' '))	
-        app.Rz_pos.configure(text="Rz: "+ Rz_pos.rjust(7, ' '))	
+            x_value = str(round(robot_pose[0],3))
+            y_value = str(round(robot_pose[1],3))
+            z_value = str(round(robot_pose[2],3))
+            Rx_pos = str(round(robot_pose[3],3))
+            Ry_pos = str(round(robot_pose[4],3))
+            Rz_pos = str(round(robot_pose[5],3))
 
-    # Joint positions
+            _set_text(app.x_pos, "X: "+ x_value.rjust(7, ' '))
+            _set_text(app.y_pos, "Y: "+ y_value.rjust(7, ' '))
+            _set_text(app.z_pos, "Z: "+ z_value.rjust(7, ' '))
+            _set_text(app.Rx_pos, "Rx: "+ Rx_pos.rjust(7, ' '))
+            _set_text(app.Ry_pos, "Ry: "+ Ry_pos.rjust(7, ' '))
+            _set_text(app.Rz_pos, "Rz: "+ Rz_pos.rjust(7, ' '))
 
-        Joint1_value = str(round(PAROL6_ROBOT.STEPS2DEG(Position_in[0],0),3))
-        Joint2_value = str(round(PAROL6_ROBOT.STEPS2DEG(Position_in[1],1),3))
-        Joint3_value = str(round(PAROL6_ROBOT.STEPS2DEG(Position_in[2],2),3))
-        Joint4_value = str(round(PAROL6_ROBOT.STEPS2DEG(Position_in[3],3),3))
-        Joint5_value = str(round(PAROL6_ROBOT.STEPS2DEG(Position_in[4],4),3))
-        Joint6_value = str(round(PAROL6_ROBOT.STEPS2DEG(Position_in[5],5),3))
+            # Joint positions
+            Joint1_value = str(round(PAROL6_ROBOT.STEPS2DEG(Position_in[0],0),3))
+            Joint2_value = str(round(PAROL6_ROBOT.STEPS2DEG(Position_in[1],1),3))
+            Joint3_value = str(round(PAROL6_ROBOT.STEPS2DEG(Position_in[2],2),3))
+            Joint4_value = str(round(PAROL6_ROBOT.STEPS2DEG(Position_in[3],3),3))
+            Joint5_value = str(round(PAROL6_ROBOT.STEPS2DEG(Position_in[4],4),3))
+            Joint6_value = str(round(PAROL6_ROBOT.STEPS2DEG(Position_in[5],5),3))
 
+            _set_text(app.theta1, "θ1: " + Joint1_value.rjust(7, ' '))
+            _set_text(app.theta2, "θ2: " + Joint2_value.rjust(7, ' '))
+            _set_text(app.theta3, "θ3: " + Joint3_value.rjust(7, ' '))
+            _set_text(app.theta4, "θ4: " + Joint4_value.rjust(7, ' '))
+            _set_text(app.theta5, "θ5: " + Joint5_value.rjust(7, ' '))
+            _set_text(app.theta6, "θ6: " + Joint6_value.rjust(7, ' '))
 
-        app.theta1.configure(text="θ1: " + Joint1_value.rjust(7, ' '))
-        app.theta2.configure(text="θ2: " + Joint2_value.rjust(7, ' '))
-        app.theta3.configure(text="θ3: " + Joint3_value.rjust(7, ' '))
-        app.theta4.configure(text="θ4: " + Joint4_value.rjust(7, ' '))
-        app.theta5.configure(text="θ5: " + Joint5_value.rjust(7, ' '))
-        app.theta6.configure(text="θ6: " + Joint6_value.rjust(7, ' '))
-        
         prev_positions[0] = Position_in[0]
         prev_positions[1] = Position_in[1]
         prev_positions[2] = Position_in[2]
@@ -4014,59 +4862,58 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         #Jog_control[0] = v1
         #Jog_control[1] = v2
         #logging.debug(Jog_control)
-        app.Velocity_percent.configure(text= ""+ str(v1).rjust(4, ' ')+ "%")
-        app.Accel_percent.configure(text= "" + str(v2).rjust(4, ' ') + "%")
+        _set_text(app.Velocity_percent, ""+ str(v1).rjust(4, ' ')+ "%")
+        _set_text(app.Accel_percent, "" + str(v2).rjust(4, ' ') + "%")
 
         # Gripper stuff
         # Sliders
         gpos = app.grip_pos_slider.get()
         #Gripper_data_out[0] = int(gpos)
-        app.grip_pos_percent.configure(text= ""+ str(gpos))
+        _set_text(app.grip_pos_percent, ""+ str(gpos))
 
         gvel = app.grip_speed_slider.get()
         #Gripper_data_out[1] = int(gvel)
-        app.grip_speed_percent.configure(text= ""+ str(gvel))
-        
+        _set_text(app.grip_speed_percent, ""+ str(gvel))
+
         gcur = app.grip_current_slider.get()
         #Gripper_data_out[2] = int(gcur)
-        app.grip_current_percent.configure(text= "" + str(gcur).rjust(0, ' ') + " mA")
+        _set_text(app.grip_current_percent, "" + str(gcur).rjust(0, ' ') + " mA")
 
-        app.grip_feedback_pos.configure(text="Gripper position feedback is: " + str(round(Gripper_data_in[1],0)).rjust(7, ' '))
-        app.grip_feedback_current.configure(text="Gripper current feedback is: " + str(round(Gripper_data_in[3],0)).rjust(7, ' '))
-        app.grip_object_detection.configure(text="Gripper object detection is: " + str(round(Gripper_data_in[4],0)).rjust(7, ' '))
-       
+        _set_text(app.grip_feedback_pos, "Gripper position feedback is: " + str(round(Gripper_data_in[1],0)).rjust(7, ' '))
+        _set_text(app.grip_feedback_current, "Gripper current feedback is: " + str(round(Gripper_data_in[3],0)).rjust(7, ' '))
+        _set_text(app.grip_object_detection, "Gripper object detection is: " + str(round(Gripper_data_in[4],0)).rjust(7, ' '))
+
         #bitfield_list = [Gripper_activate_deactivate,Gripper_action_status,InOut_in[4],Gripper_rel_dir,0,0,0,0] #InOut_in[4] is estop
         bitfield_list = [Gripper_activate_deactivate,Gripper_action_status,not InOut_in[4],Gripper_rel_dir,0,0,0,0] #InOut_in[4] is estop
         fused = PAROL6_ROBOT.fuse_bitfield_2_bytearray(bitfield_list)
         Gripper_data_out[3] = int(fused.hex(),16)
 
-        Gripper_data_byte = PAROL6_ROBOT.split_2_bitfield(Gripper_data_in[4]) 
+        Gripper_data_byte = PAROL6_ROBOT.split_2_bitfield(Gripper_data_in[4])
         fused_number = (Gripper_data_byte[2] << 1) | Gripper_data_byte[3]
         if(fused_number == 0):
-            app.grip_object_detection.configure(text="Gripper in motion ")
+            _set_text(app.grip_object_detection, "Gripper in motion ")
         elif(fused_number == 1):
-            app.grip_object_detection.configure(text="Object detected when closing ")
+            _set_text(app.grip_object_detection, "Object detected when closing ")
         elif(fused_number == 2):
-            app.grip_object_detection.configure(text="Object detected when opening ")
+            _set_text(app.grip_object_detection, "Object detected when opening ")
         elif(fused_number == 3):
-            app.grip_object_detection.configure(text="Gripper is at position ")
+            _set_text(app.grip_object_detection, "Gripper is at position ")
 
-        app.grip_cal_status.configure(text="Calibration status is: " + str(Gripper_data_byte[7]).rjust(7, ' '))
-        app.Error_status_grip.configure(text="Error status is: " + str(Gripper_data_byte[6]).rjust(7, ' '))
-        app.Gripper_ID.configure(text="Gripper ID is: " + str(Gripper_data_out[5]))
+        _set_text(app.grip_cal_status, "Calibration status is: " + str(Gripper_data_byte[7]).rjust(7, ' '))
+        _set_text(app.Error_status_grip, "Error status is: " + str(Gripper_data_byte[6]).rjust(7, ' '))
+        _set_text(app.Gripper_ID, "Gripper ID is: " + str(Gripper_data_out[5]))
 
         highlight_words_response(None)
         highlight_words_program(None)
         _update_modbus_ui(read_state("modbus", {}))
         _update_research_ui(read_state("research", {}))
         # If tab is joint jog
-        # Update joint sliders
-        for y in range(0,6):
-            app.progress_bar_joints[y].set(np.interp(Position_in[y],[PAROL6_ROBOT.Joint_limits_steps[y][0],PAROL6_ROBOT.Joint_limits_steps[y][1]],[0.0,1.0]))
-            None
+        # Update joint sliders (only when the joints actually moved this tick)
+        if position_changed:
+            for y in range(0,6):
+                app.progress_bar_joints[y].set(np.interp(Position_in[y],[PAROL6_ROBOT.Joint_limits_steps[y][0],PAROL6_ROBOT.Joint_limits_steps[y][1]],[0.0,1.0]))
     
         app.after(66,Stuff_To_Update) # Update data every 66 ms ( 15 frames per second)
-
 
 
     #Stuff_To_Update(self)

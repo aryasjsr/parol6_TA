@@ -2,6 +2,11 @@
 
 from vision.camera_calibration import CalibrationData, CameraCalibrationManager
 from vision.object_detector import BaseDetector, DetectionBundle, DetectionResult, ObjectDetector
+from vision.pick_accuracy_validator import (
+	PickAccuracyReport,
+	PickAccuracyValidator,
+	PickTrial,
+)
 from vision.safe_pick_validator import SafePickValidator
 from vision.workspace_validator import WorkspaceValidator
 
@@ -12,6 +17,9 @@ __all__ = [
 	"DetectionBundle",
 	"DetectionResult",
 	"ObjectDetector",
+	"PickAccuracyReport",
+	"PickAccuracyValidator",
+	"PickTrial",
 	"SafePickValidator",
 	"WorkspaceValidator",
 ]
