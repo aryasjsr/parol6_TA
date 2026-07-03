@@ -220,7 +220,7 @@ UI_DANGER          = "#e53935"  # functional red — Stop/Emergency
 UI_WARN            = "#ffb800"  # functional amber — Reset/Standby
 
 class CollapsibleFrame(customtkinter.CTkFrame):
-    def __init__(self, parent, title, content_height=None, **kwargs):
+    def __init__(self, parent, title, content_height=None, start_collapsed=False, **kwargs):
         super().__init__(parent, corner_radius=8, border_width=1, border_color=UI_BORDER, fg_color=UI_SURFACE, **kwargs)
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
@@ -259,14 +259,18 @@ class CollapsibleFrame(customtkinter.CTkFrame):
         self.is_collapsed = False
         self.header_frame.bind("<Button-1>", lambda event: self.toggle())
         self.title_label.bind("<Button-1>", lambda event: self.toggle())
+        if start_collapsed:
+            self.toggle()
 
     def toggle(self):
         if self.is_collapsed:
+            self.rowconfigure(1, weight=1)
             self.content_frame.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 8))
             self.toggle_btn.configure(text="▼")
             self.is_collapsed = False
         else:
             self.content_frame.grid_forget()
+            self.rowconfigure(1, weight=0)
             self.toggle_btn.configure(text="▶")
             self.is_collapsed = True
 
@@ -1486,11 +1490,12 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         tests = customtkinter.CTkFrame(app.modbus_frame, corner_radius=0)
         tests.grid(row=2, column=0, columnspan=3, padx=12, pady=(0, 6), sticky="nsew")
         tests.grid_columnconfigure((0, 1), weight=1)
-        tests.grid_rowconfigure(0, weight=1)
+        tests.grid_rowconfigure(0, weight=0)
+        tests.grid_rowconfigure(1, weight=1)
 
         block_a_cfg = cfg.get("block_a", {})
-        block_a = CollapsibleFrame(tests, title="Blok A - Protocol Performance Test")
-        block_a.grid(row=0, column=0, padx=(0, 6), pady=0, sticky="nsew")
+        block_a = CollapsibleFrame(tests, title="Blok A - Protocol Performance Test", start_collapsed=True)
+        block_a.grid(row=0, column=0, columnspan=2, padx=0, pady=(0, 6), sticky="ew")
         block_a.content_frame.grid_columnconfigure((1, 3, 5, 7), weight=1)
         app.modbus_block_a_entries = {}
         for col, (label, key, default) in enumerate([
@@ -1543,7 +1548,7 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
 
         block_b_cfg = cfg.get("block_b", {})
         block_b = CollapsibleFrame(tests, title="Blok B - Cycle Time Test")
-        block_b.grid(row=0, column=1, padx=(6, 0), pady=0, sticky="nsew")
+        block_b.grid(row=1, column=0, columnspan=2, padx=0, pady=0, sticky="nsew")
         block_b.content_frame.grid_columnconfigure((1, 3, 5, 7), weight=1)
         app.modbus_block_b_entries = {}
         for col, (label, key, default) in enumerate([
@@ -1581,6 +1586,8 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         block_b_log_scroll.grid(row=0, column=1, sticky="ns")
         app.modbus_block_b_log_tree.configure(yscrollcommand=block_b_log_scroll.set)
         customtkinter.CTkButton(block_b.content_frame, text="Export XLSX", width=110, command=export_modbus_block_b_xlsx).grid(row=6, column=0, columnspan=2, padx=5, pady=(2, 6), sticky="we")
+        customtkinter.CTkButton(block_b.content_frame, text="Export Cycle Log", width=130, command=export_modbus_cycle_log_xlsx).grid(row=6, column=2, columnspan=2, padx=5, pady=(2, 6), sticky="we")
+        customtkinter.CTkButton(block_b.content_frame, text="Clear Cycle Log", width=120, command=clear_modbus_cycle_log).grid(row=6, column=4, columnspan=2, padx=5, pady=(2, 6), sticky="we")
 
         # Draggable horizontal divider handle
         app.modbus_h_handle = customtkinter.CTkFrame(app.modbus_frame, height=7, corner_radius=3, fg_color=UI_HANDLE, cursor="sb_v_double_arrow")
@@ -2741,6 +2748,24 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         except Exception:
             return ""
 
+    def _modbus_trigger_packet_meta(modbus_state):
+        state = modbus_state if isinstance(modbus_state, dict) else {}
+        description = str(state.get("description", ""))
+        connected = bool(state.get("connected", False))
+        if description.upper() == "MOCK":
+            packet_status = "OK"
+        elif "timeout" in description.lower():
+            packet_status = "Timeout"
+        elif not connected:
+            packet_status = "Loss"
+        else:
+            packet_status = "OK"
+        try:
+            response_time_ms = round(float(state.get("cycle_ms", 0.0)), 3)
+        except Exception:
+            response_time_ms = 0.0
+        return response_time_ms, packet_status
+
     def _write_modbus_samples_workbook(path, samples, sheet_title, columns, headings, meta):
         ext = os.path.splitext(path)[1].lower()
         iso_columns = {"timestamp"}
@@ -2857,6 +2882,44 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
             return
         research_logger.record("modbus_block_b_export", 1, str(exported))
         messagebox.showinfo("Export Blok B", f"Berhasil disimpan ke:\n{exported}")
+
+    def export_modbus_cycle_log_xlsx():
+        rows = modbus_manager.get_modbus_cycle_log()
+        if not rows:
+            messagebox.showwarning("Export Cycle Log", "Belum ada data cycle log. Jalankan Blok B terlebih dahulu.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            initialfile=f"modbus_cycle_log_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
+            filetypes=(("Excel", "*.xlsx"), ("CSV", "*.csv")),
+        )
+        if not path:
+            return
+        try:
+            exported = modbus_manager.export_modbus_cycle_log(path)
+        except Exception as exc:
+            messagebox.showerror("Export Cycle Log", f"Gagal export: {exc}")
+            return
+        research_logger.record("modbus_cycle_log_export", len(rows), str(exported))
+        messagebox.showinfo("Export Cycle Log", f"Berhasil disimpan ke:\n{exported}")
+
+    def clear_modbus_cycle_log():
+        rows = modbus_manager.get_modbus_cycle_log()
+        if not rows:
+            messagebox.showinfo("Clear Cycle Log", "Cycle log sudah kosong.")
+            return
+        confirmed = messagebox.askyesno(
+            "Clear Cycle Log",
+            "Hapus data runtime Modbus Cycle Log?\n\nFile CSV/XLSX yang sudah diexport tidak akan dihapus.",
+        )
+        if not confirmed:
+            research_logger.record("modbus_cycle_log_clear_cancelled", 1)
+            return
+        if not modbus_manager.clear_modbus_cycle_log():
+            messagebox.showwarning("Clear Cycle Log", "Stop Blok B terlebih dahulu sebelum clear cycle log.")
+            return
+        shared_string.value = b'Log: Modbus cycle log cleared'
+        research_logger.record("modbus_cycle_log_ui_clear", 1)
 
     def set_research_enabled(enabled):
         research_logger.set_enabled(enabled)
@@ -3131,7 +3194,8 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
                 tree.yview_moveto(1.0)
             app._modbus_block_a_log_rendered = len(samples)
 
-    def _handle_modbus_block_b(snapshot):
+    def _handle_modbus_block_b(modbus_state):
+        snapshot = modbus_state.get("snapshot", {}) if isinstance(modbus_state, dict) else {}
         state = read_state("modbus_block_b", {})
         if not isinstance(state, dict) or not state.get("running"):
             return False
@@ -3143,7 +3207,8 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         app._last_modbus_block_b_trigger = trigger
 
         if rising and not state.get("active_cycle") and Buttons[7] == 0:
-            if modbus_manager.block_b_cycle_started():
+            response_time_ms, packet_status = _modbus_trigger_packet_meta(modbus_state)
+            if modbus_manager.block_b_cycle_started(response_time_ms, packet_status):
                 app._modbus_block_b_cycle_active = True
                 execute_program()
                 return True
@@ -3205,7 +3270,7 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         app.modbus_status.configure(text="Status: " + str(modbus_state.get("description", "Disconnected")))
         _set_tree_rows(app.modbus_monitor_table, [(key, value) for key, value in snapshot.items()])
         _update_modbus_block_a_ui()
-        block_b_running = _handle_modbus_block_b(snapshot)
+        block_b_running = _handle_modbus_block_b(modbus_state)
         _update_modbus_block_b_ui()
         trigger = bool(snapshot.get("trigger_pick", False))
         if not hasattr(app, "_last_modbus_trigger"):

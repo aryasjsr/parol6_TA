@@ -24,6 +24,22 @@ CONFIG_PATH = PROJECT_ROOT / "config.json"
 STATE_PATH = PROJECT_ROOT / "runtime_state.json"
 LOG_DIR = PROJECT_ROOT / "logs"
 TIMESTAMP_TABLE_FIELDS = ["time", "event", "label", "elapsed_s", "duration_s"]
+MODBUS_CYCLE_LOG_COLUMNS = [
+    "cycle_index",
+    "timestamp",
+    "response_time_ms",
+    "packet_status",
+    "cycle_time_s",
+    "outcome",
+]
+MODBUS_CYCLE_LOG_HEADINGS = {
+    "cycle_index": "No. Siklus",
+    "timestamp": "Timestamp",
+    "response_time_ms": "Response Time (ms)",
+    "packet_status": "Packet Status",
+    "cycle_time_s": "Cycle Time (s)",
+    "outcome": "Outcome",
+}
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -664,9 +680,12 @@ class ModbusManager:
         self._block_b_full_samples: list[dict[str, Any]] = []
         self._block_a_full_meta: dict[str, Any] = {}
         self._block_b_full_meta: dict[str, Any] = {}
+        self._modbus_cycle_log: list[dict[str, Any]] = []
+        self._modbus_cycle_meta: dict[str, Any] = {}
         self._block_b_state = self._new_block_b_state(load_config()["modbus"].get("block_b", {}))
         update_state("modbus_block_a", self._new_block_a_state(load_config()["modbus"].get("block_a", {})))
         update_state("modbus_block_b", dict(self._block_b_state))
+        update_state("modbus_cycle_log", self._cycle_log_payload_unlocked())
 
     def config(self) -> dict[str, Any]:
         return load_config()["modbus"]
@@ -728,13 +747,17 @@ class ModbusManager:
             self._block_b_state = self._new_block_b_state(settings)
             self._block_b_state["running"] = True
             self._block_b_state["started_at"] = time.time()
+            self._block_b_state["cycle_log_count"] = 0
+            self._block_b_full_samples.clear()
+            self._modbus_cycle_log.clear()
+            self._modbus_cycle_meta = {
+                "started_at": self._block_b_state["started_at"],
+                "settings": dict(settings),
+                "target": int(self._block_b_state["target"]),
+            }
             update_state("modbus_block_b", dict(self._block_b_state))
-        self._block_b_full_samples.clear()
-        self._block_b_full_meta = {
-            "started_at": self._block_b_state["started_at"],
-            "settings": dict(settings),
-            "target": int(self._block_b_state["target"]),
-        }
+            update_state("modbus_cycle_log", self._cycle_log_payload_unlocked())
+            self._block_b_full_meta = dict(self._modbus_cycle_meta)
         research_logger.record("modbus_block_b_test_start", int(self._block_b_state["target"]), "cycle time test")
 
     def stop_block_b(self) -> None:
@@ -749,9 +772,15 @@ class ModbusManager:
                 "stats": dict(self._block_b_state.get("stats", {})),
                 "stopped_early": int(self._block_b_state.get("completed", 0)) < int(self._block_b_state.get("target", 0)),
             })
+            self._modbus_cycle_meta.update({
+                "finished_at": time.time(),
+                "completed": int(self._block_b_state.get("completed", 0)),
+                "stopped_early": int(self._block_b_state.get("completed", 0)) < int(self._block_b_state.get("target", 0)),
+            })
+            update_state("modbus_cycle_log", self._cycle_log_payload_unlocked())
         research_logger.record("modbus_block_b_test_stop", int(self._block_b_state.get("completed", 0)))
 
-    def block_b_cycle_started(self) -> bool:
+    def block_b_cycle_started(self, response_time_ms: int | float | None = None, packet_status: str = "OK") -> bool:
         with self._block_b_lock:
             if not self._block_b_state.get("running") or self._block_b_state.get("active_cycle"):
                 return False
@@ -765,8 +794,21 @@ class ModbusManager:
             self._block_b_state["active_index"] = next_index
             self._block_b_state["cycle_start_epoch"] = now
             self._block_b_state["latest"] = {"index": next_index, "status": "started", "timestamp": now}
+            if response_time_ms is None:
+                response_time_ms = self._last_cycle_ms
+            cycle_row = {
+                "cycle_index": next_index,
+                "timestamp": now,
+                "response_time_ms": _round_float(response_time_ms, 3, 0.0),
+                "packet_status": _normalize_packet_status(packet_status),
+                "cycle_time_s": "",
+                "outcome": "",
+            }
+            self._modbus_cycle_log.append(cycle_row)
+            self._block_b_state["cycle_log_count"] = len(self._modbus_cycle_log)
             self._block_b_state["updated_at"] = now
             update_state("modbus_block_b", dict(self._block_b_state))
+            update_state("modbus_cycle_log", self._cycle_log_payload_unlocked())
         research_logger.record("modbus_block_b_cycle_start", next_index)
         return True
 
@@ -779,6 +821,7 @@ class ModbusManager:
             now = time.time()
             start_epoch = float(self._block_b_state.get("cycle_start_epoch") or now)
             duration = max(0.0, now - start_epoch)
+            active_index = int(self._block_b_state.get("active_index", self._block_b_state.get("completed", 0) + 1))
             samples = list(self._block_b_state.get("samples", []))
             if success:
                 samples.append(round(duration, 6))
@@ -788,14 +831,32 @@ class ModbusManager:
             self._block_b_state["completed"] = int(self._block_b_state.get("completed", 0)) + 1
             self._block_b_state["samples"] = samples[-300:]
             self._block_b_full_samples.append({
-                "index": int(self._block_b_state.get("active_index", self._block_b_state["completed"])),
+                "index": active_index,
                 "timestamp": now,
                 "status": "success" if success else "failed",
                 "duration_s": round(duration, 6),
                 "note": note,
             })
+            cycle_row = None
+            for row in reversed(self._modbus_cycle_log):
+                if int(row.get("cycle_index", 0) or 0) == active_index:
+                    cycle_row = row
+                    break
+            if cycle_row is None:
+                cycle_row = {
+                    "cycle_index": active_index,
+                    "timestamp": start_epoch,
+                    "response_time_ms": _round_float(self._last_cycle_ms, 3, 0.0),
+                    "packet_status": "OK",
+                    "cycle_time_s": "",
+                    "outcome": "",
+                }
+                self._modbus_cycle_log.append(cycle_row)
+            cycle_row["cycle_time_s"] = round(duration, 6)
+            cycle_row["outcome"] = "Sukses" if success else "Gagal"
             stats = _cycle_stats(samples)
             self._block_b_state["stats"] = stats
+            self._block_b_state["cycle_log_count"] = len(self._modbus_cycle_log)
             self._block_b_state["latest"] = {
                 "index": self._block_b_state.get("completed", 0),
                 "status": "success" if success else "failed",
@@ -812,9 +873,15 @@ class ModbusManager:
                     "stats": dict(self._block_b_state.get("stats", {})),
                     "stopped_early": False,
                 })
+                self._modbus_cycle_meta.update({
+                    "finished_at": now,
+                    "completed": int(self._block_b_state.get("completed", 0)),
+                    "stopped_early": False,
+                })
             self._block_b_state["updated_at"] = now
             payload = dict(self._block_b_state)
             update_state("modbus_block_b", payload)
+            update_state("modbus_cycle_log", self._cycle_log_payload_unlocked())
 
         try:
             self.write_value(done_name, bool(success))
@@ -873,9 +940,17 @@ class ModbusManager:
         slave_id = int(cfg.get("slave_id", 1))
         register_type = entry.type.lower()
         if register_type == "coil":
-            result = self._client.write_coil(address=entry.address, value=_coerce_bool(value), slave=slave_id)
+            result = _call_modbus(
+                self._client.write_coil,
+                {"address": entry.address, "value": _coerce_bool(value)},
+                slave_id,
+            )
         elif register_type in {"holding_register", "register"}:
-            result = self._client.write_register(address=entry.address, value=int(value), slave=slave_id)
+            result = _call_modbus(
+                self._client.write_register,
+                {"address": entry.address, "value": int(value)},
+                slave_id,
+            )
         else:
             raise ValueError(f"Address '{entry.name}' is not writable as type {entry.type}")
         ok = not bool(getattr(result, "isError", lambda: False)())
@@ -1113,22 +1188,22 @@ class ModbusManager:
         for entry in self._addresses():
             register_type = entry.type.lower()
             if register_type == "coil":
-                result = self._client.read_coils(address=entry.address, count=1, slave=slave_id)
+                result = _call_modbus(self._client.read_coils, {"address": entry.address, "count": 1}, slave_id)
                 if result.isError():
                     raise RuntimeError(f"Read failed for {entry.name}")
                 snapshot[entry.name] = bool(result.bits[0])
             elif register_type == "discrete_input":
-                result = self._client.read_discrete_inputs(address=entry.address, count=1, slave=slave_id)
+                result = _call_modbus(self._client.read_discrete_inputs, {"address": entry.address, "count": 1}, slave_id)
                 if result.isError():
                     raise RuntimeError(f"Read failed for {entry.name}")
                 snapshot[entry.name] = bool(result.bits[0])
             elif register_type in {"holding_register", "register"}:
-                result = self._client.read_holding_registers(address=entry.address, count=1, slave=slave_id)
+                result = _call_modbus(self._client.read_holding_registers, {"address": entry.address, "count": 1}, slave_id)
                 if result.isError():
                     raise RuntimeError(f"Read failed for {entry.name}")
                 snapshot[entry.name] = int(result.registers[0])
             elif register_type == "input_register":
-                result = self._client.read_input_registers(address=entry.address, count=1, slave=slave_id)
+                result = _call_modbus(self._client.read_input_registers, {"address": entry.address, "count": 1}, slave_id)
                 if result.isError():
                     raise RuntimeError(f"Read failed for {entry.name}")
                 snapshot[entry.name] = int(result.registers[0])
@@ -1216,6 +1291,83 @@ class ModbusManager:
         with self._block_b_lock:
             return dict(self._block_b_full_meta)
 
+    def get_modbus_cycle_log(self) -> list[dict[str, Any]]:
+        with self._block_b_lock:
+            return [dict(row) for row in self._modbus_cycle_log]
+
+    def clear_modbus_cycle_log(self, force: bool = False) -> bool:
+        with self._block_b_lock:
+            if not force and (self._block_b_state.get("running") or self._block_b_state.get("active_cycle")):
+                return False
+            self._modbus_cycle_log.clear()
+            self._modbus_cycle_meta = {}
+            self._block_b_state["cycle_log_count"] = 0
+            update_state("modbus_block_b", dict(self._block_b_state))
+            update_state("modbus_cycle_log", self._cycle_log_payload_unlocked())
+        research_logger.record("modbus_cycle_log_clear", 1)
+        return True
+
+    def export_modbus_cycle_log(self, destination: str | Path) -> Path:
+        destination_path = Path(destination)
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._block_b_lock:
+            rows = [dict(row) for row in self._modbus_cycle_log]
+        if destination_path.suffix.lower() == ".csv":
+            with destination_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow([MODBUS_CYCLE_LOG_HEADINGS[column] for column in MODBUS_CYCLE_LOG_COLUMNS])
+                for row in rows:
+                    writer.writerow(_modbus_cycle_log_export_row(row))
+            return destination_path
+
+        try:
+            from openpyxl import Workbook
+        except Exception as exc:
+            raise RuntimeError("openpyxl is required for Excel export") from exc
+
+        workbook = Workbook()
+        raw_sheet = workbook.active
+        raw_sheet.title = "Tabel 1 - Log Mentah"
+        raw_sheet.append([MODBUS_CYCLE_LOG_HEADINGS[column] for column in MODBUS_CYCLE_LOG_COLUMNS])
+        for row in rows:
+            raw_sheet.append(_modbus_cycle_log_export_row(row))
+
+        summary = _modbus_cycle_log_stats(rows, self.config().get("poll_interval_ms", 100))
+        protocol_sheet = workbook.create_sheet("Tabel 2 - Protokol")
+        protocol_sheet.append(["Metrik", "Nilai"])
+        for metric, value in [
+            ("Avg Response Time", f"{summary['avg_rt_ms']} ms"),
+            ("Min Response Time", f"{summary['min_rt_ms']} ms"),
+            ("Max Response Time", f"{summary['max_rt_ms']} ms"),
+            ("Throughput", f"{summary['throughput_rps']} req/s"),
+            ("Packet Loss Rate", f"{summary['packet_loss_pct']} %"),
+            ("Target Poll Interval", f"{summary['target_poll_interval_ms']} ms"),
+            ("Status vs Target", summary["status_vs_target"]),
+        ]:
+            protocol_sheet.append([metric, value])
+
+        cycle_sheet = workbook.create_sheet("Tabel 3 - Cycle Time")
+        cycle_sheet.append(["Metrik", "Nilai"])
+        for metric, value in [
+            ("Avg Cycle Time", f"{summary['avg_cycle_time_s']} s"),
+            ("Std Cycle Time", f"{summary['std_cycle_time_s']} s"),
+            ("Min Cycle Time", f"{summary['min_cycle_time_s']} s"),
+            ("Max Cycle Time", f"{summary['max_cycle_time_s']} s"),
+            ("Jumlah Data", summary["cycle_time_count"]),
+        ]:
+            cycle_sheet.append([metric, value])
+
+        workbook.save(destination_path)
+        return destination_path
+
+    def _cycle_log_payload_unlocked(self) -> dict[str, Any]:
+        return {
+            "rows": [dict(row) for row in self._modbus_cycle_log[-300:]],
+            "count": len(self._modbus_cycle_log),
+            "stats": _modbus_cycle_log_stats(self._modbus_cycle_log, self.config().get("poll_interval_ms", 100)),
+            "updated_at": time.time(),
+        }
+
 
 def _protocol_stats(
     completed: int,
@@ -1248,14 +1400,103 @@ def _cycle_stats(samples: list[float]) -> dict[str, Any]:
     }
 
 
-def _call_modbus(method: Any, kwargs: dict[str, Any], slave_id: int) -> Any:
+def _round_float(value: Any, digits: int, default: float = 0.0) -> float:
     try:
-        return method(**kwargs, slave=slave_id)
-    except TypeError:
+        return round(float(value), digits)
+    except Exception:
+        return round(float(default), digits)
+
+
+def _number_or_none(value: Any) -> float | None:
+    if value in ("", None):
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _normalize_packet_status(value: Any) -> str:
+    text = str(value or "OK").strip().lower()
+    if "timeout" in text:
+        return "Timeout"
+    if text in {"loss", "lost", "failed", "fail", "error", "disconnected"}:
+        return "Loss"
+    return "OK"
+
+
+def _format_epoch_iso(value: Any) -> str:
+    try:
+        return datetime.fromtimestamp(float(value)).isoformat(timespec="milliseconds")
+    except Exception:
+        return str(value or "")
+
+
+def _modbus_cycle_log_export_row(row: dict[str, Any]) -> list[Any]:
+    values: list[Any] = []
+    for column in MODBUS_CYCLE_LOG_COLUMNS:
+        value = row.get(column, "")
+        if column == "timestamp" and value not in ("", None):
+            value = _format_epoch_iso(value)
+        values.append(value)
+    return values
+
+
+def _modbus_cycle_log_stats(rows: list[dict[str, Any]], target_poll_interval_ms: Any = 100) -> dict[str, Any]:
+    response_times = [
+        value for value in (_number_or_none(row.get("response_time_ms")) for row in rows) if value is not None
+    ]
+    cycle_times = [
+        value for value in (_number_or_none(row.get("cycle_time_s")) for row in rows) if value is not None
+    ]
+    timestamps = [
+        value for value in (_number_or_none(row.get("timestamp")) for row in rows) if value is not None
+    ]
+    total = len(rows)
+    loss_count = sum(1 for row in rows if _normalize_packet_status(row.get("packet_status")) in {"Loss", "Timeout"})
+    if len(timestamps) >= 2:
+        elapsed_s = max(max(timestamps) - min(timestamps), 1e-9)
+        throughput = total / elapsed_s
+    else:
+        throughput = 0.0
+    avg_rt = sum(response_times) / len(response_times) if response_times else 0.0
+    min_rt = min(response_times) if response_times else 0.0
+    max_rt = max(response_times) if response_times else 0.0
+    avg_cycle = sum(cycle_times) / len(cycle_times) if cycle_times else 0.0
+    target_poll = _round_float(target_poll_interval_ms, 3, 100.0)
+    packet_loss_pct = loss_count / max(total, 1) * 100.0 if total else 0.0
+    status_vs_target = "Aman" if total and max_rt <= target_poll and packet_loss_pct == 0.0 else "Tidak Aman"
+    if not total:
+        status_vs_target = "-"
+    return {
+        "avg_rt_ms": round(avg_rt, 3),
+        "min_rt_ms": round(min_rt, 3),
+        "max_rt_ms": round(max_rt, 3),
+        "throughput_rps": round(throughput, 3),
+        "packet_loss_pct": round(packet_loss_pct, 3),
+        "target_poll_interval_ms": round(target_poll, 3),
+        "status_vs_target": status_vs_target,
+        "avg_cycle_time_s": round(avg_cycle, 6),
+        "std_cycle_time_s": round(statistics.pstdev(cycle_times), 6) if len(cycle_times) > 1 else 0.0,
+        "min_cycle_time_s": round(min(cycle_times), 6) if cycle_times else 0.0,
+        "max_cycle_time_s": round(max(cycle_times), 6) if cycle_times else 0.0,
+        "cycle_time_count": len(cycle_times),
+    }
+
+
+def _call_modbus(method: Any, kwargs: dict[str, Any], slave_id: int) -> Any:
+    for device_keyword in ("slave", "unit", "device_id"):
         try:
-            return method(**kwargs, unit=slave_id)
-        except TypeError:
-            return method(**kwargs)
+            return method(**kwargs, **{device_keyword: slave_id})
+        except TypeError as exc:
+            if not _is_unexpected_modbus_keyword(exc, device_keyword):
+                raise
+    return method(**kwargs)
+
+
+def _is_unexpected_modbus_keyword(exc: TypeError, keyword: str) -> bool:
+    message = str(exc).lower()
+    return keyword.lower() in message and "unexpected keyword" in message
 
 
 def _mock_value_for_type(register_type: str, value: Any) -> Any:
