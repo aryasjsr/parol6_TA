@@ -56,11 +56,11 @@ else:
     
 logging.debug(Image_path)
 
-text_size = 14
-PROGRAM_TEXT_FONT_SIZE = 24
-LOG_TEXT_FONT_SIZE = 24
+text_size = 13
+PROGRAM_TEXT_FONT_SIZE = 16
+LOG_TEXT_FONT_SIZE = 16
 COMMAND_TREE_FONT_SIZE = 11
-COMMAND_HELP_FONT_SIZE = 14
+COMMAND_HELP_FONT_SIZE = 13
 
 # Globals
 current_menu = "Jog"
@@ -109,8 +109,8 @@ def _set_text(widget, text):
 customtkinter.set_appearance_mode("Dark")  # Industrial Precision HMI — dark variant
 customtkinter.set_default_color_theme("blue")  # Themes: "blue" (standard), "green", "dark-blue"
 
-# --- Unified Modern Typography System ---
-FONT_FAMILY_MAIN = "Segoe UI" if my_os == "Windows" else "Helvetica"
+# --- Unified Modern Typography System — Montserrat ---
+FONT_FAMILY_MAIN = "Montserrat"
 FONT_FAMILY_MONO = "Consolas" if my_os == "Windows" else "monospace"
 _fonts_resolved = False
 
@@ -123,8 +123,8 @@ def _lazy_resolve_fonts():
     try:
         import tkinter.font as tkfont
         available = [f.lower() for f in tkfont.families()]
-        # Best available sans-serif fonts
-        for sans in ["inter", "segoe ui", "ubuntu", "liberation sans", "dejavu sans", "helvetica", "arial"]:
+        # Montserrat is the primary font — fall back gracefully if not installed
+        for sans in ["montserrat", "inter", "segoe ui", "ubuntu", "liberation sans", "dejavu sans", "helvetica", "arial"]:
             if sans in available:
                 idx = available.index(sans)
                 FONT_FAMILY_MAIN = list(tkfont.families())[idx]
@@ -140,35 +140,49 @@ def _lazy_resolve_fonts():
 
 _orig_CTkFont = customtkinter.CTkFont
 
+# --- Clean Font Size Scale ---
+# Defines a clear typographic hierarchy for professional UI readability.
+#   Display/Title : 18px  (section headings, hero labels)
+#   Heading       : 15px  (panel titles, group headers)
+#   Subheading    : 13px  (button labels, prominent UI text)
+#   Body          : 12px  (default body text)
+#   Caption       : 11px  (helper text, status labels)
+#   Small         : 10px  (footnotes, micro-labels)
+
 class UnifiedCTkFont(_orig_CTkFont):
     def __init__(self, family=None, size=None, weight=None, slant=None, underline=None, overstrike=None):
         # Lazily resolve system fonts on first use (Tk root already exists at this point)
         _lazy_resolve_fonts()
 
-        # 1. Map requested font families to modern, high-quality, OS-adapted defaults
+        # 1. Map requested font families → Montserrat (main) or monospace
         if family is None or family == 'TkDefaultFont' or family == 'Segoe UI Symbol':
             family_mapped = FONT_FAMILY_MAIN
         elif family in ('JetBrains Mono', 'monospace', 'Consolas', 'Liberation Mono', 'DejaVu Sans Mono', 'Courier New'):
             family_mapped = FONT_FAMILY_MONO
+        elif family in ('Inter', 'Segoe UI', 'Helvetica', 'Arial', 'Ubuntu'):
+            # Redirect legacy font requests to Montserrat
+            family_mapped = FONT_FAMILY_MAIN
         else:
             family_mapped = family
 
-        # 2. Rescale font sizes proportionally (integers only for Tcl compatibility)
+        # 2. Rescale font sizes to a clean, professional hierarchy
         if size is not None:
             if size >= 24:
-                size_mapped = 18
+                size_mapped = 18   # Display
             elif size >= 18:
-                size_mapped = 15
+                size_mapped = 15   # Heading
+            elif size >= 15:
+                size_mapped = 13   # Subheading
             elif size >= 14:
-                size_mapped = 12
+                size_mapped = 12   # Body
             elif size >= 12:
-                size_mapped = 10
+                size_mapped = 11   # Caption
             elif size >= 10:
-                size_mapped = 9
+                size_mapped = 10   # Small
             else:
                 size_mapped = int(size)
         else:
-            size_mapped = 11  # Clean default body size
+            size_mapped = 12  # Default body size
 
         kwargs = {}
         if family_mapped is not None:
@@ -197,27 +211,26 @@ left_frames_width = 430
 right_frames_width = 300
 bottom_frame_height = 96
 
-# === Industrial Precision HMI palette — DARK variant (see AGENTS/DESIGN.md) ===
-# Same design language as the light spec, remapped to a low-glare night palette
-# for long shifts. Vibrant HMI blue, functional safety semantics, Polman gold
-# branding — on slate-graphite surfaces with brushed-aluminum bezel borders.
-UI_APP_BG          = "#0e1218"  # outer chrome / app background — deepest slate
-UI_SURFACE         = "#1a202a"  # main panel face — graphite
-UI_SURFACE_ALT     = "#222a36"  # recessed/header strips
-UI_SURFACE_LOW     = "#171c25"  # subtle alt panels / LCD-readout bg
-UI_SURFACE_HIGH    = "#2a3340"  # deeper recesses / data wells
-UI_BORDER          = "#3a4254"  # silver bezel borders
-UI_OUTLINE         = "#5c6378"  # stronger separators
-UI_HANDLE          = "#3e4f63"  # drag handles
-UI_ACCENT          = "#2e5bff"  # vibrant HMI blue
-UI_ACCENT_DEEP     = "#4d75ff"  # pressed / hover (brighter on dark)
-UI_ACCENT_SOFT     = "#1d2a4a"  # soft accent fill (dark tint)
-UI_GOLD            = "#e5c363"  # Polman gold — brand highlights (lifted for dark)
-UI_ON_SURFACE      = "#eaf2f9"  # primary text on dark surfaces
-UI_ON_SURFACE_MUTE = "#a4adbf"  # inactive / hint text
-UI_SUCCESS         = "#28c800"  # functional green — Start/Run
-UI_DANGER          = "#e53935"  # functional red — Stop/Emergency
-UI_WARN            = "#ffb800"  # functional amber — Reset/Standby
+# === Elegant Black Professional palette ===
+# Pure black foundation with subtle warm-neutral surfaces. Refined, premium feel
+# with restrained accent colors. Gold branding, crisp white typography.
+UI_APP_BG          = "#000000"  # pure black — app background
+UI_SURFACE         = "#0a0a0a"  # near-black panel face
+UI_SURFACE_ALT     = "#111111"  # slightly lifted — header strips
+UI_SURFACE_LOW     = "#080808"  # deepest recessed panels
+UI_SURFACE_HIGH    = "#1a1a1a"  # elevated surfaces / data wells
+UI_BORDER          = "#1f1f1f"  # subtle borders — low contrast
+UI_OUTLINE         = "#2a2a2a"  # stronger separators
+UI_HANDLE          = "#252525"  # drag handles
+UI_ACCENT          = "#3366ff"  # refined blue accent
+UI_ACCENT_DEEP     = "#5588ff"  # hover / pressed state
+UI_ACCENT_SOFT     = "#0d1a33"  # subtle accent tint
+UI_GOLD            = "#d4a843"  # refined Polman gold — muted elegance
+UI_ON_SURFACE      = "#f0f0f0"  # crisp white text
+UI_ON_SURFACE_MUTE = "#808080"  # muted secondary text
+UI_SUCCESS         = "#2ecc71"  # refined green — Start/Run
+UI_DANGER          = "#e74c3c"  # refined red — Stop/Emergency
+UI_WARN            = "#f39c12"  # refined amber — Reset/Standby
 
 class CollapsibleFrame(customtkinter.CTkFrame):
     def __init__(self, parent, title, content_height=None, start_collapsed=False, **kwargs):
@@ -308,9 +321,9 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
             if btn is None:
                 continue
             if active_name in active_for:
-                btn.configure(fg_color=UI_ACCENT, hover_color=UI_ACCENT_DEEP, text_color="#ffffff", font=customtkinter.CTkFont(family="Segoe UI Symbol", size=15, weight="bold"))
+                btn.configure(fg_color=UI_ACCENT, hover_color=UI_ACCENT_DEEP, text_color="#ffffff", font=customtkinter.CTkFont(size=13, weight="bold"))
             else:
-                btn.configure(fg_color="transparent", hover_color=UI_ACCENT_SOFT, text_color=UI_ON_SURFACE_MUTE, font=customtkinter.CTkFont(family="Segoe UI Symbol", size=15, weight="normal"))
+                btn.configure(fg_color="transparent", hover_color=UI_ACCENT_SOFT, text_color=UI_ON_SURFACE_MUTE, font=customtkinter.CTkFont(size=13, weight="normal"))
 
     #logging.debug(left_jog_buttons)
     #logging.debug(Joint_jog_buttons)
@@ -370,36 +383,47 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         # frames for top panel mode selection section
         app.menu_select_frame = customtkinter.CTkFrame(app,height = 0,width=150, corner_radius=8, fg_color=UI_SURFACE, border_width=1, border_color=UI_BORDER)
         app.menu_select_frame.grid(row=0, column=0, columnspan=4, padx=(5,5), pady=5,sticky="new")
-        app.menu_select_frame.grid_columnconfigure(0, weight=0)
+        app.menu_select_frame.grid_columnconfigure(0, weight=0)  # logo
+        app.menu_select_frame.grid_columnconfigure(6, weight=1)  # spacer pushes fw_label + help right
         app.menu_select_frame.grid_rowconfigure(0, weight=0)
 
+        # --- Polman Logo (left side of header bar) ---
+        try:
+            _logo_img = Image.open(os.path.join(Image_path, "logo_polman_icon.png"))
+            app._header_logo_ctk = customtkinter.CTkImage(_logo_img, size=(32, 32))
+            app._header_logo_label = customtkinter.CTkLabel(
+                app.menu_select_frame, image=app._header_logo_ctk, text="",
+                fg_color="transparent"
+            )
+            app._header_logo_label.grid(row=0, column=0, padx=(12, 4), pady=5, sticky="w")
+        except Exception as e:
+            logging.warning(f"Could not load header logo: {e}")
+
         # Tab glyph icons (Unicode, no asset files required).
-        # Picked from the BMP "Misc Technical / Symbols" blocks so they render
-        # in any default Tk font on Windows/Linux/macOS.
-        _tab_font = customtkinter.CTkFont(family='Segoe UI Symbol', size=15)
+        _tab_font = customtkinter.CTkFont(size=13, weight="bold")
 
         # Move button — compass / move arrows
         app.move_mode_select_button = customtkinter.CTkButton(app.menu_select_frame,text="✥  Move", font=_tab_font, command = raise_frame_jog)
-        app.move_mode_select_button.grid(row=0, column=0, padx=(padx_top_bot,0),pady = 5,sticky="nw")
+        app.move_mode_select_button.grid(row=0, column=1, padx=(10,0),pady = 5,sticky="nw")
 
         # I/O button — bidirectional arrows
         app.I0_mode_select_button = customtkinter.CTkButton(app.menu_select_frame,text="⇅  I/O", font=_tab_font, command = raise_frame_IO)
-        app.I0_mode_select_button.grid(row=0, column=1, padx=(padx_top_bot,0),pady = 5,sticky="nw")
+        app.I0_mode_select_button.grid(row=0, column=2, padx=(10,0),pady = 5,sticky="nw")
 
         # Vision button — camera lens / eye
         app.Vision_button = customtkinter.CTkButton(app.menu_select_frame,text="◉  Vision", font=_tab_font, command = raise_vision_frame)
-        app.Vision_button.grid(row=0, column=2, padx=(padx_top_bot,0) ,pady = 5,sticky="nw")
+        app.Vision_button.grid(row=0, column=3, padx=(10,0) ,pady = 5,sticky="nw")
 
         # Modbus button — bolt / live link
         app.Modbus_button = customtkinter.CTkButton(app.menu_select_frame,text="⚡  Modbus", font=_tab_font, command = raise_modbus_frame)
-        app.Modbus_button.grid(row=0, column=3, padx=(padx_top_bot,0) ,pady = 5,sticky="nw")
+        app.Modbus_button.grid(row=0, column=4, padx=(10,0) ,pady = 5,sticky="nw")
 
         # Research button — chart / analytics
         app.Research_button = customtkinter.CTkButton(app.menu_select_frame,text="▤  Research", font=_tab_font, command = raise_research_frame)
-        app.Research_button.grid(row=0, column=4, padx=(padx_top_bot,0) ,pady = 5,sticky="nw")
+        app.Research_button.grid(row=0, column=5, padx=(10,0) ,pady = 5,sticky="nw")
 
-        app.fw_label = customtkinter.CTkLabel(app.menu_select_frame, text="Source controller fw v1.0.0", text_color=UI_GOLD, font=customtkinter.CTkFont(family='JetBrains Mono', size=12, weight='bold'))
-        app.fw_label.grid(row=0, column=5, padx=(20,10), pady=5 ,sticky="ne")
+        app.fw_label = customtkinter.CTkLabel(app.menu_select_frame, text="Source controller fw v1.0.0", text_color=UI_GOLD, font=customtkinter.CTkFont(family='JetBrains Mono', size=11, weight='bold'))
+        app.fw_label.grid(row=0, column=7, padx=(20,10), pady=5 ,sticky="ne")
 
         # help button
         help_image =Image.open(os.path.join(Image_path, "help.png"))
@@ -408,7 +432,7 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         app.help_button = customtkinter.CTkButton(app.menu_select_frame, corner_radius=0, height=1, border_spacing=10,
                                                 fg_color="transparent", text_color=("gray10", "gray90"),
                                                 image=app.help_button_image, anchor="CENTER",text = "",hover = 0,command = Open_help) #hover = 0
-        app.help_button.grid(row=0, column=6, padx=(10,0), sticky="news")
+        app.help_button.grid(row=0, column=8, padx=(10,0), sticky="news")
 
 
     def bottom_frames():
@@ -4709,11 +4733,11 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
             style.theme_use("default")
 
             style.configure("Treeview",
-                            background="#202630",
-                            foreground="white",
+                            background=UI_SURFACE_LOW,
+                            foreground=UI_ON_SURFACE,
                             rowheight=30,
-                            fieldbackground="#202630",
-                            bordercolor="#2f3844",
+                            fieldbackground=UI_SURFACE_LOW,
+                            bordercolor=UI_BORDER,
                             borderwidth=0,
                             font=(FONT_FAMILY_MAIN, COMMAND_TREE_FONT_SIZE))
 
@@ -4722,14 +4746,14 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
                       foreground=[('selected', '#ffffff')])
 
             style.configure("Treeview.Heading",
-                            background="#2f3844",
-                            foreground="white",
+                            background=UI_SURFACE_ALT,
+                            foreground=UI_ON_SURFACE,
                             relief="flat",
                             font=(FONT_FAMILY_MAIN, COMMAND_TREE_FONT_SIZE,'bold'),
                             )
 
             style.map("Treeview.Heading",
-                        background=[('active', "#3a4254")])
+                        background=[('active', UI_SURFACE_HIGH)])
 
         if(new_appearance_mode == "Light"):
             style = ttk.Style()
