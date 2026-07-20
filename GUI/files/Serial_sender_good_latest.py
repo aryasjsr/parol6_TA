@@ -42,6 +42,17 @@ from Commander_feature_adapters import (
 from vision.tool_z_runtime import (
     resolve_vision_placeholders,
 )
+from backend.program_control import (
+    PROGRAM_SIGNAL_PAUSED,
+    PROGRAM_SIGNAL_STEP,
+    PROGRAM_SIGNAL_STOP_REQUESTED,
+    has_realtime_program_signal,
+    is_paused as control_is_paused,
+    manual_jog_allowed,
+    motion_needs_replan,
+    read_program_signal,
+    write_program_signal,
+)
 def normalize_angle(angle):
     """Normalize angle to [-pi, pi] range to handle angle wrapping"""
     while angle > np.pi:
@@ -719,13 +730,70 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
     Command_step = 0
     Command_len = 0
     error_state = 0
+    program_pause_latched = False
     offline_state = {}
     offline_program_reset(offline_state)
 
     while timer.elapsed_time < 110000:
+        # Stop is a state-machine request, not merely the GUI run-button flag.
+        # Handle it before packing the next serial frame so the robot receives a
+        # live-position/zero-speed hold instead of one more trajectory setpoint.
+        realtime_control = has_realtime_program_signal(Buttons)
+        program_signal = read_program_signal(Buttons)
+        stop_requested = (
+            program_signal == PROGRAM_SIGNAL_STOP_REQUESTED
+            if realtime_control
+            else program_stop_requested()
+        )
+        if stop_requested:
+            finish_program_stop(
+                Position_out,
+                Speed_out,
+                Command_out,
+                Position_in,
+                Buttons,
+                shared_string,
+                program_log_queue=program_log_queue,
+                Joint_jog_buttons=Joint_jog_buttons,
+                Cart_jog_buttons=Cart_jog_buttons,
+            )
+            offline_program_reset(offline_state)
+            Robot_mode = "Dummy"
+            Command_step = 0
+            Command_len = 0
+            program_pause_latched = False
+
         if Buttons[7] == 0 and Robot_mode == "Program":
             reset_vision_runtime()
             Robot_mode = "Dummy"
+
+        control_state = program_control_state()
+        paused_requested = (
+            program_signal == PROGRAM_SIGNAL_PAUSED
+            if realtime_control
+            else control_is_paused(control_state)
+        )
+        paused_now = Buttons[7] == 1 and paused_requested
+        if paused_now and not program_pause_latched:
+            current_command = (
+                clean_string[Program_step]
+                if 0 <= Program_step < len(clean_string)
+                else None
+            )
+            if motion_needs_replan(current_command, Command_step):
+                # Jogging changes the physical start pose. Discard only the
+                # active motion profile; on Resume the same program command is
+                # rebuilt from Position_in, without replaying earlier commands.
+                Command_step = 0
+                Command_len = 0
+                emit_program_log(
+                    shared_string,
+                    program_log_queue,
+                    "Log: Active motion paused; Resume will replan from current pose",
+                )
+            program_pause_latched = True
+        elif not paused_now:
+            program_pause_latched = False
 
         if ser.is_open == True:
             refresh_robot_connection_state(General_data, shared_string)
@@ -765,8 +833,15 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
 
             
             # JOINT JOG (regular speed control) 0x123 # -1 is value if nothing is pressed
-            if result_joint_jog != -1 and Buttons[2] == 0 and InOut_in[4] == 1: 
-                Robot_mode = "Joint jog"
+            if (result_joint_jog != -1 and Buttons[2] == 0 and InOut_in[4] == 1
+                    and manual_jog_allowed(
+                        Buttons[7] == 1,
+                        control_state,
+                        program_signal if realtime_control else None,
+                    )):
+                # Preserve Program mode while paused so Resume continues at the
+                # current instruction rather than reloading the script.
+                Robot_mode = "Program" if paused_now else "Joint jog"
                 Command_out.value = 123 
                 # Set speed for all other joints to 0
                 for i in range(6):
@@ -792,7 +867,12 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
             ######################################################
             ######################################################
             # CART JOG (regular speed control but for multiple joints) 0x123 # -1 is value if nothing is pressed
-            elif result_cart_jog != -1 and Buttons[2] == 0 and InOut_in[4] == 1: #
+            elif (result_cart_jog != -1 and Buttons[2] == 0 and InOut_in[4] == 1
+                    and manual_jog_allowed(
+                        Buttons[7] == 1,
+                        control_state,
+                        program_signal if realtime_control else None,
+                    )): #
 
                 Command_out.value = 123
                 # Set speed for all other joints to 0
@@ -992,7 +1072,7 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
                     
                     scale_percent = int((1.0 / max_scale_factor) * 100)
                     shared_string.value = b'Warning: Cartesian jog speeds scaled to ' + bytes(str(scale_percent), 'utf-8') + b'% to respect joint limits'
-                Robot_mode = "Cartesian jog"
+                Robot_mode = "Program" if paused_now else "Cartesian jog"
                 # Calculate every joint speed using var and q1
 
 
@@ -1032,14 +1112,9 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
             elif Buttons[6] == 1: # For testing accel motions?
                 Command_out.value = 69
             
-            elif Buttons[7] == 1 and program_stop_requested():
-                Robot_mode = "Dummy"
-                finish_program_stop(Position_out,Speed_out,Command_out,Position_in,Buttons,shared_string)
-
-            elif Buttons[7] == 1 and program_paused():
+            elif Buttons[7] == 1 and paused_now:
                 Robot_mode = "Program"
                 dummy_data(Position_out,Speed_out,Command_out,Position_in)
-                shared_string.value = b'Log: Program paused'
 
             # Program execution
             ######################################################
@@ -1914,7 +1989,24 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
                                 pattern = r'MoveCart\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*(?:,\s*v\s*=\s*(-?\d+(?:\.\d+)?))?(?:,\s*a\s*=\s*(-?\d+(?:\.\d+)?))?(?:,\s*t\s*=\s*(-?\d+(?:\.\d+)?))?(?:,\s*(trap|poly))?(?:,\s*(speed))?\s*\)?'
 
                                 # Use re.match to find the pattern in the data packet
-                                match = re.match(pattern, clean_string_commands[Program_step])
+                                try:
+                                    command_text = resolve_motion_vision_placeholders(
+                                        clean_string_commands[Program_step],
+                                        Position_in,
+                                    )
+                                except ValueError as exc:
+                                    reset_vision_runtime()
+                                    emit_program_log(
+                                        shared_string,
+                                        program_log_queue,
+                                        f"Error: MoveCart() {exc}",
+                                    )
+                                    error_state = 1
+                                    Buttons[7] = 0
+                                    update_state("program_control", {"state": "ERROR", "paused": False, "stop_requested": False, "step_requested": 0, "updated_at": time.time()})
+                                    match = None
+                                else:
+                                    match = re.match(pattern, command_text)
 
                                 if match:
                                     shared_string.value = b'Log: MoveCart() command'
@@ -2643,8 +2735,26 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
                             #Robot_mode = "Dummy"
                             #Buttons[7] = 0
 
-                        if program_control_state().get("state") == "STEP" and Buttons[7] == 1 and Program_step != program_step_before:
-                            finish_program_stop(Position_out,Speed_out,Command_out,Position_in,Buttons,shared_string,"Program step complete")
+                        step_requested = (
+                            read_program_signal(Buttons) == PROGRAM_SIGNAL_STEP
+                            if has_realtime_program_signal(Buttons)
+                            else program_control_state().get("state") == "STEP"
+                        )
+                        if (step_requested
+                                and Buttons[7] == 1
+                                and Program_step != program_step_before):
+                            finish_program_stop(
+                                Position_out,
+                                Speed_out,
+                                Command_out,
+                                Position_in,
+                                Buttons,
+                                shared_string,
+                                "Program step complete",
+                                program_log_queue,
+                                Joint_jog_buttons,
+                                Cart_jog_buttons,
+                            )
                            
                         
                 
@@ -2668,10 +2778,7 @@ def Task1(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,In
             # No robot connected. Run software-only programs offline so the user
             # still gets feedback in the response log; refuse anything that needs
             # the physical robot. Otherwise keep trying to reconnect.
-            if Buttons[7] == 1 and program_stop_requested():
-                offline_program_finish(offline_state, Buttons, "IDLE",
-                                       "Log: Program stopped", shared_string, program_log_queue)
-            elif Buttons[7] == 1 and program_paused():
+            if Buttons[7] == 1 and paused_now:
                 shared_string.value = b'Log: Program paused'
             elif Buttons[7] == 1:
                 offline_program_tick(offline_state, shared_string, Buttons, program_log_queue)
@@ -2697,17 +2804,21 @@ def program_stop_requested():
     state = program_control_state()
     return bool(state.get("stop_requested", False)) or state.get("state") == "STOP_REQUESTED"
 
-def program_paused():
-    state = program_control_state()
-    return bool(state.get("paused", False)) or state.get("state") == "PAUSED"
-
-def finish_program_stop(Position_out,Speed_out,Command_out,Position_in,Buttons,shared_string, reason="Program stopped"):
+def finish_program_stop(
+        Position_out, Speed_out, Command_out, Position_in, Buttons, shared_string,
+        reason="Program stopped", program_log_queue=None,
+        Joint_jog_buttons=None, Cart_jog_buttons=None):
     Buttons[7] = 0
+    write_program_signal(Buttons, 0)
     dummy_data(Position_out,Speed_out,Command_out,Position_in)
+    for jog_buttons in (Joint_jog_buttons, Cart_jog_buttons):
+        if jog_buttons is not None:
+            for index in range(len(jog_buttons)):
+                jog_buttons[index] = 0
     reset_vision_runtime()
     update_state("program_control", {"state": "IDLE", "paused": False, "stop_requested": False, "step_requested": 0, "updated_at": time.time()})
     research_logger.record("program_idle", 1, reason)
-    shared_string.value = f"Log: {reason}".encode("utf-8")[:99]
+    emit_program_log(shared_string, program_log_queue, f"Log: {reason}")
 
 def extract_content_from_command(command):
     match = re.search(r'\((.*?)\)', command)
@@ -2741,7 +2852,11 @@ def parse_print_command(command):
 
 def resolve_motion_vision_placeholders(command, Position_in):
     runtime = get_vision_runtime()
-    if "$vision.z_plus" in command:
+    if (
+        "$vision.z_plus" in command
+        or "$vision.x_comp" in command
+        or "$vision.grip" in command
+    ):
         reference = list(runtime.get("reference_joint_deg", [])) if isinstance(runtime, dict) else []
         if len(reference) != 6:
             raise ValueError("vision reference pose is unavailable")
@@ -3584,8 +3699,9 @@ if __name__ == '__main__':
     # COM port, baud rate, reconnect request, connection state
     General_data =  multiprocessing.Array("i",[STARTING_PORT,3000000,0,0], lock=False)
 
-    # Home,Enable,Disable,Clear error,Real_robot,Sim_robot, demo_app, program execution,
-    Buttons =  multiprocessing.Array("i",[0,0,0,0,1,1,0,0,0], lock=False) 
+    # Home, Enable, Disable, Clear error, Real robot, Sim robot, demo app,
+    # program execution, Park, real-time program control signal.
+    Buttons = multiprocessing.Array("i", [0,0,0,0,1,1,0,0,0,0], lock=False)
 
     # Positions for robot simulator
     Position_Sim =  multiprocessing.Array("i",[0,0,0,0,0,0], lock=False) 

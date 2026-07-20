@@ -429,6 +429,8 @@ class CameraCalibrationManager:
             "valid": valid,
             "homography": homography.tolist(),
             "image_size": [int(image_size[0]), int(image_size[1])],
+            "video_source": str(self._config.get("vision.video_source", "")),
+            "zoom": float(self._config.get("vision.zoom", 1.0)),
             "point_count": int(len(pixel_points)),
             "inlier_count": int(np.sum(inlier_mask)) if inlier_mask is not None else int(len(pixel_points)),
             "rms_error_mm": rms_error,

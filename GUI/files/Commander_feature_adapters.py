@@ -5,10 +5,10 @@ import csv
 import json
 import math
 import shutil
-import statistics
 import sys
 import threading
 import time
+import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -22,6 +22,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 CONFIG_PATH = PROJECT_ROOT / "config.json"
 STATE_PATH = PROJECT_ROOT / "runtime_state.json"
+# Cross-process Modbus write queue. Only the process that owns the poll loop
+# holds the single Modbus-TCP connection the PLC allows, so other processes
+# drop write requests here for the owner to execute on that live connection.
+MODBUS_WRITE_DIR = PROJECT_ROOT / "runtime_modbus_writes"
+MODBUS_WRITE_ROUTE_TIMEOUT_S = 5.0
 LOG_DIR = PROJECT_ROOT / "logs"
 TIMESTAMP_TABLE_FIELDS = ["time", "event", "label", "elapsed_s", "duration_s"]
 MODBUS_CYCLE_LOG_COLUMNS = [
@@ -61,17 +66,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         ],
         "jog_lock_timeout_s": 5.0,
         "jog_speed_pct": 20,
-        "block_a": {
-            "enabled": False,
-            "ip": "MOCK",
-            "port": 502,
-            "slave_id": 1,
-            "timeout_ms": 1000,
-            "iterations": 1000,
-            "function": "read_holding_register",
-            "address": 100,
-            "count": 1,
-        },
         "block_b": {
             "enabled": False,
             "iterations": 100,
@@ -666,6 +660,10 @@ class ModbusAddress:
 class ModbusManager:
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        # Serializes actual client socket I/O so the poll thread and any
+        # write caller in the same process never interleave Modbus frames
+        # (interleaved frames make the PLC reset the connection).
+        self._client_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._snapshot: dict[str, Any] = {}
@@ -673,17 +671,13 @@ class ModbusManager:
         self._description = "Disconnected"
         self._client: Any = None
         self._last_cycle_ms = 0.0
-        self._block_a_stop = threading.Event()
-        self._block_a_thread: threading.Thread | None = None
         self._block_b_lock = threading.Lock()
-        self._block_a_full_samples: list[dict[str, Any]] = []
         self._block_b_full_samples: list[dict[str, Any]] = []
-        self._block_a_full_meta: dict[str, Any] = {}
         self._block_b_full_meta: dict[str, Any] = {}
         self._modbus_cycle_log: list[dict[str, Any]] = []
         self._modbus_cycle_meta: dict[str, Any] = {}
         self._block_b_state = self._new_block_b_state(load_config()["modbus"].get("block_b", {}))
-        update_state("modbus_block_a", self._new_block_a_state(load_config()["modbus"].get("block_a", {})))
+        self._block_b_clear_done = False
         update_state("modbus_block_b", dict(self._block_b_state))
         update_state("modbus_cycle_log", self._cycle_log_payload_unlocked())
 
@@ -715,31 +709,17 @@ class ModbusManager:
         if self._thread is not None:
             self._thread.join(timeout=1.0)
         self._thread = None
-        self._disconnect()
+        with self._client_lock:
+            self._disconnect()
         self._connected = False
         self._description = "Disconnected"
         self._publish()
 
-    def save_block_test_config(self, block_a: dict[str, Any] | None = None, block_b: dict[str, Any] | None = None) -> None:
+    def save_block_test_config(self, block_b: dict[str, Any] | None = None) -> None:
         cfg = load_config()
-        if block_a is not None:
-            cfg.setdefault("modbus", {}).setdefault("block_a", {}).update(block_a)
         if block_b is not None:
             cfg.setdefault("modbus", {}).setdefault("block_b", {}).update(block_b)
         save_config(cfg)
-
-    def start_block_a(self, settings: dict[str, Any]) -> None:
-        self.stop_block_a(join_timeout=1.0)
-        self.save_block_test_config(block_a=settings)
-        self._block_a_stop = threading.Event()
-        self._block_a_thread = threading.Thread(target=self._run_block_a_test, args=(dict(settings), self._block_a_stop), daemon=True)
-        self._block_a_thread.start()
-
-    def stop_block_a(self, join_timeout: float = 1.0) -> None:
-        self._block_a_stop.set()
-        if self._block_a_thread is not None and self._block_a_thread.is_alive():
-            self._block_a_thread.join(timeout=join_timeout)
-        self._block_a_thread = None
 
     def start_block_b(self, settings: dict[str, Any]) -> None:
         self.save_block_test_config(block_b=settings)
@@ -758,6 +738,17 @@ class ModbusManager:
             update_state("modbus_block_b", dict(self._block_b_state))
             update_state("modbus_cycle_log", self._cycle_log_payload_unlocked())
             self._block_b_full_meta = dict(self._modbus_cycle_meta)
+        # A done/error coil left high by an earlier run (e.g. the app was
+        # closed mid-handshake) blocks the PLC from raising the first trigger.
+        self._block_b_clear_done = False
+        try:
+            self.write_value(str(settings.get("done_name", "cycle_done")), False)
+        except Exception:
+            pass
+        try:
+            self.write_value(str(settings.get("error_name", "error_flag")), False)
+        except Exception:
+            pass
         research_logger.record("modbus_block_b_test_start", int(self._block_b_state["target"]), "cycle time test")
 
     def stop_block_b(self) -> None:
@@ -888,6 +879,11 @@ class ModbusManager:
             self.write_value(error_name, not bool(success))
         except Exception as exc:
             research_logger.record("modbus_block_b_flag_error", 1, str(exc))
+        if success:
+            # Phase 4 of the handshake still owes the PLC a falling edge on
+            # the done coil; the poll loop performs it once the PLC lowers
+            # its trigger (see _finish_block_b_handshake).
+            self._block_b_clear_done = True
 
         if success:
             research_logger.record("modbus_block_b_cycle_time_s", round(duration, 6), note)
@@ -935,30 +931,170 @@ class ModbusManager:
                 self._snapshot[entry.name] = _mock_value_for_type(entry.type, value)
             self._publish()
             return True
-        if self._client is None:
-            self._ensure_connected(cfg)
+        # The PLC accepts a single Modbus-TCP connection, held by whichever
+        # process runs the poll loop. If that owner is a different process
+        # (e.g. the GUI while a program executes in the executor process),
+        # route the write through it instead of opening a second socket the
+        # PLC would refuse ("Unable to connect"). Fall back to a direct write
+        # if the request could not be routed.
+        if not self._owns_poll_loop() and self._poll_loop_active_elsewhere():
+            routed = self._write_via_queue(entry, value)
+            if routed is not None:
+                return routed
+        return self._write_direct(entry, cfg, value)
+
+    def _write_direct(self, entry: "ModbusAddress", cfg: dict[str, Any], value: Any) -> bool:
         slave_id = int(cfg.get("slave_id", 1))
         register_type = entry.type.lower()
-        if register_type == "coil":
-            result = _call_modbus(
-                self._client.write_coil,
-                {"address": entry.address, "value": _coerce_bool(value)},
-                slave_id,
-            )
-        elif register_type in {"holding_register", "register"}:
-            result = _call_modbus(
-                self._client.write_register,
-                {"address": entry.address, "value": int(value)},
-                slave_id,
-            )
-        else:
-            raise ValueError(f"Address '{entry.name}' is not writable as type {entry.type}")
+
+        def _do_write() -> Any:
+            with self._client_lock:
+                if self._client is None:
+                    self._ensure_connected(cfg)
+                if register_type == "coil":
+                    # PLC only supports 0F (Write Multiple Coils) for the Work
+                    # Area, so a single bit is written as a one-element block.
+                    return _call_modbus(
+                        self._client.write_coils,
+                        {"address": entry.address, "values": [_coerce_bool(value)]},
+                        slave_id,
+                    )
+                if register_type in {"holding_register", "register"}:
+                    # 06 (Write Single Register) into the Data Memory Area.
+                    return _call_modbus(
+                        self._client.write_register,
+                        {"address": entry.address, "value": int(value)},
+                        slave_id,
+                    )
+                raise ValueError(f"Address '{entry.name}' is not writable as type {entry.type}")
+
+        try:
+            result = _do_write()
+        except _modbus_link_errors():
+            # Transient link drop (e.g. Wi-Fi blip): drop the stale socket and
+            # retry once with a fresh connection before failing the command.
+            with self._client_lock:
+                self._disconnect()
+            try:
+                result = _do_write()
+            except _modbus_link_errors():
+                # Still down: drop the dead client too, otherwise a process
+                # without a poll loop caches it and every later write fails.
+                with self._client_lock:
+                    self._disconnect()
+                raise
         ok = not bool(getattr(result, "isError", lambda: False)())
+        if not self._owns_poll_loop():
+            # This process only borrowed the PLC's single connection slot for
+            # a fallback write; caching the socket would lock the poll-loop
+            # owner out ("Unable to connect") for as long as we live.
+            with self._client_lock:
+                self._disconnect()
         if ok:
             with self._lock:
                 self._snapshot[entry.name] = _mock_value_for_type(entry.type, value)
             self._publish()
         return ok
+
+    def _owns_poll_loop(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def _poll_loop_active_elsewhere(self) -> bool:
+        """True if some other process is actively running the Modbus poll loop
+        (recent heartbeat in shared state), so it owns the PLC connection."""
+        state = read_state("modbus", {})
+        if not isinstance(state, dict):
+            return False
+        updated_at = float(state.get("updated_at", 0.0) or 0.0)
+        interval_s = float(self.config().get("poll_interval_ms", 100)) / 1000.0
+        heartbeat = max(3.0, 5.0 * interval_s)
+        return (time.time() - updated_at) < heartbeat
+
+    def _write_via_queue(self, entry: "ModbusAddress", value: Any) -> bool | None:
+        """Ask the poll-loop-owning process to perform the write. Returns the
+        boolean result, or None if it could not be routed (caller falls back)."""
+        try:
+            MODBUS_WRITE_DIR.mkdir(parents=True, exist_ok=True)
+            request_id = uuid.uuid4().hex
+            req_path = MODBUS_WRITE_DIR / f"req_{request_id}.json"
+            tmp_path = req_path.with_suffix(".tmp")
+            tmp_path.write_text(
+                json.dumps({"name": entry.name, "value": value, "ts": time.time()}),
+                encoding="utf-8",
+            )
+            tmp_path.replace(req_path)  # atomic: the owner only ever sees a complete file
+        except Exception:
+            return None
+        res_path = MODBUS_WRITE_DIR / f"res_{request_id}.json"
+        deadline = time.time() + MODBUS_WRITE_ROUTE_TIMEOUT_S
+        while time.time() < deadline:
+            if res_path.exists():
+                try:
+                    result = json.loads(res_path.read_text(encoding="utf-8"))
+                except Exception:
+                    result = {}
+                try:
+                    res_path.unlink()
+                except OSError:
+                    pass
+                if result.get("error"):
+                    raise RuntimeError(str(result["error"]))
+                return bool(result.get("ok", False))
+            time.sleep(0.02)
+        # Timed out waiting for the owner: abandon the request so it is skipped.
+        try:
+            req_path.unlink()
+        except OSError:
+            pass
+        return None
+
+    def _drain_write_queue(self, cfg: dict[str, Any]) -> None:
+        """Owner side: execute any pending cross-process write requests on the
+        live connection and post their results. Runs inside the poll thread."""
+        if not MODBUS_WRITE_DIR.exists():
+            return
+        now = time.time()
+        for req_path in sorted(MODBUS_WRITE_DIR.glob("req_*.json")):
+            try:
+                payload = json.loads(req_path.read_text(encoding="utf-8"))
+            except Exception:
+                self._safe_unlink(req_path)
+                continue
+            request_id = req_path.stem[len("req_"):]
+            # Skip requests the caller already gave up on (avoids double writes).
+            if now - float(payload.get("ts", 0.0) or 0.0) > MODBUS_WRITE_ROUTE_TIMEOUT_S:
+                self._safe_unlink(req_path)
+                continue
+            result: dict[str, Any] = {"ok": False, "error": ""}
+            try:
+                entry = self._address_for(payload.get("name"))
+                if entry is None:
+                    raise KeyError(f"Unknown Modbus selector: {payload.get('name')}")
+                result["ok"] = self._write_direct(entry, cfg, payload.get("value"))
+            except Exception as exc:
+                result["error"] = str(exc)
+            res_path = MODBUS_WRITE_DIR / f"res_{request_id}.json"
+            try:
+                tmp_path = res_path.with_suffix(".tmp")
+                tmp_path.write_text(json.dumps(result), encoding="utf-8")
+                tmp_path.replace(res_path)
+            except Exception:
+                pass
+            self._safe_unlink(req_path)
+        # Clean orphaned result files (caller died before reading them).
+        for res_path in MODBUS_WRITE_DIR.glob("res_*.json"):
+            try:
+                if now - res_path.stat().st_mtime > MODBUS_WRITE_ROUTE_TIMEOUT_S * 2:
+                    res_path.unlink()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _safe_unlink(path: Path) -> None:
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
     def _poll_loop(self) -> None:
         while not self._stop.is_set():
@@ -970,194 +1106,73 @@ class ModbusManager:
                 self._publish()
                 self._stop.wait(max(0.05, float(cfg.get("poll_interval_ms", 100)) / 1000.0))
                 continue
+            wait_s = max(0.05, float(cfg.get("poll_interval_ms", 100)) / 1000.0)
             try:
-                self._ensure_connected(cfg)
-                snapshot = self._poll_snapshot(cfg)
+                try:
+                    snapshot = self._poll_pass(cfg)
+                except Exception:
+                    # A failed poll at a cycle boundary is usually transient
+                    # (the PLC scan stalls while it handles the handshake):
+                    # retry once on a fresh socket so one slow response does
+                    # not tear down the connection between cycles.
+                    with self._client_lock:
+                        self._disconnect()
+                    snapshot = self._poll_pass(cfg)
                 with self._lock:
                     self._snapshot.update(snapshot)
                 self._last_cycle_ms = (time.perf_counter() - started) * 1000.0
                 research_logger.record("modbus_cycle", round(self._last_cycle_ms, 3))
                 self._publish()
+                self._finish_block_b_handshake(snapshot)
             except Exception as exc:
                 self._connected = False
                 self._description = str(exc)
-                self._disconnect()
+                with self._client_lock:
+                    self._disconnect()
                 self._publish()
                 research_logger.record("modbus_error", 1, str(exc))
-            self._stop.wait(max(0.05, float(cfg.get("poll_interval_ms", 100)) / 1000.0))
-
-    def _run_block_a_test(self, settings: dict[str, Any], stop_event: threading.Event) -> None:
-        target = max(1, int(float(settings.get("iterations", 1000))))
-        settings = {
-            **load_config()["modbus"].get("block_a", {}),
-            **settings,
-            "iterations": target,
-        }
-        state = self._new_block_a_state(settings)
-        state["running"] = True
-        state["started_at"] = time.time()
-        update_state("modbus_block_a", state)
-        self._block_a_full_samples.clear()
-        self._block_a_full_meta = {
-            "started_at": state["started_at"],
-            "settings": dict(settings),
-            "target": target,
-        }
-        research_logger.record("modbus_block_a_test_start", target, str(settings.get("function", "")))
-
-        response_times: list[float] = []
-        success_count = 0
-        failed_count = 0
-        timeout_count = 0
-        samples: list[dict[str, Any]] = []
-        start_time = time.perf_counter()
-        client = None
-        client_error = ""
-        if str(settings.get("ip", "MOCK")).strip().upper() != "MOCK":
+                # Redialing at poll rate hammers the PLC's single server slot
+                # with connection attempts and can keep it from ever freeing
+                # the old session; back off to the failsafe interval instead.
+                try:
+                    failsafe = load_config().get("failsafe", {})
+                    wait_s = max(wait_s, float(failsafe.get("modbus_reconnect_interval_s", 5)))
+                except Exception:
+                    wait_s = max(wait_s, 5.0)
+            # Execute writes routed from other processes on our live connection.
             try:
-                client = self._open_block_a_client(settings)
-            except Exception as exc:
-                client_error = str(exc)
-
-        for index in range(1, target + 1):
-            if stop_event.is_set():
-                break
-            t0 = time.perf_counter()
-            status = "success"
-            ok = True
-            detail = ""
-            try:
-                if client_error:
-                    raise ConnectionError(client_error)
-                ok, detail = self._perform_block_a_request(client, settings)
-                status = "success" if ok else "failed"
-            except Exception as exc:
-                ok = False
-                detail = str(exc)
-                status = "timeout" if "timeout" in detail.lower() else "failed"
-            response_ms = round((time.perf_counter() - t0) * 1000.0, 3)
-            timeout_ms = float(settings.get("timeout_ms", 1000))
-            if not ok and response_ms >= timeout_ms:
-                status = "timeout"
-
-            if status == "success":
-                success_count += 1
-                response_times.append(response_ms)
-                research_logger.record("modbus_block_a_response_ms", response_ms, f"n={index}")
-                research_logger.record("modbus_block_a_success", 1, f"n={index}")
-            elif status == "timeout":
-                timeout_count += 1
-                research_logger.record("modbus_block_a_timeout", 1, f"n={index}; {detail}")
-            else:
-                failed_count += 1
-                research_logger.record("modbus_block_a_failed", 1, f"n={index}; {detail}")
-
-            samples.append({"n": index, "response_ms": response_ms, "status": status, "detail": detail})
-            self._block_a_full_samples.append({
-                "n": index,
-                "timestamp": time.time(),
-                "response_ms": response_ms,
-                "status": status,
-                "detail": detail,
-            })
-            stats = _protocol_stats(
-                completed=index,
-                success_count=success_count,
-                failed_count=failed_count,
-                timeout_count=timeout_count,
-                response_times=response_times,
-                elapsed_s=max(time.perf_counter() - start_time, 1e-9),
-            )
-            update_state(
-                "modbus_block_a",
-                {
-                    "running": True,
-                    "target": target,
-                    "completed": index,
-                    "settings": settings,
-                    "stats": stats,
-                    "latest": samples[-1],
-                    "samples": samples[-300:],
-                    "updated_at": time.time(),
-                },
-            )
-
-        elapsed_s = max(time.perf_counter() - start_time, 1e-9)
-        completed = success_count + failed_count + timeout_count
-        stats = _protocol_stats(completed, success_count, failed_count, timeout_count, response_times, elapsed_s)
-        final_state = {
-            "running": False,
-            "target": target,
-            "completed": completed,
-            "settings": settings,
-            "stats": stats,
-            "latest": samples[-1] if samples else {},
-            "samples": samples[-300:],
-            "stopped": stop_event.is_set() and completed < target,
-            "updated_at": time.time(),
-        }
-        update_state("modbus_block_a", final_state)
-        self._block_a_full_meta.update({
-            "finished_at": time.time(),
-            "completed": completed,
-            "stats": dict(stats),
-            "stopped_early": bool(stop_event.is_set() and completed < target),
-        })
-        research_logger.record("modbus_block_a_packet_loss_pct", stats.get("packet_loss_pct", 0.0))
-        research_logger.record("modbus_block_a_throughput_rps", stats.get("throughput_rps", 0.0))
-        research_logger.record("modbus_block_a_test_finished", completed)
-        if client is not None:
-            try:
-                client.close()
+                self._drain_write_queue(cfg)
             except Exception:
                 pass
+            self._stop.wait(wait_s)
 
-    def _open_block_a_client(self, settings: dict[str, Any]) -> Any:
+    def _poll_pass(self, cfg: dict[str, Any]) -> dict[str, Any]:
+        with self._client_lock:
+            self._ensure_connected(cfg)
+        return self._poll_snapshot(cfg)
+
+    def _finish_block_b_handshake(self, snapshot: dict[str, Any]) -> None:
+        # Robot side of handshake phase 4: once the PLC has acknowledged our
+        # done signal by lowering its trigger, lower the done coil again. A
+        # done coil that stays high keeps the PLC from raising the trigger
+        # for the next cycle (it times out and latches its error bit instead).
+        if not self._block_b_clear_done:
+            return
+        with self._block_b_lock:
+            trigger_name = str(self._block_b_state.get("trigger_name", "trigger_pick"))
+            done_name = str(self._block_b_state.get("done_name", "cycle_done"))
+        if _coerce_bool(snapshot.get(trigger_name, False)):
+            return  # PLC has not acknowledged yet
         try:
-            from pymodbus.client import ModbusTcpClient
+            if self.write_value(done_name, False):
+                self._block_b_clear_done = False
+                research_logger.record("modbus_block_b_done_cleared", 1)
         except Exception as exc:
-            raise RuntimeError(f"pymodbus unavailable: {exc}") from exc
-        timeout_s = max(0.001, float(settings.get("timeout_ms", 1000)) / 1000.0)
-        client = ModbusTcpClient(
-            host=str(settings.get("ip", "127.0.0.1")),
-            port=int(settings.get("port", 502)),
-            timeout=timeout_s,
-        )
-        if not client.connect():
-            raise ConnectionError(f"Unable to connect to {settings.get('ip')}:{settings.get('port')}")
-        return client
-
-    def _perform_block_a_request(self, client: Any, settings: dict[str, Any]) -> tuple[bool, str]:
-        function = str(settings.get("function", "read_holding_register")).strip().lower()
-        address = int(float(settings.get("address", 100)))
-        count = max(1, int(float(settings.get("count", 1))))
-        slave_id = int(float(settings.get("slave_id", 1)))
-        if client is None:
-            time.sleep(0.001)
-            with self._lock:
-                self._snapshot["block_a_mock_last_address"] = address
-                self._snapshot["block_a_mock_count"] = count
-            self._publish()
-            return True, "MOCK"
-
-        if function == "read_holding_register":
-            result = _call_modbus(client.read_holding_registers, {"address": address, "count": count}, slave_id)
-        elif function == "read_input_register":
-            result = _call_modbus(client.read_input_registers, {"address": address, "count": count}, slave_id)
-        elif function == "read_coil":
-            result = _call_modbus(client.read_coils, {"address": address, "count": count}, slave_id)
-        elif function == "read_discrete_input":
-            result = _call_modbus(client.read_discrete_inputs, {"address": address, "count": count}, slave_id)
-        elif function == "write_register":
-            result = _call_modbus(client.write_register, {"address": address, "value": 1}, slave_id)
-        elif function == "write_coil":
-            result = _call_modbus(client.write_coil, {"address": address, "value": True}, slave_id)
-        else:
-            raise ValueError(f"Unsupported Block A function: {function}")
-        is_error = bool(getattr(result, "isError", lambda: False)())
-        return not is_error, "modbus_error" if is_error else "ok"
+            research_logger.record("modbus_block_b_flag_error", 1, str(exc))
 
     def _ensure_connected(self, cfg: dict[str, Any]) -> None:
+        # Caller must hold _client_lock: two threads creating clients at once
+        # would leak a socket on the PLC's single-connection slot.
         if self._client is not None:
             self._connected = True
             return
@@ -1167,13 +1182,20 @@ class ModbusManager:
             raise RuntimeError(f"pymodbus unavailable: {exc}") from exc
         host = str(cfg.get("ip", "127.0.0.1"))
         port = int(cfg.get("port", 502))
-        self._client = ModbusTcpClient(host=host, port=port)
+        timeout_s = max(0.2, float(cfg.get("timeout_ms", 3000)) / 1000.0)
+        self._client = ModbusTcpClient(host=host, port=port, timeout=timeout_s)
         if not self._client.connect():
+            # Do not keep a dead client around: a cached, unconnected client
+            # would make the next _ensure_connected() falsely return "connected".
+            self._disconnect()
+            self._connected = False
             raise ConnectionError(f"Unable to connect to {host}:{port}")
         self._connected = True
         self._description = f"{host}:{port}"
 
     def _disconnect(self) -> None:
+        # Caller must hold _client_lock so the client is never nulled out
+        # underneath a thread that is mid-read or mid-write on it.
         if self._client is not None:
             try:
                 self._client.close()
@@ -1181,32 +1203,35 @@ class ModbusManager:
                 self._client = None
 
     def _poll_snapshot(self, cfg: dict[str, Any]) -> dict[str, Any]:
-        if self._client is None:
-            return {}
         slave_id = int(cfg.get("slave_id", 1))
         snapshot: dict[str, Any] = {}
-        for entry in self._addresses():
-            register_type = entry.type.lower()
-            if register_type == "coil":
-                result = _call_modbus(self._client.read_coils, {"address": entry.address, "count": 1}, slave_id)
-                if result.isError():
-                    raise RuntimeError(f"Read failed for {entry.name}")
-                snapshot[entry.name] = bool(result.bits[0])
-            elif register_type == "discrete_input":
-                result = _call_modbus(self._client.read_discrete_inputs, {"address": entry.address, "count": 1}, slave_id)
-                if result.isError():
-                    raise RuntimeError(f"Read failed for {entry.name}")
-                snapshot[entry.name] = bool(result.bits[0])
-            elif register_type in {"holding_register", "register"}:
-                result = _call_modbus(self._client.read_holding_registers, {"address": entry.address, "count": 1}, slave_id)
-                if result.isError():
-                    raise RuntimeError(f"Read failed for {entry.name}")
-                snapshot[entry.name] = int(result.registers[0])
-            elif register_type == "input_register":
-                result = _call_modbus(self._client.read_input_registers, {"address": entry.address, "count": 1}, slave_id)
-                if result.isError():
-                    raise RuntimeError(f"Read failed for {entry.name}")
-                snapshot[entry.name] = int(result.registers[0])
+        # Hold the client lock for the whole read burst so a concurrent write
+        # in this process cannot interleave a frame mid-poll.
+        with self._client_lock:
+            if self._client is None:
+                return {}
+            for entry in self._addresses():
+                register_type = entry.type.lower()
+                if register_type == "coil":
+                    result = _call_modbus(self._client.read_coils, {"address": entry.address, "count": 1}, slave_id)
+                    if result.isError():
+                        raise RuntimeError(f"Read failed for {entry.name}")
+                    snapshot[entry.name] = bool(result.bits[0])
+                elif register_type == "discrete_input":
+                    result = _call_modbus(self._client.read_discrete_inputs, {"address": entry.address, "count": 1}, slave_id)
+                    if result.isError():
+                        raise RuntimeError(f"Read failed for {entry.name}")
+                    snapshot[entry.name] = bool(result.bits[0])
+                elif register_type in {"holding_register", "register"}:
+                    result = _call_modbus(self._client.read_holding_registers, {"address": entry.address, "count": 1}, slave_id)
+                    if result.isError():
+                        raise RuntimeError(f"Read failed for {entry.name}")
+                    snapshot[entry.name] = int(result.registers[0])
+                elif register_type == "input_register":
+                    result = _call_modbus(self._client.read_input_registers, {"address": entry.address, "count": 1}, slave_id)
+                    if result.isError():
+                        raise RuntimeError(f"Read failed for {entry.name}")
+                    snapshot[entry.name] = int(result.registers[0])
         return snapshot
 
     def _addresses(self) -> list[ModbusAddress]:
@@ -1231,19 +1256,6 @@ class ModbusManager:
             if entry.address == selector_int:
                 return entry
         return None
-
-    def _new_block_a_state(self, settings: dict[str, Any]) -> dict[str, Any]:
-        target = max(1, int(float(settings.get("iterations", 1000))))
-        return {
-            "running": False,
-            "target": target,
-            "completed": 0,
-            "settings": dict(settings),
-            "stats": _protocol_stats(0, 0, 0, 0, [], 0.0),
-            "latest": {},
-            "samples": [],
-            "updated_at": time.time(),
-        }
 
     def _new_block_b_state(self, settings: dict[str, Any]) -> dict[str, Any]:
         target = max(1, int(float(settings.get("iterations", 100))))
@@ -1277,15 +1289,9 @@ class ModbusManager:
             },
         )
 
-    def get_block_a_full_samples(self) -> list[dict[str, Any]]:
-        return list(self._block_a_full_samples)
-
     def get_block_b_full_samples(self) -> list[dict[str, Any]]:
         with self._block_b_lock:
             return list(self._block_b_full_samples)
-
-    def get_block_a_full_meta(self) -> dict[str, Any]:
-        return dict(self._block_a_full_meta)
 
     def get_block_b_full_meta(self) -> dict[str, Any]:
         with self._block_b_lock:
@@ -1327,35 +1333,22 @@ class ModbusManager:
 
         workbook = Workbook()
         raw_sheet = workbook.active
-        raw_sheet.title = "Tabel 1 - Log Mentah"
+        raw_sheet.title = "Data"
         raw_sheet.append([MODBUS_CYCLE_LOG_HEADINGS[column] for column in MODBUS_CYCLE_LOG_COLUMNS])
         for row in rows:
             raw_sheet.append(_modbus_cycle_log_export_row(row))
 
-        summary = _modbus_cycle_log_stats(rows, self.config().get("poll_interval_ms", 100))
-        protocol_sheet = workbook.create_sheet("Tabel 2 - Protokol")
-        protocol_sheet.append(["Metrik", "Nilai"])
+        summary = _modbus_cycle_log_stats(rows)
+        summary_sheet = workbook.create_sheet("Ringkasan")
+        summary_sheet.append(["Metrik", "Nilai"])
         for metric, value in [
             ("Avg Response Time", f"{summary['avg_rt_ms']} ms"),
-            ("Min Response Time", f"{summary['min_rt_ms']} ms"),
-            ("Max Response Time", f"{summary['max_rt_ms']} ms"),
             ("Throughput", f"{summary['throughput_rps']} req/s"),
             ("Packet Loss Rate", f"{summary['packet_loss_pct']} %"),
-            ("Target Poll Interval", f"{summary['target_poll_interval_ms']} ms"),
-            ("Status vs Target", summary["status_vs_target"]),
-        ]:
-            protocol_sheet.append([metric, value])
-
-        cycle_sheet = workbook.create_sheet("Tabel 3 - Cycle Time")
-        cycle_sheet.append(["Metrik", "Nilai"])
-        for metric, value in [
             ("Avg Cycle Time", f"{summary['avg_cycle_time_s']} s"),
-            ("Std Cycle Time", f"{summary['std_cycle_time_s']} s"),
-            ("Min Cycle Time", f"{summary['min_cycle_time_s']} s"),
-            ("Max Cycle Time", f"{summary['max_cycle_time_s']} s"),
             ("Jumlah Data", summary["cycle_time_count"]),
         ]:
-            cycle_sheet.append([metric, value])
+            summary_sheet.append([metric, value])
 
         workbook.save(destination_path)
         return destination_path
@@ -1364,39 +1357,17 @@ class ModbusManager:
         return {
             "rows": [dict(row) for row in self._modbus_cycle_log[-300:]],
             "count": len(self._modbus_cycle_log),
-            "stats": _modbus_cycle_log_stats(self._modbus_cycle_log, self.config().get("poll_interval_ms", 100)),
+            "stats": _modbus_cycle_log_stats(self._modbus_cycle_log),
             "updated_at": time.time(),
         }
 
 
-def _protocol_stats(
-    completed: int,
-    success_count: int,
-    failed_count: int,
-    timeout_count: int,
-    response_times: list[float],
-    elapsed_s: float,
-) -> dict[str, Any]:
-    loss_count = int(failed_count) + int(timeout_count)
-    avg_rt = sum(response_times) / len(response_times) if response_times else 0.0
-    return {
-        "avg_rt_ms": round(avg_rt, 3),
-        "throughput_rps": round(float(completed) / max(float(elapsed_s), 1e-9), 3) if completed else 0.0,
-        "packet_loss_pct": round(loss_count / max(int(completed), 1) * 100.0, 3) if completed else 0.0,
-        "success_count": int(success_count),
-        "failed_count": int(failed_count),
-        "timeout_count": int(timeout_count),
-    }
-
-
 def _cycle_stats(samples: list[float]) -> dict[str, Any]:
     if not samples:
-        return {"avg_s": 0.0, "min_s": 0.0, "max_s": 0.0, "std_s": 0.0}
+        return {"avg_s": 0.0, "count": 0}
     return {
         "avg_s": round(sum(samples) / len(samples), 6),
-        "min_s": round(min(samples), 6),
-        "max_s": round(max(samples), 6),
-        "std_s": round(statistics.pstdev(samples), 6) if len(samples) > 1 else 0.0,
+        "count": len(samples),
     }
 
 
@@ -1442,7 +1413,7 @@ def _modbus_cycle_log_export_row(row: dict[str, Any]) -> list[Any]:
     return values
 
 
-def _modbus_cycle_log_stats(rows: list[dict[str, Any]], target_poll_interval_ms: Any = 100) -> dict[str, Any]:
+def _modbus_cycle_log_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
     response_times = [
         value for value in (_number_or_none(row.get("response_time_ms")) for row in rows) if value is not None
     ]
@@ -1460,28 +1431,25 @@ def _modbus_cycle_log_stats(rows: list[dict[str, Any]], target_poll_interval_ms:
     else:
         throughput = 0.0
     avg_rt = sum(response_times) / len(response_times) if response_times else 0.0
-    min_rt = min(response_times) if response_times else 0.0
-    max_rt = max(response_times) if response_times else 0.0
     avg_cycle = sum(cycle_times) / len(cycle_times) if cycle_times else 0.0
-    target_poll = _round_float(target_poll_interval_ms, 3, 100.0)
     packet_loss_pct = loss_count / max(total, 1) * 100.0 if total else 0.0
-    status_vs_target = "Aman" if total and max_rt <= target_poll and packet_loss_pct == 0.0 else "Tidak Aman"
-    if not total:
-        status_vs_target = "-"
     return {
         "avg_rt_ms": round(avg_rt, 3),
-        "min_rt_ms": round(min_rt, 3),
-        "max_rt_ms": round(max_rt, 3),
         "throughput_rps": round(throughput, 3),
         "packet_loss_pct": round(packet_loss_pct, 3),
-        "target_poll_interval_ms": round(target_poll, 3),
-        "status_vs_target": status_vs_target,
         "avg_cycle_time_s": round(avg_cycle, 6),
-        "std_cycle_time_s": round(statistics.pstdev(cycle_times), 6) if len(cycle_times) > 1 else 0.0,
-        "min_cycle_time_s": round(min(cycle_times), 6) if cycle_times else 0.0,
-        "max_cycle_time_s": round(max(cycle_times), 6) if cycle_times else 0.0,
         "cycle_time_count": len(cycle_times),
     }
+
+
+def _modbus_link_errors() -> tuple[type[BaseException], ...]:
+    # pymodbus signals a dropped link with its own ModbusException family
+    # (ConnectionException, ModbusIOException), not OSError/ConnectionError.
+    try:
+        from pymodbus.exceptions import ModbusException
+    except Exception:
+        return (ConnectionError, OSError)
+    return (ConnectionError, OSError, ModbusException)
 
 
 def _call_modbus(method: Any, kwargs: dict[str, Any], slave_id: int) -> Any:
@@ -2297,10 +2265,11 @@ def camera_to_base_is_usable(camera_to_base: Any) -> bool:
     """Return True if a real 3x3 homography is present.
 
     The calibration is treated as usable based on the actual homography data,
-    not the ``valid`` flag alone. The GUI flips ``valid`` to False whenever
-    vision settings are re-saved (see save_vision_settings), which would
-    otherwise drop a perfectly good calibration. As long as a proper 3x3
-    numeric homography exists, the pixel->base mapping still works.
+    not the ``valid`` flag alone. Older configs may still carry ``valid: False``
+    from the days when the GUI flipped it on every settings save; as long as a
+    proper 3x3 numeric homography exists, the pixel->base mapping still works.
+    Applicability to the active source/zoom/frame size is enforced separately
+    by WorkspaceValidator.has_camera_to_base_calibration().
     """
     if not isinstance(camera_to_base, dict):
         return False
@@ -2425,6 +2394,8 @@ def execute_vision_tool_z(
             z_plus_min_mm=float(tool_cfg.get("z_plus_min_mm", 0.0)),
             z_plus_max_mm=float(tool_cfg.get("z_plus_max_mm", 78.0)),
             retreat_margin_mm=float(tool_cfg.get("retreat_margin_mm", 30.0)),
+            x_comp_base_mm=float(tool_cfg.get("x_comp_base_mm", -20.0)),
+            x_comp_slope=float(tool_cfg.get("x_comp_slope", 0.0875)),
         )
     except Exception as exc:
         reset_vision_runtime()
@@ -2435,6 +2406,28 @@ def execute_vision_tool_z(
         )
         research_logger.record("vision_tool_z_error", 1, str(exc))
         return False
+
+    # Absolute grip target for MoveCart($vision.grip_x, ...): vision XY at a
+    # fixed world height, pulled back along the approach direction so the
+    # protruding fingers (not the TCP) meet the object — the clamped
+    # MoveCartRelTRF path did this implicitly. Only published when within safe
+    # reach — beyond it the near-singular arm violates joint/speed limits
+    # before touching the object.
+    grip_z_mm = float(tool_cfg.get("grip_z_mm", 238.5))
+    grip_max_reach_mm = float(tool_cfg.get("grip_max_reach_mm", 425.0))
+    grip_pullback_mm = float(tool_cfg.get("grip_pullback_mm", 12.0))
+    approach_xy = np.asarray(reference_transform.R, dtype=np.float64)[:2, 2]
+    approach_norm = float(np.linalg.norm(approach_xy))
+    if approach_norm > 1e-9:
+        approach_xy = approach_xy / approach_norm
+    grip_x_mm = float(
+        result.target_base_x_mm - grip_pullback_mm * approach_xy[0]
+    )
+    grip_y_mm = float(
+        result.target_base_y_mm - grip_pullback_mm * approach_xy[1]
+    )
+    grip_reach_mm = float(np.linalg.norm([grip_x_mm, grip_y_mm, grip_z_mm]))
+    grip_in_reach = grip_reach_mm <= grip_max_reach_mm
 
     now = time.time()
     runtime = {
@@ -2448,6 +2441,7 @@ def execute_vision_tool_z(
         "z_raw_mm": result.z_raw_mm,
         "z_plus_mm": result.z_plus_mm,
         "z_minus_mm": result.z_minus_mm,
+        "x_comp_mm": result.x_comp_mm,
         "residual_mm": result.residual_mm,
         "clamped": result.clamped,
         "sample_count": int(stable["sample_count"]),
@@ -2457,6 +2451,10 @@ def execute_vision_tool_z(
         "updated_at": now,
         "expires_at": now + float(tool_cfg.get("runtime_max_age_s", 30.0)),
     }
+    if grip_in_reach:
+        runtime["grip_x_mm"] = grip_x_mm
+        runtime["grip_y_mm"] = grip_y_mm
+        runtime["grip_z_mm"] = grip_z_mm
     set_vision_runtime(runtime)
     px_u, px_v = runtime["pick_point_px"]
     emit_program_log(
@@ -2472,8 +2470,22 @@ def execute_vision_tool_z(
         program_log_queue,
         (
             f"Log: Zraw={result.z_raw_mm:.3f} Z+={result.z_plus_mm:.3f} "
-            f"Z-={result.z_minus_mm:.3f} residual={result.residual_mm:.3f} "
+            f"Z-={result.z_minus_mm:.3f} Xcomp={result.x_comp_mm:.3f} "
+            f"residual={result.residual_mm:.3f} "
             f"clamp={'YES' if result.clamped else 'NO'}"
+        ),
+    )
+    emit_program_log(
+        shared_string,
+        program_log_queue,
+        (
+            f"Log: Grip=({grip_x_mm:.3f},{grip_y_mm:.3f},{grip_z_mm:.3f}) "
+            f"pullback={grip_pullback_mm:.1f} reach={grip_reach_mm:.1f} "
+            + (
+                "OK"
+                if grip_in_reach
+                else f"OUT-OF-REACH (max {grip_max_reach_mm:.0f}) grip disabled"
+            )
         ),
     )
     research_logger.record(
@@ -2482,6 +2494,7 @@ def execute_vision_tool_z(
         (
             f"x={result.target_base_x_mm:.3f},y={result.target_base_y_mm:.3f},"
             f"zplus={result.z_plus_mm:.3f},zminus={result.z_minus_mm:.3f},"
+            f"xcomp={result.x_comp_mm:.3f},"
             f"residual={result.residual_mm:.3f},safety={safety}"
         ),
     )

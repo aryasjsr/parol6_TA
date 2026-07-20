@@ -1,0 +1,12 @@
+Begin()
+print("trigger from PLC to Pick")
+ModbusRead(trigger_pick, HIGH, timeout=5)
+ModbusWrite(trigger_place, LOW)
+Delay(10)
+print("trigger to PLC to Place")
+ModbusWrite(trigger_place, HIGH)
+Loop()
+
+
+
+

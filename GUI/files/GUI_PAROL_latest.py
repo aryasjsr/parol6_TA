@@ -28,6 +28,8 @@ import re
 from Commander_feature_adapters import (
     build_vision_pick_sequence,
     clear_timestamp_table,
+    emit_program_log,
+    get_vision_runtime,
     export_timestamp_table as export_timestamp_table_file,
     load_config,
     modbus_manager,
@@ -36,6 +38,18 @@ from Commander_feature_adapters import (
     save_config,
     update_state,
     vision_manager,
+)
+from backend.program_control import (
+    PROGRAM_SIGNAL_PAUSED,
+    PROGRAM_SIGNAL_RUNNING,
+    PROGRAM_SIGNAL_STEP,
+    PROGRAM_SIGNAL_STOP_REQUESTED,
+    RUN_ACTION_QUEUE,
+    RUN_ACTION_START,
+    classify_run_request,
+    has_realtime_program_signal,
+    read_program_signal,
+    write_program_signal,
 )
 
 logging.basicConfig(level = logging.DEBUG,
@@ -57,8 +71,8 @@ else:
 logging.debug(Image_path)
 
 text_size = 13
-PROGRAM_TEXT_FONT_SIZE = 16
-LOG_TEXT_FONT_SIZE = 16
+PROGRAM_TEXT_FONT_SIZE = 18
+LOG_TEXT_FONT_SIZE = 18
 COMMAND_TREE_FONT_SIZE = 11
 COMMAND_HELP_FONT_SIZE = 13
 
@@ -130,7 +144,7 @@ def _lazy_resolve_fonts():
                 FONT_FAMILY_MAIN = list(tkfont.families())[idx]
                 break
         # Best available monospace fonts
-        for mono in ["jetbrains mono", "consolas", "ubuntu mono", "liberation mono", "dejavu sans mono", "courier new"]:
+        for mono in ["jetbrains mono", "consolas", "dejavu sans mono", "liberation mono", "ubuntu mono", "courier new"]:
             if mono in available:
                 idx = available.index(mono)
                 FONT_FAMILY_MONO = list(tkfont.families())[idx]
@@ -166,8 +180,12 @@ class UnifiedCTkFont(_orig_CTkFont):
             family_mapped = family
 
         # 2. Rescale font sizes to a clean, professional hierarchy
+        # (monospace text is exempt: the hierarchy caps at 18px and shrank the
+        # program/log editors to 13px, which was too small to read)
         if size is not None:
-            if size >= 24:
+            if family_mapped == FONT_FAMILY_MONO:
+                size_mapped = int(size)
+            elif size >= 24:
                 size_mapped = 18   # Display
             elif size >= 18:
                 size_mapped = 15   # Heading
@@ -1298,11 +1316,21 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         _grid_labeled_entry(vision_tool.content_frame, 4, 2, "Vision samples", tool_cfg.get("sample_count", 5), store=app.vision_entries, cast=int)
         _grid_labeled_entry(vision_tool.content_frame, 5, 0, "Detection age", tool_cfg.get("detection_max_age_s", 1.0), store=app.vision_entries, cast=float)
         _grid_labeled_entry(vision_tool.content_frame, 5, 2, "Runtime age", tool_cfg.get("runtime_max_age_s", 30.0), store=app.vision_entries, cast=float)
+        _grid_labeled_entry(vision_tool.content_frame, 6, 0, "X comp base", tool_cfg.get("x_comp_base_mm", -20.0), store=app.vision_entries, cast=float)
+        _grid_labeled_entry(vision_tool.content_frame, 6, 2, "X comp slope", tool_cfg.get("x_comp_slope", 0.0875), store=app.vision_entries, cast=float)
+        _grid_labeled_entry(vision_tool.content_frame, 7, 0, "Grip Z", tool_cfg.get("grip_z_mm", 238.5), store=app.vision_entries, cast=float)
+        _grid_labeled_entry(vision_tool.content_frame, 7, 2, "Grip max reach", tool_cfg.get("grip_max_reach_mm", 425.0), store=app.vision_entries, cast=float)
+        _grid_labeled_entry(vision_tool.content_frame, 8, 0, "Grip pullback", tool_cfg.get("grip_pullback_mm", 12.0), store=app.vision_entries, cast=float)
         customtkinter.CTkButton(
             vision_tool.content_frame,
             text="Test Compute Tool-Z (Optional)",
             command=run_vision_pick_now,
-        ).grid(row=6, column=0, columnspan=4, padx=6, pady=(8, 4), sticky="we")
+        ).grid(row=9, column=0, columnspan=4, padx=6, pady=(8, 4), sticky="we")
+        customtkinter.CTkButton(
+            vision_tool.content_frame,
+            text="Test Compute Grip XYZ Base (Optional)",
+            command=run_vision_grip_now,
+        ).grid(row=10, column=0, columnspan=4, padx=6, pady=(0, 4), sticky="we")
 
         calibration = CollapsibleFrame(side, title="Camera Calibration")
         calibration.grid(row=6, column=0, padx=4, pady=6, sticky="ew")
@@ -1510,69 +1538,15 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         app.modbus_save = customtkinter.CTkButton(top.content_frame, text="Save Config", width=90, command=save_modbus_settings)
         app.modbus_save.grid(row=0, column=8, padx=6, pady=6)
 
-        # Container for Block A and Block B tests (now placed higher at row 2 and vertically resizable)
+        # Container for the unified Modbus test (vertically resizable)
         tests = customtkinter.CTkFrame(app.modbus_frame, corner_radius=0)
         tests.grid(row=2, column=0, columnspan=3, padx=12, pady=(0, 6), sticky="nsew")
         tests.grid_columnconfigure((0, 1), weight=1)
-        tests.grid_rowconfigure(0, weight=0)
-        tests.grid_rowconfigure(1, weight=1)
-
-        block_a_cfg = cfg.get("block_a", {})
-        block_a = CollapsibleFrame(tests, title="Blok A - Protocol Performance Test", start_collapsed=True)
-        block_a.grid(row=0, column=0, columnspan=2, padx=0, pady=(0, 6), sticky="ew")
-        block_a.content_frame.grid_columnconfigure((1, 3, 5, 7), weight=1)
-        app.modbus_block_a_entries = {}
-        for col, (label, key, default) in enumerate([
-            ("IP", "ip", cfg.get("ip", "MOCK")),
-            ("Port", "port", cfg.get("port", 502)),
-            ("Slave", "slave_id", cfg.get("slave_id", 1)),
-            ("Timeout ms", "timeout_ms", 1000),
-        ]):
-            customtkinter.CTkLabel(block_a.content_frame, text=label).grid(row=1, column=col * 2, padx=5, pady=3, sticky="w")
-            entry = _entry(block_a.content_frame, block_a_cfg.get(key, default), width=90)
-            entry.grid(row=1, column=col * 2 + 1, padx=5, pady=3, sticky="we")
-            app.modbus_block_a_entries[key] = entry
-        customtkinter.CTkLabel(block_a.content_frame, text="Function").grid(row=2, column=0, padx=5, pady=3, sticky="w")
-        app.modbus_block_a_function = customtkinter.CTkOptionMenu(
-            block_a.content_frame,
-            values=["read_holding_register", "read_input_register", "read_coil", "read_discrete_input", "write_register", "write_coil"],
-        )
-        app.modbus_block_a_function.set(str(block_a_cfg.get("function", "read_holding_register")))
-        app.modbus_block_a_function.grid(row=2, column=1, columnspan=3, padx=5, pady=3, sticky="we")
-        for col, (label, key, default) in enumerate([("Address", "address", 100), ("Count", "count", 1), ("N", "iterations", 1000)], start=2):
-            customtkinter.CTkLabel(block_a.content_frame, text=label).grid(row=2, column=col * 2, padx=5, pady=3, sticky="w")
-            entry = _entry(block_a.content_frame, block_a_cfg.get(key, default), width=80)
-            entry.grid(row=2, column=col * 2 + 1, padx=5, pady=3, sticky="we")
-            app.modbus_block_a_entries[key] = entry
-        customtkinter.CTkButton(block_a.content_frame, text="Start Block A", width=110, command=start_modbus_block_a).grid(row=3, column=0, columnspan=2, padx=5, pady=6, sticky="we")
-        customtkinter.CTkButton(block_a.content_frame, text="Stop", width=70, command=stop_modbus_block_a).grid(row=3, column=2, padx=5, pady=6, sticky="we")
-        app.modbus_block_a_labels = {}
-        for idx, key in enumerate(["progress", "avg_rt_ms", "throughput_rps", "packet_loss_pct", "success_count", "failed_count", "timeout_count"]):
-            label = customtkinter.CTkLabel(block_a.content_frame, text=f"{key}: -", anchor="w")
-            label.grid(row=4 + idx // 4, column=(idx % 4) * 2, columnspan=2, padx=5, pady=2, sticky="we")
-            app.modbus_block_a_labels[key] = label
-
-        block_a.content_frame.grid_rowconfigure(6, weight=1)
-        block_a_log_columns = ("n", "timestamp", "response_ms", "status", "detail")
-        block_a_log_container = customtkinter.CTkFrame(block_a.content_frame, fg_color="transparent")
-        block_a_log_container.grid(row=6, column=0, columnspan=10, padx=5, pady=(4, 2), sticky="nsew")
-        block_a_log_container.grid_columnconfigure(0, weight=1)
-        block_a_log_container.grid_rowconfigure(0, weight=1)
-        app.modbus_block_a_log_tree = ttk.Treeview(block_a_log_container, columns=block_a_log_columns, show="headings", height=6)
-        block_a_log_headings = {"n": "N", "timestamp": "Time", "response_ms": "RT (ms)", "status": "Status", "detail": "Detail"}
-        block_a_log_widths = {"n": 50, "timestamp": 110, "response_ms": 80, "status": 70, "detail": 220}
-        for column in block_a_log_columns:
-            app.modbus_block_a_log_tree.heading(column, text=block_a_log_headings[column])
-            app.modbus_block_a_log_tree.column(column, width=block_a_log_widths[column], stretch=column == "detail")
-        app.modbus_block_a_log_tree.grid(row=0, column=0, sticky="nsew")
-        block_a_log_scroll = ttk.Scrollbar(block_a_log_container, orient="vertical", command=app.modbus_block_a_log_tree.yview)
-        block_a_log_scroll.grid(row=0, column=1, sticky="ns")
-        app.modbus_block_a_log_tree.configure(yscrollcommand=block_a_log_scroll.set)
-        customtkinter.CTkButton(block_a.content_frame, text="Export XLSX", width=110, command=export_modbus_block_a_xlsx).grid(row=7, column=0, columnspan=2, padx=5, pady=(2, 6), sticky="we")
+        tests.grid_rowconfigure(0, weight=1)
 
         block_b_cfg = cfg.get("block_b", {})
-        block_b = CollapsibleFrame(tests, title="Blok B - Cycle Time Test")
-        block_b.grid(row=1, column=0, columnspan=2, padx=0, pady=0, sticky="nsew")
+        block_b = CollapsibleFrame(tests, title="Pengujian Modbus (Per Siklus)")
+        block_b.grid(row=0, column=0, columnspan=2, padx=0, pady=0, sticky="nsew")
         block_b.content_frame.grid_columnconfigure((1, 3, 5, 7), weight=1)
         app.modbus_block_b_entries = {}
         for col, (label, key, default) in enumerate([
@@ -1585,10 +1559,10 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
             entry = _entry(block_b.content_frame, block_b_cfg.get(key, default), width=90)
             entry.grid(row=1, column=col * 2 + 1, padx=5, pady=3, sticky="we")
             app.modbus_block_b_entries[key] = entry
-        customtkinter.CTkButton(block_b.content_frame, text="Start Block B", width=110, command=start_modbus_block_b).grid(row=2, column=0, columnspan=2, padx=5, pady=6, sticky="we")
+        customtkinter.CTkButton(block_b.content_frame, text="Start", width=110, command=start_modbus_block_b).grid(row=2, column=0, columnspan=2, padx=5, pady=6, sticky="we")
         customtkinter.CTkButton(block_b.content_frame, text="Stop", width=70, command=stop_modbus_block_b).grid(row=2, column=2, padx=5, pady=6, sticky="we")
         app.modbus_block_b_labels = {}
-        for idx, key in enumerate(["progress", "avg_s", "min_s", "max_s", "std_s", "success_count", "failed_count", "active"]):
+        for idx, key in enumerate(["progress", "avg_s", "success_count", "failed_count", "active"]):
             label = customtkinter.CTkLabel(block_b.content_frame, text=f"{key}: -", anchor="w")
             label.grid(row=3 + idx // 4, column=(idx % 4) * 2, columnspan=2, padx=5, pady=2, sticky="we")
             app.modbus_block_b_labels[key] = label
@@ -1609,9 +1583,8 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         block_b_log_scroll = ttk.Scrollbar(block_b_log_container, orient="vertical", command=app.modbus_block_b_log_tree.yview)
         block_b_log_scroll.grid(row=0, column=1, sticky="ns")
         app.modbus_block_b_log_tree.configure(yscrollcommand=block_b_log_scroll.set)
-        customtkinter.CTkButton(block_b.content_frame, text="Export XLSX", width=110, command=export_modbus_block_b_xlsx).grid(row=6, column=0, columnspan=2, padx=5, pady=(2, 6), sticky="we")
-        customtkinter.CTkButton(block_b.content_frame, text="Export Cycle Log", width=130, command=export_modbus_cycle_log_xlsx).grid(row=6, column=2, columnspan=2, padx=5, pady=(2, 6), sticky="we")
-        customtkinter.CTkButton(block_b.content_frame, text="Clear Cycle Log", width=120, command=clear_modbus_cycle_log).grid(row=6, column=4, columnspan=2, padx=5, pady=(2, 6), sticky="we")
+        customtkinter.CTkButton(block_b.content_frame, text="Export Data", width=130, command=export_modbus_cycle_log_xlsx).grid(row=6, column=0, columnspan=2, padx=5, pady=(2, 6), sticky="we")
+        customtkinter.CTkButton(block_b.content_frame, text="Clear Data", width=120, command=clear_modbus_cycle_log).grid(row=6, column=2, columnspan=2, padx=5, pady=(2, 6), sticky="we")
 
         # Draggable horizontal divider handle
         app.modbus_h_handle = customtkinter.CTkFrame(app.modbus_frame, height=7, corner_radius=3, fg_color=UI_HANDLE, cursor="sb_v_double_arrow")
@@ -1695,6 +1668,21 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         customtkinter.CTkLabel(jog, text="Lock timeout s").grid(row=0, column=2, padx=6, pady=4, sticky="w")
         app.modbus_jog_timeout = _entry(jog, cfg.get("jog_lock_timeout_s", 5.0), width=80)
         app.modbus_jog_timeout.grid(row=0, column=3, padx=6, pady=4, sticky="we")
+
+        # Write to PLC — only for addresses whose RW is 'write'
+        write_box = customtkinter.CTkFrame(monitor.content_frame, corner_radius=0)
+        write_box.grid(row=5, column=0, padx=8, pady=(0, 8), sticky="ew")
+        write_box.grid_columnconfigure(1, weight=1)
+        customtkinter.CTkLabel(write_box, text="Write to PLC", font=customtkinter.CTkFont(weight="bold")).grid(row=0, column=0, columnspan=3, padx=6, pady=(4, 2), sticky="w")
+        customtkinter.CTkLabel(write_box, text="Signal").grid(row=1, column=0, padx=6, pady=4, sticky="w")
+        app.modbus_write_target = customtkinter.CTkOptionMenu(write_box, values=_writable_modbus_signals() or ["(no writable addresses)"])
+        app.modbus_write_target.grid(row=1, column=1, padx=6, pady=4, sticky="we")
+        customtkinter.CTkButton(write_box, text="↻", width=32, command=refresh_modbus_write_targets).grid(row=1, column=2, padx=6, pady=4)
+        customtkinter.CTkLabel(write_box, text="Value").grid(row=2, column=0, padx=6, pady=4, sticky="w")
+        app.modbus_write_value = _entry(write_box, "", width=120)
+        app.modbus_write_value.grid(row=2, column=1, padx=6, pady=4, sticky="we")
+        customtkinter.CTkButton(write_box, text="Write", width=80, command=write_modbus_value).grid(row=2, column=2, padx=6, pady=4)
+        refresh_modbus_write_targets()
 
     def research_frame():
         title = customtkinter.CTkLabel(app.research_frame, text="Research Logger", font=customtkinter.CTkFont(size=20, weight="bold"))
@@ -1873,6 +1861,11 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
             "Vision samples": "tool_z.sample_count",
             "Detection age": "tool_z.detection_max_age_s",
             "Runtime age": "tool_z.runtime_max_age_s",
+            "X comp base": "tool_z.x_comp_base_mm",
+            "X comp slope": "tool_z.x_comp_slope",
+            "Grip Z": "tool_z.grip_z_mm",
+            "Grip max reach": "tool_z.grip_max_reach_mm",
+            "Grip pullback": "tool_z.grip_pullback_mm",
         }
         for label, key in key_map.items():
             if label in entries:
@@ -1930,20 +1923,15 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
     def save_vision_settings():
         settings = build_vision_settings()
         workspace = build_workspace_settings()
-        previous_cfg = load_config()
-        previous_vision = previous_cfg.get("vision", {})
-        calibration_changed = (
-            str(previous_vision.get("video_source", "")) != str(settings.get("video_source", ""))
-            or float(previous_vision.get("zoom", 1.0)) != float(settings.get("zoom", 1.0))
-            or int(previous_vision.get("camera_width", 1280)) != int(settings.get("camera_width", 1280))
-            or int(previous_vision.get("camera_height", 720)) != int(settings.get("camera_height", 720))
-        )
-        cfg = previous_cfg
+        # Camera-to-Base validity is no longer flipped here. The homography
+        # records the source/zoom/image_size it was solved with, and
+        # WorkspaceValidator.has_camera_to_base_calibration() checks that the
+        # record matches the active settings at use time, so switching source
+        # (e.g. to MOCK and back) no longer destroys a good calibration.
+        cfg = load_config()
         calibration_update = settings.pop("calibration", {})
         cfg["vision"].update(settings)
         cfg["vision"].setdefault("calibration", {}).update(calibration_update)
-        if calibration_changed:
-            cfg["vision"].setdefault("camera_to_base", {})["valid"] = False
         cfg["workspace"].update(workspace)
         save_config(cfg)
         vision_manager.save_settings(settings, workspace)
@@ -2646,6 +2634,28 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
             pass
         research_logger.record("vision_pick_dry_run", len(sequence), "|".join(sequence))
 
+    def run_vision_grip_now():
+        save_vision_settings()
+        try:
+            sequence = build_vision_pick_sequence(shared_string, program_log_queue)
+        except Exception as exc:
+            shared_string.value = f"Error: vision grip failed {exc}".encode("utf-8")[:99]
+            research_logger.record("vision_grip_error", 1, str(exc))
+            return
+        if sequence is None:
+            research_logger.record("vision_grip_dry_run", 0, "compute failed")
+            return
+        runtime = get_vision_runtime()
+        if all(key in runtime for key in ("grip_x_mm", "grip_y_mm", "grip_z_mm")):
+            message = (
+                f"Log: Grip XYZ base = ({runtime['grip_x_mm']:.3f}, "
+                f"{runtime['grip_y_mm']:.3f}, {runtime['grip_z_mm']:.3f}) mm"
+            )
+        else:
+            message = "Log: grip target out of reach; $vision.grip_* disabled"
+        shared_string.value = message.encode("utf-8")[:99]
+        research_logger.record("vision_grip_dry_run", 1, message)
+
     def add_modbus_row(row=None):
         row = row or {"name": "signal", "type": "coil", "address": 0, "rw": "read", "desc": ""}
         app.modbus_table.insert("", "end", values=(row.get("name", "signal"), row.get("type", "coil"), row.get("address", 0), row.get("rw", "read"), row.get("desc", "")))
@@ -2691,6 +2701,70 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
             })
         return rows
 
+    def _writable_modbus_signals():
+        """Names of address-mapping rows whose RW is 'write' (live table first, config fallback)."""
+        signals = []
+        if hasattr(app, "modbus_table"):
+            for item in app.modbus_table.get_children():
+                values = app.modbus_table.item(item, "values")
+                if len(values) >= 4 and str(values[3]).strip().lower() == "write":
+                    name = str(values[0]).strip()
+                    if name:
+                        signals.append(name)
+        if not signals:
+            for entry in load_config()["modbus"].get("addresses", []):
+                if str(entry.get("rw", "")).strip().lower() == "write":
+                    name = str(entry.get("name", "")).strip()
+                    if name:
+                        signals.append(name)
+        return signals
+
+    def _modbus_type_for_signal(name):
+        if hasattr(app, "modbus_table"):
+            for item in app.modbus_table.get_children():
+                values = app.modbus_table.item(item, "values")
+                if values and str(values[0]).strip() == name:
+                    return str(values[1] or "coil").strip().lower()
+        for entry in load_config()["modbus"].get("addresses", []):
+            if str(entry.get("name", "")).strip() == name:
+                return str(entry.get("type", "coil")).strip().lower()
+        return "coil"
+
+    def refresh_modbus_write_targets():
+        if not hasattr(app, "modbus_write_target"):
+            return
+        signals = _writable_modbus_signals()
+        menu_values = signals or ["(no writable addresses)"]
+        app.modbus_write_target.configure(values=menu_values)
+        if app.modbus_write_target.get() not in menu_values:
+            app.modbus_write_target.set(menu_values[0])
+
+    def write_modbus_value():
+        target = app.modbus_write_target.get()
+        if target not in _writable_modbus_signals():
+            shared_string.value = b'Log: No writable Modbus address selected'
+            return
+        raw = app.modbus_write_value.get().strip()
+        reg_type = _modbus_type_for_signal(target)
+        if reg_type in {"holding_register", "register"}:
+            try:
+                value = int(float(raw))
+            except ValueError:
+                shared_string.value = b'Log: Modbus write value must be an integer word'
+                return
+        else:
+            value = raw
+        try:
+            ok = modbus_manager.write_value(target, value)
+        except Exception as exc:
+            shared_string.value = ('Log: Modbus write failed: ' + str(exc)).encode()
+            return
+        if ok:
+            research_logger.record("modbus_write", 1, target + "=" + str(value))
+            shared_string.value = ('Log: Modbus wrote ' + target + ' = ' + str(value)).encode()
+        else:
+            shared_string.value = ('Log: Modbus write to ' + target + ' failed').encode()
+
     def save_modbus_settings():
         modbus_manager.save_config(
             app.modbus_entries["ip"].get(),
@@ -2700,7 +2774,7 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
             _entry_value(app.modbus_jog_speed, 20, float),
             _entry_value(app.modbus_jog_timeout, 5.0, float),
         )
-        if hasattr(app, "modbus_block_a_entries"):
+        if hasattr(app, "modbus_block_b_entries"):
             _save_modbus_block_settings()
         research_logger.record("modbus_settings_saved", 1)
         shared_string.value = b'Log: Modbus settings saved'
@@ -2714,19 +2788,6 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         modbus_manager.stop()
         research_logger.record("modbus_stop", 1)
 
-    def _modbus_block_a_settings():
-        entries = getattr(app, "modbus_block_a_entries", {})
-        return {
-            "ip": (entries["ip"].get().strip() or "MOCK") if "ip" in entries else "MOCK",
-            "port": int(_entry_value(entries.get("port"), 502, int)) if "port" in entries else 502,
-            "slave_id": int(_entry_value(entries.get("slave_id"), 1, int)) if "slave_id" in entries else 1,
-            "timeout_ms": int(_entry_value(entries.get("timeout_ms"), 1000, int)) if "timeout_ms" in entries else 1000,
-            "iterations": int(_entry_value(entries.get("iterations"), 1000, int)) if "iterations" in entries else 1000,
-            "function": app.modbus_block_a_function.get() if hasattr(app, "modbus_block_a_function") else "read_holding_register",
-            "address": int(_entry_value(entries.get("address"), 100, int)) if "address" in entries else 100,
-            "count": int(_entry_value(entries.get("count"), 1, int)) if "count" in entries else 1,
-        }
-
     def _modbus_block_b_settings():
         entries = getattr(app, "modbus_block_b_entries", {})
         return {
@@ -2737,25 +2798,14 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         }
 
     def _save_modbus_block_settings():
-        block_a = _modbus_block_a_settings() if hasattr(app, "modbus_block_a_entries") else None
         block_b = _modbus_block_b_settings() if hasattr(app, "modbus_block_b_entries") else None
-        modbus_manager.save_block_test_config(block_a=block_a, block_b=block_b)
-        return block_a, block_b
-
-    def start_modbus_block_a():
-        block_a, _ = _save_modbus_block_settings()
-        if block_a is not None:
-            modbus_manager.start_block_a(block_a)
-            research_logger.record("modbus_block_a_ui_start", int(block_a.get("iterations", 0)))
-
-    def stop_modbus_block_a():
-        modbus_manager.stop_block_a()
-        research_logger.record("modbus_block_a_ui_stop", 1)
+        modbus_manager.save_block_test_config(block_b=block_b)
+        return block_b
 
     def start_modbus_block_b():
         save_modbus_settings()
         modbus_manager.start()
-        _, block_b = _save_modbus_block_settings()
+        block_b = _save_modbus_block_settings()
         if block_b is not None:
             app._modbus_block_b_cycle_active = False
             modbus_manager.start_block_b(block_b)
@@ -2789,123 +2839,6 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         except Exception:
             response_time_ms = 0.0
         return response_time_ms, packet_status
-
-    def _write_modbus_samples_workbook(path, samples, sheet_title, columns, headings, meta):
-        ext = os.path.splitext(path)[1].lower()
-        iso_columns = {"timestamp"}
-        if ext == ".csv":
-            import csv as _csv
-            with open(path, "w", newline="", encoding="utf-8") as fh:
-                writer = _csv.writer(fh)
-                writer.writerow([headings.get(c, c) for c in columns])
-                for sample in samples:
-                    row = []
-                    for c in columns:
-                        v = sample.get(c, "")
-                        if c in iso_columns and v not in ("", None):
-                            try:
-                                v = datetime.fromtimestamp(float(v)).isoformat(timespec="milliseconds")
-                            except Exception:
-                                pass
-                        row.append(v)
-                    writer.writerow(row)
-            return path
-        from openpyxl import Workbook
-        wb = Workbook()
-        ws = wb.active
-        ws.title = sheet_title[:31] if sheet_title else "Samples"
-        ws.append([headings.get(c, c) for c in columns])
-        for sample in samples:
-            row = []
-            for c in columns:
-                v = sample.get(c, "")
-                if c in iso_columns and v not in ("", None):
-                    try:
-                        v = datetime.fromtimestamp(float(v)).isoformat(timespec="milliseconds")
-                    except Exception:
-                        pass
-                row.append(v)
-            ws.append(row)
-        summary_ws = wb.create_sheet("Summary")
-        summary_ws.append(["Field", "Value"])
-        for key in ("started_at", "finished_at"):
-            value = meta.get(key)
-            if value:
-                try:
-                    value = datetime.fromtimestamp(float(value)).isoformat(timespec="milliseconds")
-                except Exception:
-                    pass
-            summary_ws.append([key, value if value is not None else ""])
-        for key in ("target", "completed", "stopped_early"):
-            summary_ws.append([key, meta.get(key, "")])
-        stats = meta.get("stats", {}) or {}
-        for key, value in stats.items():
-            summary_ws.append([f"stat.{key}", value])
-        settings = meta.get("settings", {}) or {}
-        for key, value in settings.items():
-            summary_ws.append([f"setting.{key}", value])
-        wb.save(path)
-        return path
-
-    def export_modbus_block_a_xlsx():
-        samples = modbus_manager.get_block_a_full_samples()
-        if not samples:
-            messagebox.showwarning("Export Blok A", "Belum ada data. Jalankan test Blok A terlebih dahulu.")
-            return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".xlsx",
-            initialfile=f"modbus_block_a_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
-            filetypes=(("Excel", "*.xlsx"), ("CSV", "*.csv")),
-        )
-        if not path:
-            return
-        meta = modbus_manager.get_block_a_full_meta()
-        if not meta.get("stats"):
-            meta["stats"] = read_state("modbus_block_a", {}).get("stats", {})
-        try:
-            exported = _write_modbus_samples_workbook(
-                path,
-                samples,
-                "Block A Samples",
-                ("n", "timestamp", "response_ms", "status", "detail"),
-                {"n": "N", "timestamp": "Timestamp", "response_ms": "Response (ms)", "status": "Status", "detail": "Detail"},
-                meta,
-            )
-        except Exception as exc:
-            messagebox.showerror("Export Blok A", f"Gagal export: {exc}")
-            return
-        research_logger.record("modbus_block_a_export", 1, str(exported))
-        messagebox.showinfo("Export Blok A", f"Berhasil disimpan ke:\n{exported}")
-
-    def export_modbus_block_b_xlsx():
-        samples = modbus_manager.get_block_b_full_samples()
-        if not samples:
-            messagebox.showwarning("Export Blok B", "Belum ada data. Jalankan test Blok B terlebih dahulu.")
-            return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".xlsx",
-            initialfile=f"modbus_block_b_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
-            filetypes=(("Excel", "*.xlsx"), ("CSV", "*.csv")),
-        )
-        if not path:
-            return
-        meta = modbus_manager.get_block_b_full_meta()
-        if not meta.get("stats"):
-            meta["stats"] = read_state("modbus_block_b", {}).get("stats", {})
-        try:
-            exported = _write_modbus_samples_workbook(
-                path,
-                samples,
-                "Block B Samples",
-                ("index", "timestamp", "status", "duration_s", "note"),
-                {"index": "Index", "timestamp": "Timestamp", "status": "Status", "duration_s": "Duration (s)", "note": "Note"},
-                meta,
-            )
-        except Exception as exc:
-            messagebox.showerror("Export Blok B", f"Gagal export: {exc}")
-            return
-        research_logger.record("modbus_block_b_export", 1, str(exported))
-        messagebox.showinfo("Export Blok B", f"Berhasil disimpan ke:\n{exported}")
 
     def export_modbus_cycle_log_xlsx():
         rows = modbus_manager.get_modbus_cycle_log()
@@ -3183,45 +3116,11 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         research_logger.record("modbus_jog", joint_id + 1, "positive" if direction_positive else "negative")
         app.after(220, lambda idx=button_index: release_modbus_jog(idx))
 
-    def _update_modbus_block_a_ui():
-        if not hasattr(app, "modbus_block_a_labels"):
-            return
-        state = read_state("modbus_block_a", {})
-        if not isinstance(state, dict):
-            state = {}
-        stats = state.get("stats", {}) if isinstance(state.get("stats"), dict) else {}
-        completed = int(state.get("completed", 0) or 0)
-        target = int(state.get("target", 0) or 0)
-        app.modbus_block_a_labels["progress"].configure(text=f"progress: {completed}/{target} {'RUNNING' if state.get('running') else 'IDLE'}")
-        for key in ["avg_rt_ms", "throughput_rps", "packet_loss_pct", "success_count", "failed_count", "timeout_count"]:
-            app.modbus_block_a_labels[key].configure(text=f"{key}: {stats.get(key, '-')}")
-        if hasattr(app, "modbus_block_a_log_tree"):
-            samples = modbus_manager.get_block_a_full_samples()
-            tree = app.modbus_block_a_log_tree
-            rendered = getattr(app, "_modbus_block_a_log_rendered", 0)
-            if len(samples) < rendered:
-                tree.delete(*tree.get_children())
-                rendered = 0
-            new_rows = samples[rendered:]
-            for sample in new_rows:
-                detail = str(sample.get("detail", ""))
-                if len(detail) > 200:
-                    detail = detail[:197] + "..."
-                tree.insert("", "end", values=(
-                    sample.get("n", ""),
-                    _format_modbus_timestamp(sample.get("timestamp")),
-                    sample.get("response_ms", ""),
-                    sample.get("status", ""),
-                    detail,
-                ))
-            if new_rows:
-                tree.yview_moveto(1.0)
-            app._modbus_block_a_log_rendered = len(samples)
-
     def _handle_modbus_block_b(modbus_state):
         snapshot = modbus_state.get("snapshot", {}) if isinstance(modbus_state, dict) else {}
         state = read_state("modbus_block_b", {})
         if not isinstance(state, dict) or not state.get("running"):
+            app._modbus_block_b_trigger_pending = False
             return False
         trigger_name = str(state.get("trigger_name", "trigger_pick"))
         trigger = bool(snapshot.get(trigger_name, False))
@@ -3229,8 +3128,19 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
             app._last_modbus_block_b_trigger = False
         rising = trigger and not app._last_modbus_block_b_trigger
         app._last_modbus_block_b_trigger = trigger
+        if rising:
+            # Latch the edge: a trigger that arrives while the previous cycle
+            # is still being finalized must start the next cycle once the
+            # robot is idle, not be silently consumed.
+            app._modbus_block_b_trigger_pending = True
 
-        if rising and not state.get("active_cycle") and Buttons[7] == 0:
+        if (
+            getattr(app, "_modbus_block_b_trigger_pending", False)
+            and not state.get("active_cycle")
+            and not getattr(app, "_modbus_block_b_cycle_active", False)
+            and Buttons[7] == 0
+        ):
+            app._modbus_block_b_trigger_pending = False
             response_time_ms, packet_status = _modbus_trigger_packet_meta(modbus_state)
             if modbus_manager.block_b_cycle_started(response_time_ms, packet_status):
                 app._modbus_block_b_cycle_active = True
@@ -3260,8 +3170,7 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         app.modbus_block_b_labels["active"].configure(text=f"active: {bool(state.get('active_cycle', False))}")
         app.modbus_block_b_labels["success_count"].configure(text=f"success_count: {state.get('success_count', 0)}")
         app.modbus_block_b_labels["failed_count"].configure(text=f"failed_count: {state.get('failed_count', 0)}")
-        for key in ["avg_s", "min_s", "max_s", "std_s"]:
-            app.modbus_block_b_labels[key].configure(text=f"{key}: {stats.get(key, '-')}")
+        app.modbus_block_b_labels["avg_s"].configure(text=f"avg_s: {stats.get('avg_s', '-')}")
         if hasattr(app, "modbus_block_b_log_tree"):
             samples = modbus_manager.get_block_b_full_samples()
             tree = app.modbus_block_b_log_tree
@@ -3293,7 +3202,6 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         snapshot = modbus_state.get("snapshot", {}) if isinstance(modbus_state, dict) else {}
         app.modbus_status.configure(text="Status: " + str(modbus_state.get("description", "Disconnected")))
         _set_tree_rows(app.modbus_monitor_table, [(key, value) for key, value in snapshot.items()])
-        _update_modbus_block_a_ui()
         block_b_running = _handle_modbus_block_b(modbus_state)
         _update_modbus_block_b_ui()
         trigger = bool(snapshot.get("trigger_pick", False))
@@ -3686,19 +3594,31 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
 
 
         
-    def _program_file_display_name():
-        if Now_open_txt:
-            return os.path.basename(Now_open_txt)
+    def _program_textbox(slot=None):
+        slot = slot or getattr(app, "_selected_program_slot", 1)
+        return app.program_textboxes[int(slot)]
+
+    def _select_program_slot(slot):
+        slot = int(slot)
+        app._selected_program_slot = slot
+        for pane_slot, pane in getattr(app, "program_panes", {}).items():
+            pane.configure(border_color=UI_ACCENT if pane_slot == slot else UI_BORDER)
+
+    def _program_file_display_name(slot):
+        file_path = app.program_files.get(int(slot), "")
+        if file_path:
+            return os.path.basename(file_path)
         return "No .txt file opened"
 
-    def _update_open_txt_preview():
-        label = getattr(app, "program_file_label", None)
+    def _update_open_txt_preview(slot):
+        slot = int(slot)
+        label = getattr(app, "program_file_labels", {}).get(slot)
         if label is None:
             return
 
-        display_name = _program_file_display_name()
-        saved_content = getattr(app, "_program_saved_content", None)
-        textbox = getattr(app, "textbox_program", None)
+        display_name = _program_file_display_name(slot)
+        saved_content = app.program_saved_contents.get(slot)
+        textbox = _program_textbox(slot)
         if textbox is not None and saved_content is not None:
             try:
                 if textbox.get("1.0", tk.END) != saved_content:
@@ -3707,67 +3627,88 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
                 pass
         _set_text(label, "File: " + display_name)
 
-    def _mark_program_saved():
-        app._program_saved_content = app.textbox_program.get("1.0", tk.END)
-        _update_open_txt_preview()
+    def _mark_program_saved(slot):
+        slot = int(slot)
+        app.program_saved_contents[slot] = _program_textbox(slot).get("1.0", tk.END)
+        _update_open_txt_preview(slot)
 
-    def _write_program_file(file_path):
+    def _write_program_file(file_path, slot):
         with open(file_path, "w") as text_file:
-            text_file.write(app.textbox_program.get("1.0", tk.END))
-        _mark_program_saved()
+            text_file.write(_program_textbox(slot).get("1.0", tk.END))
+        _mark_program_saved(slot)
 
-    def _confirm_save_current_program():
-        global Now_open_txt
+    def _confirm_save_current_program(slot):
+        slot = int(slot)
+        file_path = app.program_files.get(slot, "")
+        if not file_path:
+            return save_as_txt(slot)
 
-        if not Now_open_txt:
-            return save_as_txt()
-
-        filename = os.path.basename(Now_open_txt)
-        if not messagebox.askyesno("Confirm Save", f"Save changes to {filename}?"):
+        filename = os.path.basename(file_path)
+        if not messagebox.askyesno("Confirm Save", f"Save Program {slot} changes to {filename}?"):
             return False
 
-        _write_program_file(Now_open_txt)
+        _write_program_file(file_path, slot)
         return True
 
-    def _confirm_discard_or_save_changes():
-        saved_content = getattr(app, "_program_saved_content", None)
-        if saved_content is None or app.textbox_program.get("1.0", tk.END) == saved_content:
+    def _confirm_discard_or_save_changes(slot):
+        slot = int(slot)
+        saved_content = app.program_saved_contents.get(slot)
+        if saved_content is None or _program_textbox(slot).get("1.0", tk.END) == saved_content:
             return True
 
         answer = messagebox.askyesnocancel(
             "Unsaved Changes",
-            "Save changes before opening another .txt file?",
+            f"Save Program {slot} changes before opening another .txt file?",
         )
         if answer is None:
             return False
         if answer:
-            return _confirm_save_current_program()
+            return _confirm_save_current_program(slot)
         return True
 
-    def highlight_words_program(event):
+    def highlight_words_program(event, slot=None):
         # Re-tagging scans the whole textbox for every command word, so only do
         # it when the content actually changed. The periodic Stuff_To_Update
         # calls this 15x/s; without the cache it rescans the full text each tick
         # (a big slowdown, especially when the window is maximized/fullscreen).
-        content = app.textbox_program.get("1.0", tk.END)
-        if getattr(app, "_program_highlight_cache", None) == content:
+        slot = int(slot or getattr(app, "_selected_program_slot", 1))
+        textbox = _program_textbox(slot)
+        content = textbox.get("1.0", tk.END)
+        if app.program_highlight_cache.get(slot) == content:
             return
-        app._program_highlight_cache = content
+        app.program_highlight_cache[slot] = content
 
-        app.textbox_program.tag_config("green", foreground="green")
+        textbox.tag_config("green", foreground="green")
         words = PAROL6_ROBOT.Commands_list
 
         for word in words:
             start = "1.0"
             while True:
-                start = app.textbox_program.search(word, start, stopindex=tk.END)
+                start = textbox.search(word, start, stopindex=tk.END)
                 if not start:
                     break
                 end = f"{start}+{len(word)}c"
-                app.textbox_program.tag_add("green", start, end)
+                textbox.tag_add("green", start, end)
                 start = end
 
-        _update_open_txt_preview()
+        _update_open_txt_preview(slot)
+
+    def _program_select_all(event):
+        """Select all text in the focused native Tk editor."""
+        textbox = event.widget
+        textbox.tag_add(tk.SEL, "1.0", "end-1c")
+        textbox.mark_set(tk.INSERT, "1.0")
+        textbox.see(tk.INSERT)
+        return "break"
+
+    def _program_undo(event):
+        """Undo in only the editor that currently owns keyboard focus."""
+        try:
+            event.widget.edit_undo()
+        except tk.TclError:
+            # Tk raises when the per-editor undo stack is empty.
+            pass
+        return "break"
 
     def highlight_words_response(event):
         # Same idea as highlight_words_program: skip the full rescan unless the
@@ -3792,54 +3733,104 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
 
     # dodaj slikice kao iz meca studio
     def program_frames():
-        #program frame
+        # Two independent editor slots share one exclusive robot executor.
         app.program_frame = customtkinter.CTkFrame(app,height = 400, width = 550, corner_radius=8, fg_color=UI_SURFACE, border_width=1, border_color=UI_BORDER)
         app.program_frame.grid(row=1, column=1, columnspan=2, padx=(5,0), pady=5, sticky="nsew")
-        app.program_frame.grid_columnconfigure(0, weight=1)
-        app.program_frame.grid_rowconfigure(1, weight=0)
-        app.program_frame.grid_rowconfigure(1, weight=1)
+        app.program_frame.grid_columnconfigure((0, 1), weight=1, uniform="program_editor")
+        app.program_frame.grid_rowconfigure(0, weight=1)
+        app.program_textboxes = {}
+        app.program_panes = {}
+        app.program_file_labels = {}
+        app.program_files = {1: "", 2: ""}
+        app.program_saved_contents = {}
+        app.program_highlight_cache = {1: None, 2: None}
+        app._selected_program_slot = 1
+        app._active_program_slot = None
+        app._queued_program_slot = None
+        app._queued_program_start_pending = False
 
-        app.program_label = customtkinter.CTkLabel(app.program_frame, text="Program:", font=customtkinter.CTkFont(size=16))
-        app.program_label.grid(row=0, column=0, padx=(10,10), pady=5, sticky="w")
+        for slot in (1, 2):
+            pane = customtkinter.CTkFrame(
+                app.program_frame,
+                corner_radius=6,
+                fg_color=UI_SURFACE,
+                border_width=2,
+                border_color=UI_ACCENT if slot == 1 else UI_BORDER,
+            )
+            pane.grid(row=0, column=slot - 1, padx=(8 if slot == 1 else 4, 4 if slot == 1 else 8), pady=8, sticky="nsew")
+            pane.grid_columnconfigure(0, weight=1)
+            pane.grid_rowconfigure(1, weight=1)
+            app.program_panes[slot] = pane
 
-        app.program_file_label = customtkinter.CTkLabel(app.program_frame, text="File: No .txt file opened", font=customtkinter.CTkFont(size=14), anchor="e")
-        app.program_file_label.grid(row=0, column=1, padx=(10, 20), pady=5, sticky="e")
+            header = customtkinter.CTkFrame(pane, fg_color="transparent")
+            header.grid(row=0, column=0, padx=8, pady=(5, 2), sticky="ew")
+            header.grid_columnconfigure(1, weight=1)
+            customtkinter.CTkLabel(
+                header,
+                text=f"Program {slot}",
+                font=customtkinter.CTkFont(size=16, weight="bold"),
+            ).grid(row=0, column=0, padx=(0, 8), sticky="w")
+            file_label = customtkinter.CTkLabel(
+                header,
+                text="File: No .txt file opened",
+                font=customtkinter.CTkFont(size=13),
+                anchor="e",
+            )
+            file_label.grid(row=0, column=1, sticky="e")
+            app.program_file_labels[slot] = file_label
 
-        app.textbox_program = customtkinter.CTkTextbox(app.program_frame, font=customtkinter.CTkFont(size=PROGRAM_TEXT_FONT_SIZE, family='JetBrains Mono'), fg_color=UI_SURFACE_LOW, text_color=UI_ON_SURFACE, border_color=UI_BORDER, border_width=1, corner_radius=6)
-        app.textbox_program.grid(row=1, column=0,columnspan=2, padx=(20, 20), pady=(5, 20), sticky="nsew")
+            textbox = customtkinter.CTkTextbox(
+                pane,
+                font=customtkinter.CTkFont(size=PROGRAM_TEXT_FONT_SIZE, family='JetBrains Mono'),
+                fg_color=UI_SURFACE_LOW,
+                text_color=UI_ON_SURFACE,
+                border_color=UI_BORDER,
+                border_width=1,
+                corner_radius=6,
+                undo=True,
+                autoseparators=True,
+                maxundo=-1,
+            )
+            textbox.grid(row=1, column=0, padx=8, pady=(2, 8), sticky="nsew")
+            textbox.bind("<KeyRelease>", lambda event, s=slot: highlight_words_program(event, s))
+            textbox.bind("<FocusIn>", lambda event, s=slot: _select_program_slot(s))
+            textbox.bind("<Control-a>", _program_select_all)
+            textbox.bind("<Control-A>", _program_select_all)
+            textbox.bind("<Control-z>", _program_undo)
+            textbox.bind("<Control-Z>", _program_undo)
+            app.program_textboxes[slot] = textbox
+            _mark_program_saved(slot)
 
-        app.textbox_program.bind("<KeyRelease>", highlight_words_program)
-        _mark_program_saved()
+        # Compatibility alias for integrations that still target Program 1.
+        app.textbox_program = app.program_textboxes[1]
 
 
     def start_stop_frame():
         app.start_stop_frame = customtkinter.CTkFrame(app,height = 30, corner_radius=8, fg_color=UI_SURFACE, border_width=1, border_color=UI_BORDER)
         app.start_stop_frame.grid(row=2, column=1, columnspan=2, padx=(5,0), pady=5, sticky="nsew")
-        app.start_stop_frame.grid_columnconfigure(0, weight=0)
+        app.start_stop_frame.grid_columnconfigure(0, weight=1)
         #app.response_frame.grid_rowconfigure(1, weight=0)
         #app.response_frame.grid_rowconfigure(1, weight=1)
 
         _btn_font = customtkinter.CTkFont(family='Inter', size=15, weight='bold')
-        app.start = customtkinter.CTkButton(app.start_stop_frame,text="Run",width= 50, font=_btn_font, fg_color=UI_SUCCESS, hover_color="#1ea800", text_color="#ffffff", command = execute_program)
-        app.start.grid(row=0, column=0, padx=2,pady = 5,sticky="w")
-
-        app.pause_resume = customtkinter.CTkButton(app.start_stop_frame,text="Pause", width= 55, font=_btn_font, fg_color=UI_WARN, hover_color="#cc9300", text_color="#241a00", command = pause_resume_program)
-        app.pause_resume.grid(row=0, column=1, padx=2,pady = 5,sticky="w")
-
-        app.stop = customtkinter.CTkButton(app.start_stop_frame,text="Stop", width= 50, font=_btn_font, fg_color=UI_DANGER, hover_color="#b71c1c", text_color="#ffffff", command = stop_program)
-        app.stop.grid(row=0, column=2, padx=2,pady = 5,sticky="w")
-
-        app.step = customtkinter.CTkButton(app.start_stop_frame,text="Step", width= 50, font=_btn_font, command = step_program)
-        app.step.grid(row=0, column=3, padx=2,pady = 5,sticky="w")
-
-        app.save = customtkinter.CTkButton(app.start_stop_frame,text="Save",width= 50, font=_btn_font, command = save_txt)
-        app.save.grid(row=0, column=4, padx=2,pady = 5,sticky="w")
-
-        app.save_as = customtkinter.CTkButton(app.start_stop_frame,text="Save as", width= 35,font = customtkinter.CTkFont(size=15, family='TkDefaultFont'),command = save_as_txt)
-        app.save_as.grid(row=0, column=5, padx=2,pady = 5,sticky="w")
-
-        app.open = customtkinter.CTkButton(app.start_stop_frame,text="Open",width= 35, font = customtkinter.CTkFont(size=15, family='TkDefaultFont'),command = open_txt)
-        app.open.grid(row=0, column=6, padx=2,pady = 5,sticky="w")
+        app.pause_resume_buttons = {}
+        app.program_status_labels = {}
+        for slot in (1, 2):
+            controls = customtkinter.CTkFrame(app.start_stop_frame, fg_color="transparent")
+            controls.grid(row=slot - 1, column=0, padx=4, pady=2, sticky="ew")
+            controls.grid_columnconfigure(7, weight=1)
+            customtkinter.CTkButton(controls, text=f"Run {slot}", width=62, font=_btn_font, fg_color=UI_SUCCESS, hover_color="#1ea800", text_color="#ffffff", command=lambda s=slot: execute_program(s)).grid(row=0, column=0, padx=2, pady=3)
+            pause_button = customtkinter.CTkButton(controls, text=f"Pause {slot}", width=72, font=_btn_font, fg_color=UI_WARN, hover_color="#cc9300", text_color="#241a00", command=lambda s=slot: pause_resume_program(s))
+            pause_button.grid(row=0, column=1, padx=2, pady=3)
+            app.pause_resume_buttons[slot] = pause_button
+            customtkinter.CTkButton(controls, text=f"Stop {slot}", width=64, font=_btn_font, fg_color=UI_DANGER, hover_color="#b71c1c", text_color="#ffffff", command=lambda s=slot: stop_program(s)).grid(row=0, column=2, padx=2, pady=3)
+            customtkinter.CTkButton(controls, text=f"Step {slot}", width=64, font=_btn_font, command=lambda s=slot: step_program(s)).grid(row=0, column=3, padx=2, pady=3)
+            customtkinter.CTkButton(controls, text=f"Save {slot}", width=64, font=_btn_font, command=lambda s=slot: save_txt(s)).grid(row=0, column=4, padx=2, pady=3)
+            customtkinter.CTkButton(controls, text="Save as", width=66, font=_btn_font, command=lambda s=slot: save_as_txt(s)).grid(row=0, column=5, padx=2, pady=3)
+            customtkinter.CTkButton(controls, text="Open", width=58, font=_btn_font, command=lambda s=slot: open_txt(s)).grid(row=0, column=6, padx=2, pady=3)
+            status = customtkinter.CTkLabel(controls, text=f"Program {slot}: IDLE", font=customtkinter.CTkFont(size=14, weight="bold"), anchor="e")
+            status.grid(row=0, column=7, padx=(12, 8), sticky="e")
+            app.program_status_labels[slot] = status
 
 
     # dodaj slikice kao iz meca studio
@@ -4162,49 +4153,50 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
                 return
             logging.debug(value[0])
             show_command_help(value[0])
+            program_editor = _program_textbox()
             if value[0] == "Cartesian_space" or value[0] == "Joint_space" or value[0] == "Conditional_stetements" or value[0] == "Vision" or value[0] == "Modbus" or value[0] == "Research":
                 None
                 # Do nothing here because these are the selection menus
             elif Current_Custom_pose_select == "Current":
                 if value[0] == "MoveJoint":
-                    app.textbox_program.insert(tk.INSERT, str(value[0]) + "(" + Joint1_value + "," + Joint2_value + "," +Joint3_value + "," +
+                    program_editor.insert(tk.INSERT, str(value[0]) + "(" + Joint1_value + "," + Joint2_value + "," +Joint3_value + "," +
                                                Joint4_value +"," + Joint5_value +"," + Joint6_value + ")" +"\n")                    
 
                 elif value[0] == "MovePose":
-                    app.textbox_program.insert(tk.INSERT, str(value[0]) + "(" + x_value + "," + y_value + "," +z_value + "," +
+                    program_editor.insert(tk.INSERT, str(value[0]) + "(" + x_value + "," + y_value + "," +z_value + "," +
                                                Rx_pos +"," + Ry_pos +"," + Rz_pos + ")" +"\n")   
 
                 elif value[0] == "MoveCart":
-                    app.textbox_program.insert(tk.INSERT, str(value[0]) + "(" + x_value + "," + y_value + "," +z_value + "," +
+                    program_editor.insert(tk.INSERT, str(value[0]) + "(" + x_value + "," + y_value + "," +z_value + "," +
                                                Rx_pos +"," + Ry_pos +"," + Rz_pos + ")" +"\n")   
                     
                 elif value[0] == "MoveCartRelTRF":
-                    app.textbox_program.insert(tk.INSERT, str(value[0]) + "(" + str(0) + "," + str(0) + "," +str(0) + "," +
+                    program_editor.insert(tk.INSERT, str(value[0]) + "(" + str(0) + "," + str(0) + "," +str(0) + "," +
                                 str(0) +"," + str(0) +"," + str(0) + ")" +"\n")   
                 elif value[0] == "vision":
-                    app.textbox_program.insert(tk.INSERT, "vision()" + "\n")
+                    program_editor.insert(tk.INSERT, "vision()" + "\n")
                 elif value[0] == "ModbusRead":
-                    app.textbox_program.insert(tk.INSERT, "ModbusRead(trigger_pick, HIGH, timeout=5)" + "\n")
+                    program_editor.insert(tk.INSERT, "ModbusRead(trigger_pick, HIGH, timeout=5)" + "\n")
                 elif value[0] == "ModbusWrite":
-                    app.textbox_program.insert(tk.INSERT, "ModbusWrite(cycle_done, HIGH)" + "\n")
+                    program_editor.insert(tk.INSERT, "ModbusWrite(cycle_done, HIGH)" + "\n")
                 elif value[0] == "timestamp":
-                    app.textbox_program.insert(tk.INSERT, "timestamp(label=\"event\", record)" + "\n")
+                    program_editor.insert(tk.INSERT, "timestamp(label=\"event\", record)" + "\n")
                 elif value[0] == "print":
-                    app.textbox_program.insert(tk.INSERT, "print(\"tes 1\")" + "\n")
+                    program_editor.insert(tk.INSERT, "print(\"tes 1\")" + "\n")
                 else:
-                    app.textbox_program.insert(tk.INSERT, str(value[0]) + "()" +"\n")
+                    program_editor.insert(tk.INSERT, str(value[0]) + "()" +"\n")
           
             elif Current_Custom_pose_select == "Custom":
                 if value[0] == "ModbusRead":
-                    app.textbox_program.insert(tk.INSERT, "ModbusRead(trigger_pick, HIGH, timeout=5)" + "\n")
+                    program_editor.insert(tk.INSERT, "ModbusRead(trigger_pick, HIGH, timeout=5)" + "\n")
                 elif value[0] == "ModbusWrite":
-                    app.textbox_program.insert(tk.INSERT, "ModbusWrite(cycle_done, HIGH)" + "\n")
+                    program_editor.insert(tk.INSERT, "ModbusWrite(cycle_done, HIGH)" + "\n")
                 elif value[0] == "timestamp":
-                    app.textbox_program.insert(tk.INSERT, "timestamp(label=\"event\", record)" + "\n")
+                    program_editor.insert(tk.INSERT, "timestamp(label=\"event\", record)" + "\n")
                 elif value[0] == "print":
-                    app.textbox_program.insert(tk.INSERT, "print(\"tes 1\")" + "\n")
+                    program_editor.insert(tk.INSERT, "print(\"tes 1\")" + "\n")
                 else:
-                    app.textbox_program.insert(tk.INSERT, str(value[0]) + "()" +"\n")
+                    program_editor.insert(tk.INSERT, str(value[0]) + "()" +"\n")
 
         app.table.bind('<ButtonRelease-1>', select)
 
@@ -4545,93 +4537,184 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         Current_Custom_pose_select = "Custom"
         logging.debug(Current_Custom_pose_select)
 
-    # save u neki temp file?
-    def open_txt():
-
-        global Now_open_txt
-        logging.debug("Open txt")
-        logging.debug(Now_open_txt)
-        if not _confirm_discard_or_save_changes():
+    def open_txt(slot=1):
+        slot = int(slot)
+        _select_program_slot(slot)
+        logging.debug("Open txt for Program %s", slot)
+        if not _confirm_discard_or_save_changes(slot):
             return
 
-        text_file = filedialog.askopenfilename(initialdir = Image_path + "/Programs",title = "open text file", filetypes= (("Text Files","*.txt"),))
+        text_file = filedialog.askopenfilename(
+            initialdir=Image_path + "/Programs",
+            title=f"Open Program {slot}",
+            filetypes=(("Text Files", "*.txt"),),
+        )
         if not text_file:
             return
 
-        logging.debug(text_file)
-        Now_open_txt = text_file
-        app.textbox_program.delete('1.0', tk.END)
-        with open(text_file, 'r') as opened_file:
-            temp_var = opened_file.read()
-        app.textbox_program.insert(tk.END,temp_var)
-        _mark_program_saved()
-        app._program_highlight_cache = None
-        highlight_words_program(None)
+        app.program_files[slot] = text_file
+        textbox = _program_textbox(slot)
+        textbox.delete("1.0", tk.END)
+        with open(text_file, "r") as opened_file:
+            textbox.insert(tk.END, opened_file.read())
+        # Opening a file establishes a new undo baseline; Ctrl+Z must never
+        # restore content from the previously opened file in this slot.
+        textbox._textbox.edit_reset()
+        _mark_program_saved(slot)
+        app.program_highlight_cache[slot] = None
+        highlight_words_program(None, slot)
 
-    def execute_program():
-        # When program start button is pressed:
-        # copy the editor content to execute_script.txt without overwriting
-        # the .txt file currently opened in the editor.
-        # set Button[7] flag to 1
-        logging.debug("Execute program")
-        global Now_open_txt
-        logging.debug(Now_open_txt)
+    def execute_program(slot=1, queue_if_stopping=True):
+        slot = int(slot)
+        _select_program_slot(slot)
+        logging.debug("Execute Program %s", slot)
+        run_action = classify_run_request(
+            Buttons[7] == 1,
+            queue_if_stopping
+            and read_program_signal(Buttons) == PROGRAM_SIGNAL_STOP_REQUESTED,
+        )
+        if run_action != RUN_ACTION_START:
+            if run_action == RUN_ACTION_QUEUE:
+                app._queued_program_slot = slot
+                emit_program_log(
+                    shared_string,
+                    program_log_queue,
+                    f"Log: Program {slot} queued; it will run after Stop completes",
+                )
+                return False
+            active_slot = getattr(app, "_active_program_slot", None)
+            emit_program_log(
+                shared_string,
+                program_log_queue,
+                f"Log: Program {active_slot or '?'} is active; Stop it before Run {slot}",
+            )
+            return False
+
         runtime_file = Image_path + "/Programs/execute_script.txt"
-        with open(runtime_file, 'w') as text_file:
-            text_file.write(app.textbox_program.get(1.0,tk.END))
-            
-        # Set flag to 1. Program will try to run
-        update_state("program_control", {"state": "RUNNING", "paused": False, "stop_requested": False, "step_requested": 0, "updated_at": time.time()})
-        research_logger.record("program_run", 1, Now_open_txt or "unsaved_editor")
+        with open(runtime_file, "w") as text_file:
+            text_file.write(_program_textbox(slot).get("1.0", tk.END))
+
+        app._active_program_slot = slot
+        app._queued_program_slot = None
+        update_state("program_control", {
+            "state": "RUNNING", "active_slot": slot, "paused": False,
+            "stop_requested": False, "step_requested": 0,
+            "updated_at": time.time(),
+        })
+        source = app.program_files.get(slot) or f"unsaved_editor_{slot}"
+        research_logger.record("program_run", slot, source)
+        write_program_signal(Buttons, PROGRAM_SIGNAL_RUNNING)
         Buttons[7] = 1
-        
+        emit_program_log(shared_string, program_log_queue, f"Log: Program {slot} started")
+        return True
 
-    def stop_program():
-        logging.debug("Stop program")
-        update_state("program_control", {"state": "STOP_REQUESTED", "paused": False, "stop_requested": True, "step_requested": 0, "updated_at": time.time()})
-        research_logger.record("program_stop_requested", 1)
-        Buttons[7] = 0
+    def stop_program(slot=1):
+        slot = int(slot)
+        logging.debug("Stop Program %s", slot)
+        if Buttons[7] == 0:
+            emit_program_log(shared_string, program_log_queue, "Log: No program is running")
+            return
+        active_slot = getattr(app, "_active_program_slot", None)
+        if active_slot is not None and active_slot != slot:
+            emit_program_log(
+                shared_string,
+                program_log_queue,
+                f"Log: Program {active_slot} is active; Stop {slot} ignored",
+            )
+            return
+        # The serial owner acknowledges Stop and only then clears Buttons[7].
+        write_program_signal(Buttons, PROGRAM_SIGNAL_STOP_REQUESTED)
+        update_state("program_control", {
+            "state": "STOP_REQUESTED", "active_slot": slot, "paused": False,
+            "stop_requested": True, "step_requested": 0,
+            "updated_at": time.time(),
+        })
+        research_logger.record("program_stop_requested", slot)
+        app.pause_resume_buttons[slot].configure(text=f"Pause {slot}")
+        emit_program_log(shared_string, program_log_queue, f"Log: Program {slot} stop requested")
 
-    def pause_resume_program():
+    def pause_resume_program(slot=1):
+        slot = int(slot)
+        if Buttons[7] == 0:
+            emit_program_log(shared_string, program_log_queue, "Log: No program is running")
+            return
+        active_slot = getattr(app, "_active_program_slot", None)
+        if active_slot is not None and active_slot != slot:
+            emit_program_log(
+                shared_string,
+                program_log_queue,
+                f"Log: Program {active_slot} is active; Pause {slot} ignored",
+            )
+            return
         control = read_state("program_control", {})
-        paused = not bool(control.get("paused", False))
+        stopping = (
+            read_program_signal(Buttons) == PROGRAM_SIGNAL_STOP_REQUESTED
+            if has_realtime_program_signal(Buttons)
+            else str(control.get("state", "")).upper() == "STOP_REQUESTED"
+        )
+        if stopping:
+            emit_program_log(shared_string, program_log_queue, f"Log: Program {slot} is stopping")
+            return
+        paused = (
+            read_program_signal(Buttons) != PROGRAM_SIGNAL_PAUSED
+            if has_realtime_program_signal(Buttons)
+            else not bool(control.get("paused", False))
+        )
         state = "PAUSED" if paused else "RUNNING"
-        update_state("program_control", {"state": state, "paused": paused, "stop_requested": False, "step_requested": 0, "updated_at": time.time()})
-        app.pause_resume.configure(text="Resume" if paused else "Pause")
-        research_logger.record("program_pause" if paused else "program_resume", 1)
+        write_program_signal(Buttons, PROGRAM_SIGNAL_PAUSED if paused else PROGRAM_SIGNAL_RUNNING)
+        update_state("program_control", {
+            "state": state, "active_slot": slot, "paused": paused,
+            "stop_requested": False, "step_requested": 0,
+            "updated_at": time.time(),
+        })
+        action = "Resume" if paused else "Pause"
+        app.pause_resume_buttons[slot].configure(text=f"{action} {slot}")
+        research_logger.record("program_pause" if paused else "program_resume", slot)
+        emit_program_log(
+            shared_string,
+            program_log_queue,
+            f"Log: Program {slot} paused" if paused else f"Log: Program {slot} resumed",
+        )
 
-    def step_program():
-        execute_program()
-        update_state("program_control", {"state": "STEP", "paused": False, "stop_requested": False, "step_requested": time.time(), "updated_at": time.time()})
-        research_logger.record("program_step", 1)
+    def step_program(slot=1):
+        slot = int(slot)
+        if not execute_program(slot, queue_if_stopping=False):
+            return
+        write_program_signal(Buttons, PROGRAM_SIGNAL_STEP)
+        update_state("program_control", {
+            "state": "STEP", "active_slot": slot, "paused": False,
+            "stop_requested": False, "step_requested": time.time(),
+            "updated_at": time.time(),
+        })
+        research_logger.record("program_step", slot)
 
-    def save_txt():
-        logging.debug("Save txt")
-        global Now_open_txt
-        logging.debug(Now_open_txt)
-        _confirm_save_current_program()
-        
-    def save_as_txt():
-        logging.debug("Save as txt")
-        global Now_open_txt
+    def save_txt(slot=1):
+        slot = int(slot)
+        _select_program_slot(slot)
+        logging.debug("Save Program %s", slot)
+        return _confirm_save_current_program(slot)
 
+    def save_as_txt(slot=1):
+        slot = int(slot)
+        _select_program_slot(slot)
+        logging.debug("Save Program %s as", slot)
         file_path = filedialog.asksaveasfilename(
             initialdir=Image_path + "/Programs",
             defaultextension=".txt",
             filetypes=(("Text Files", "*.txt"),),
             confirmoverwrite=False,
         )
-        if file_path:
-            filename = os.path.basename(file_path)
-            if os.path.exists(file_path):
-                if not messagebox.askyesno("Confirm Overwrite", f"Overwrite {filename}?"):
-                    return False
-            elif not messagebox.askyesno("Confirm Save", f"Save current program as {filename}?"):
+        if not file_path:
+            return False
+        filename = os.path.basename(file_path)
+        if os.path.exists(file_path):
+            if not messagebox.askyesno("Confirm Overwrite", f"Overwrite {filename}?"):
                 return False
-            Now_open_txt = file_path
-            _write_program_file(file_path)
-            return True
-        return False
+        elif not messagebox.askyesno("Confirm Save", f"Save Program {slot} as {filename}?"):
+            return False
+        app.program_files[slot] = file_path
+        _write_program_file(file_path, slot)
+        return True
 
     def Select_simulator():
         global Robot_sim
@@ -4716,9 +4799,10 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
     def Park_robot():
         logging.debug("Park button pressed")
         Buttons[8] = 1
-        app.textbox_program.insert(tk.INSERT, "Begin()"  +"\n") 
-        app.textbox_program.insert(tk.INSERT, "MoveJoint(90.0,-144.683,108.171,2.222,25.003,180.0,t=4)" +"\n")     
-        app.textbox_program.insert(tk.INSERT, "End()" +"\n") 
+        editor = _program_textbox()
+        editor.insert(tk.INSERT, "Begin()"  +"\n")
+        editor.insert(tk.INSERT, "MoveJoint(90.0,-144.683,108.171,2.222,25.003,180.0,t=4)" +"\n")
+        editor.insert(tk.INSERT, "End()" +"\n")
 
     def Open_help():
         messagebox.showwarning("test","test2")
@@ -4823,9 +4907,9 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
                 if not message:
                     continue
                 try:
-                    time_string = datetime.fromtimestamp(stamp).strftime("%H:%M:%S") if stamp else datetime.now().strftime("%H:%M:%S")
+                    time_string = datetime.fromtimestamp(stamp).strftime("%H:%M:%S:%f")[:-3] if stamp else datetime.now().strftime("%H:%M:%S:%f")[:-3]
                 except Exception:
-                    time_string = datetime.now().strftime("%H:%M:%S")
+                    time_string = datetime.now().strftime("%H:%M:%S:%f")[:-3]
                 app.textbox_response.insert(tk.INSERT, time_string + "--" + message + "\n")
                 drained_last = message
             if drained_last is not None:
@@ -4838,7 +4922,7 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
             prev_string_shared = shared_string_string
         elif shared_string_string != prev_string_shared:
             prev_string_shared = shared_string_string
-            time_string = datetime.now().strftime("%H:%M:%S")
+            time_string = datetime.now().strftime("%H:%M:%S:%f")[:-3]
             app.textbox_response.insert(tk.INSERT,time_string + "--" + shared_string_string + "\n")
         else:
             prev_string_shared = shared_string_string
@@ -4993,9 +5077,59 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         _set_text(app.Gripper_ID, "Gripper ID is: " + str(Gripper_data_out[5]))
 
         highlight_words_response(None)
-        highlight_words_program(None)
+        highlight_words_program(None, 1)
+        highlight_words_program(None, 2)
         _update_modbus_ui(read_state("modbus", {}))
         _update_research_ui(read_state("research", {}))
+        control = read_state("program_control", {})
+        control = control if isinstance(control, dict) else {}
+        program_state = str(control.get("state", "IDLE")).upper()
+        if Buttons[7] == 1:
+            program_state = {
+                PROGRAM_SIGNAL_PAUSED: "PAUSED",
+                PROGRAM_SIGNAL_STOP_REQUESTED: "STOP_REQUESTED",
+                PROGRAM_SIGNAL_STEP: "STEP",
+            }.get(read_program_signal(Buttons), "RUNNING")
+        elif program_state not in {"ERROR"}:
+            program_state = "IDLE"
+        active_slot = getattr(app, "_active_program_slot", None)
+        queued_slot = getattr(app, "_queued_program_slot", None)
+        for slot in (1, 2):
+            if Buttons[7] == 1 and slot == active_slot:
+                slot_state = program_state
+            elif slot == queued_slot:
+                slot_state = "QUEUED"
+            else:
+                slot_state = "IDLE"
+            status_text = {
+                "PAUSED": f"Program {slot}: PAUSED — Jog enabled",
+                "STOP_REQUESTED": f"Program {slot}: STOPPING...",
+                "STEP": f"Program {slot}: STEP",
+                "RUNNING": f"Program {slot}: RUNNING",
+                "QUEUED": f"Program {slot}: QUEUED",
+                "ERROR": f"Program {slot}: ERROR",
+            }.get(slot_state, f"Program {slot}: IDLE")
+            app.program_status_labels[slot].configure(text=status_text)
+            pause_text = "Resume" if slot_state == "PAUSED" else "Pause"
+            app.pause_resume_buttons[slot].configure(text=f"{pause_text} {slot}")
+
+        # Run clicked while another slot is STOPPING is latched. Start it as
+        # soon as the serial thread acknowledges the hold and clears Buttons[7].
+        if (
+            Buttons[7] == 0
+            and queued_slot in (1, 2)
+            and not getattr(app, "_queued_program_start_pending", False)
+        ):
+            app._queued_program_start_pending = True
+
+            def _start_queued_program(slot=queued_slot):
+                app._queued_program_start_pending = False
+                if app._queued_program_slot != slot or Buttons[7] == 1:
+                    return
+                app._queued_program_slot = None
+                execute_program(slot)
+
+            app.after_idle(_start_queued_program)
         # If tab is joint jog
         # Update joint sliders (only when the joints actually moved this tick)
         if position_changed:
@@ -5076,8 +5210,9 @@ if __name__ == "__main__":
     Jog_control = [0,0,0,0]
     # COM PORT, BAUD RATE, 
     General_data = [4,3000000,0,0]
-    # Home,Enable,Disable,Clear error,Real_robot,Sim_robot,Demo app,Program executions,Park
-    Buttons = [0,0,0,0,1,1,0,0,0]
+    # Home, Enable, Disable, Clear error, Real robot, Sim robot, Demo app,
+    # Program execution, Park, real-time program control signal.
+    Buttons = [0,0,0,0,1,1,0,0,0,0]
     
     shared_string = multiprocessing.Array('c', b' ' * 100)
 

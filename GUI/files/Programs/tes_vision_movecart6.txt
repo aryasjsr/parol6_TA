@@ -29,9 +29,7 @@ MoveJoint(89.569,-134.657,130.46,-4.022,-89.958,312.519)
 MoveJoint(89.569,-134.657,146.727,-4.022,-15.623,191.222)
 ModbusWrite(trigger_place, HIGH)
 ModbusWrite(trigger_pick, LOW)
-Loop()
 End()
-
 
 
 

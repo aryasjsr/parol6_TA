@@ -9,7 +9,9 @@ from typing import Any, Iterable
 import numpy as np
 
 
-VISION_PLACEHOLDER_PATTERN = re.compile(r"\$vision\.(z_plus|z_minus)")
+VISION_PLACEHOLDER_PATTERN = re.compile(
+    r"\$vision\.(z_plus|z_minus|x_comp|grip_x|grip_y|grip_z)"
+)
 DIAGNOSTIC_COMMANDS = {
     "Begin",
     "End",
@@ -28,6 +30,7 @@ class ToolZResult:
     z_raw_mm: float
     z_plus_mm: float
     z_minus_mm: float
+    x_comp_mm: float
     residual_mm: float
     clamped: bool
 
@@ -48,6 +51,8 @@ def calculate_tool_z(
     z_plus_min_mm: float = 0.0,
     z_plus_max_mm: float = 78.0,
     retreat_margin_mm: float = 30.0,
+    x_comp_base_mm: float = -20.0,
+    x_comp_slope: float = 0.0875,
 ) -> ToolZResult:
     target_xy = np.asarray(list(target_base_xy_mm), dtype=np.float64).reshape(2)
     target_xy = target_xy + np.array(
@@ -79,6 +84,9 @@ def calculate_tool_z(
         raise ValueError("Z+ minimum must not exceed Z+ maximum")
     z_plus = float(np.clip(z_corrected, z_min, z_max))
     z_minus = -(z_plus + float(retreat_margin_mm))
+    # Tool-X compensation so the world-Z descent stays constant regardless of
+    # z_plus: cancels the vertical component of the (slightly tilted) tool-Z axis.
+    x_comp = float(x_comp_base_mm) + float(x_comp_slope) * z_plus
 
     return ToolZResult(
         target_base_x_mm=float(target_xy[0]),
@@ -86,6 +94,7 @@ def calculate_tool_z(
         z_raw_mm=z_raw,
         z_plus_mm=z_plus,
         z_minus_mm=z_minus,
+        x_comp_mm=x_comp,
         residual_mm=residual,
         clamped=not math.isclose(z_plus, z_corrected, abs_tol=1e-9),
     )
@@ -115,25 +124,36 @@ def stable_pick_from_history(
 ) -> dict[str, Any]:
     timestamp = time.time() if now is None else float(now)
     candidates: list[dict[str, Any]] = []
+    rejections: dict[str, int] = {}
+
+    def _reject(reason: str) -> None:
+        rejections[reason] = rejections.get(reason, 0) + 1
+
     for item in history:
         if not isinstance(item, dict):
             continue
         captured_at = float(item.get("captured_at", 0.0) or 0.0)
         if captured_at <= 0.0 or timestamp - captured_at > float(max_age_s):
+            _reject(f"older than {float(max_age_s):.1f}s")
             continue
         safety = str(item.get("pick_safety", "")).upper()
         if safety not in {"SAFE", "MARGINAL"}:
+            _reject(f"status {safety or 'UNKNOWN'}")
             continue
         if str(item.get("coordinate_frame", "")).upper() != "BASE":
+            _reject("not in BASE frame")
             continue
         if item.get("fixture_box") is None:
+            _reject("no fixture")
             continue
         pick_point_base = item.get("pick_point_base")
         if pick_point_base is None:
             pick_point_base = item.get("pick_point_world")
         if item.get("pick_point_px") is None or pick_point_base is None:
+            _reject("no base coordinates (pixel-to-base calibration inactive?)")
             continue
         if item.get("selongsong_box") is None:
+            _reject("no selongsong box")
             continue
         candidate = dict(item)
         candidate["pick_point_base"] = pick_point_base
@@ -141,7 +161,13 @@ def stable_pick_from_history(
 
     candidates.sort(key=lambda item: float(item.get("captured_at", 0.0)))
     if not candidates:
-        raise ValueError("no recent SAFE or MARGINAL detection with fixture")
+        detail = ", ".join(
+            f"{count}x {reason}" for reason, count in sorted(rejections.items())
+        )
+        raise ValueError(
+            "no recent SAFE or MARGINAL detection with fixture"
+            + (f" — rejected: {detail}" if detail else " — detection history is empty")
+        )
 
     reference_box = candidates[-1]["selongsong_box"]
     same_object = [
@@ -211,11 +237,21 @@ def resolve_vision_placeholders(
     if not VISION_PLACEHOLDER_PATTERN.search(str(text)):
         return str(text)
     valid_runtime = validate_runtime(runtime, now=now)
-    values = {
-        "z_plus": float(valid_runtime["z_plus_mm"]),
-        "z_minus": float(valid_runtime["z_minus_mm"]),
+    runtime_keys = {
+        "z_plus": "z_plus_mm",
+        "z_minus": "z_minus_mm",
+        "x_comp": "x_comp_mm",
+        "grip_x": "grip_x_mm",
+        "grip_y": "grip_y_mm",
+        "grip_z": "grip_z_mm",
     }
-    return VISION_PLACEHOLDER_PATTERN.sub(
-        lambda match: f"{values[match.group(1)]:.3f}",
-        str(text),
-    )
+
+    def _substitute(match: re.Match[str]) -> str:
+        key = runtime_keys[match.group(1)]
+        if key not in valid_runtime:
+            raise ValueError(
+                f"vision runtime has no {key}; run vision() again"
+            )
+        return f"{float(valid_runtime[key]):.3f}"
+
+    return VISION_PLACEHOLDER_PATTERN.sub(_substitute, str(text))

@@ -1,0 +1,45 @@
+Begin()
+print("pick start")
+Output(1,LOW)
+Output(2,HIGH)
+Delay(1)
+MoveJoint(90,-88,174,0,3,177,t=4)
+Delay(1)
+MoveCart(0, 336.497, 231.000,-87.0,0.0,-95.0,t=4)
+Delay(1)
+Output(1,HIGH)
+Output(2,LOW)
+MoveCart(0,197.5,228,-87.0,0.0,-95.0,t=4)
+Delay(1)
+MoveJoint(90.422,-140.586,147.491,-4.036,6.005,180.979)
+ModbusRead(signal_cont, HIGH, timeout=50)
+MoveJoint(90.422,-135.084,141.902,-4.036,-63.858,180.979)
+print("base move headed to place")
+MoveJoint(-46.521,-135.084,141.902,-4.036,-63.858,180.979)
+print("J6 Move headed to place")
+MoveJoint(-46.521,-129.929,150.255,-4.036,-63.858,278.038)
+ModbusRead(signal_cont, HIGH, timeout=50)
+MoveJoint(-46.512,-117.7,157.315,-4.022,-63.844,278.016)
+MoveJoint(-43.427,-98.125,171.835,-4.022,-68.442,301.832)
+MoveJoint(-43.427,-100.232,164.564,-4.022,-68.4,322.847)
+MoveJoint(-43.427,-94.863,169.78,-4.022,-68.892,326.177)
+ModbusRead(signal_cont, HIGH, timeout=50)
+Output(1,LOW)
+Output(2,HIGH)
+Delay(2)
+MoveJoint(-43.427,-142.923,115.1,-4.022,-68.4,322.836,t=2)
+MoveJoint(88.444,-142.923,115.1,-4.022,-68.4,322.836,t=2)
+ModbusWrite(trigger_place, HIGH)
+MoveJoint(88.444,-125.913,143.366,-4.022,-3.53,174.583,t=2)
+End()
+
+
+
+
+
+
+
+
+
+
+

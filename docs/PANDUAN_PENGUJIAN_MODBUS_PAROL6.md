@@ -1,21 +1,30 @@
 # Panduan Pengujian Modbus PAROL6 App
 
-Dokumen ini menjelaskan langkah pengujian Modbus pada PAROL6 App secara
-terpisah untuk:
-
-- Blok A: Protocol Performance Test.
-- Blok B: Cycle Time Test.
-
-Keduanya sengaja dipisahkan karena fungsi yang diuji berbeda. Blok A mengukur
-performa komunikasi Modbus TCP/IP. Blok B mengukur durasi siklus kerja robot
-yang dipicu oleh sinyal Modbus.
+Dokumen ini menjelaskan langkah pengujian Modbus pada PAROL6 App. Pengujian
+dilakukan sebagai **satu alur terpadu berbasis siklus** (per-siklus): setiap
+trigger dari PLC memicu satu siklus kerja robot, dan aplikasi mencatat data
+komunikasi Modbus sekaligus data cycle time dalam satu tabel.
 
 ## 1. Ringkasan Pengujian
 
-| Blok | Fokus uji | Robot wajib connect? | PLC wajib ada? | Output utama |
-| --- | --- | --- | --- | --- |
-| Blok A | Response time, throughput, packet loss | Tidak | Tidak jika `MOCK`; ya jika IP PLC nyata | Statistik protokol |
-| Blok B | Trigger Modbus ke siklus pick-place | Ya, jika program berisi gerakan robot | Tidak jika `MOCK`; ya untuk uji integrasi PLC nyata | Cycle time, success/fail |
+Pada setiap siklus (satu trigger PLC), aplikasi mencatat satu baris data:
+
+| Kolom | Arti |
+| --- | --- |
+| `No. Siklus` | Nomor urut siklus |
+| `Timestamp` | Waktu siklus dimulai |
+| `Response Time (ms)` | Waktu respons komunikasi Modbus saat trigger |
+| `Packet Status` | `OK`, `Timeout`, atau `Loss` |
+| `Cycle Time (s)` | Durasi end-to-end satu siklus robot |
+| `Outcome` | `Sukses` atau `Gagal` |
+
+Ringkasan (dihitung otomatis, tanpa min/max/outlier):
+
+- `avg_rt_ms`: rata-rata response time komunikasi.
+- `throughput_rps`: jumlah siklus per detik.
+- `packet_loss_pct`: persentase paket gagal/timeout.
+- `avg_cycle_time_s`: rata-rata cycle time.
+- `jumlah_data`: jumlah siklus tercatat.
 
 Catatan:
 
@@ -49,7 +58,7 @@ asset dan program runtime memakai path relatif.
 
 ### 2.2 Siapkan robot PAROL6
 
-Langkah ini wajib untuk Blok B jika program melakukan gerakan fisik.
+Langkah ini wajib jika program melakukan gerakan fisik.
 
 1. Hubungkan power robot dan board kontrol.
 2. Hubungkan USB serial robot ke komputer.
@@ -103,108 +112,16 @@ Catatan penyimpanan:
 
 - Perubahan IP, port, slave ID, dan address mapping tidak langsung tersimpan
   saat diketik.
-- Perubahan tersimpan saat klik **Save Config**, **Connect**, atau
-  **Start Block B**.
+- Perubahan tersimpan saat klik **Save Config**, **Connect**, atau **Start**.
 - Jika IP diganti saat Modbus masih connected, lakukan **Disconnect** lalu
   **Connect** lagi supaya client memakai IP baru.
 
-## 3. Pengujian Blok A - Protocol Performance Test
+## 3. Pengujian Per Siklus
 
 ### 3.1 Tujuan
 
-Blok A digunakan untuk mengukur performa komunikasi Modbus TCP/IP tanpa
-menjalankan robot. Data utama:
-
-- `avg_rt_ms`: rata-rata response time.
-- `throughput_rps`: jumlah request per detik.
-- `packet_loss_pct`: persentase request gagal atau timeout.
-- `success_count`: jumlah request sukses.
-- `failed_count`: jumlah request gagal.
-- `timeout_count`: jumlah request timeout.
-
-### 3.2 Kapan Blok A dilakukan
-
-Lakukan Blok A sebelum Blok B untuk memastikan jalur komunikasi stabil.
-Urutan yang disarankan:
-
-1. Dry-run dengan `IP = MOCK`.
-2. Uji PLC nyata dengan `IP = <alamat PLC>`.
-3. Ulangi jika ada perubahan jaringan, timeout, slave ID, atau mapping
-   address.
-
-### 3.3 Konfigurasi Blok A
-
-Pada section **Blok A - Protocol Performance Test**, isi:
-
-| Field | Nilai awal yang disarankan | Keterangan |
-| --- | --- | --- |
-| `IP` | `MOCK` atau IP PLC | Target koneksi Modbus untuk Blok A |
-| `Port` | `502` | Port Modbus TCP |
-| `Slave` | `1` | Slave/unit ID |
-| `Timeout ms` | `1000` | Batas tunggu response |
-| `Function` | `read_coil` atau sesuai PLC | Function code yang diuji |
-| `Address` | address yang valid | Contoh `0` untuk coil trigger |
-| `Count` | `1` | Jumlah register/coil per request |
-| `N` | `1000` | Jumlah request untuk uji protokol |
-
-Jika memakai mapping default, untuk uji sederhana dapat memakai:
-
-- `Function = read_coil`
-- `Address = 0`
-- `Count = 1`
-- `N = 1000`
-
-Jika PLC hanya menyediakan holding register, gunakan:
-
-- `Function = read_holding_register`
-- `Address = address register yang valid`
-- `Count = 1`
-
-### 3.4 Langkah menjalankan Blok A
-
-1. Pastikan app sudah terbuka dan tab **Modbus** aktif.
-2. Isi konfigurasi Blok A sesuai target uji.
-3. Klik **Start Block A**.
-4. Amati label progress sampai selesai:
-   - `progress`
-   - `avg_rt_ms`
-   - `throughput_rps`
-   - `packet_loss_pct`
-   - `success_count`
-   - `failed_count`
-   - `timeout_count`
-5. Jika ingin menghentikan sebelum selesai, klik **Stop**.
-6. Setelah selesai, klik **Export XLSX**.
-7. Simpan file hasil dengan nama yang jelas, misalnya:
-
-   ```text
-   block_a_plc_read_coil_addr0_n1000_YYYYMMDD.xlsx
-   ```
-
-### 3.5 Validasi hasil Blok A
-
-Hasil Blok A dianggap layak untuk lanjut ke Blok B jika:
-
-1. `packet_loss_pct` rendah atau 0% untuk jaringan stabil.
-2. `timeout_count` tidak muncul terus-menerus.
-3. `avg_rt_ms` masih sesuai batas penelitian. Jika memakai target 100 ms,
-   bandingkan `avg_rt_ms` terhadap 100 ms.
-4. Tidak ada error koneksi seperti `Unable to connect`.
-
-Jika `packet_loss_pct = 100%`, cek:
-
-- IP PLC salah.
-- Port `502` tertutup.
-- Slave ID salah.
-- Address/function tidak valid untuk PLC.
-- Firewall memblokir koneksi.
-- PLC belum aktif sebagai Modbus TCP server.
-
-## 4. Pengujian Blok B - Cycle Time Test
-
-### 4.1 Tujuan
-
-Blok B digunakan untuk mengukur durasi end-to-end satu siklus robot:
+Mengukur, per siklus, durasi end-to-end satu siklus robot sekaligus performa
+komunikasi Modbus yang memicunya:
 
 1. PLC atau emulator mengirim trigger Modbus.
 2. App mendeteksi rising edge `trigger_pick`.
@@ -212,11 +129,12 @@ Blok B digunakan untuk mengukur durasi end-to-end satu siklus robot:
 4. Setelah program selesai, app menulis:
    - `cycle_done = True` jika sukses.
    - `error_flag = True` jika gagal.
-5. App menyimpan data cycle time dan status siklus.
+5. App menyimpan satu baris data (response time, packet status, cycle time,
+   outcome).
 
-### 4.2 Prasyarat Blok B
+### 3.2 Prasyarat
 
-Sebelum menjalankan Blok B, pastikan:
+Sebelum menjalankan pengujian, pastikan:
 
 1. Robot sudah connect ke app jika program berisi gerakan fisik.
 2. Program pick-place sudah diuji manual lewat tombol execute biasa.
@@ -226,7 +144,7 @@ Sebelum menjalankan Blok B, pastikan:
 6. Trigger dapat dikembalikan ke `False` setelah satu siklus agar rising edge
    berikutnya bisa terdeteksi.
 
-### 4.3 Contoh struktur program robot
+### 3.3 Contoh struktur program robot
 
 Gunakan program pick-place yang sudah divalidasi di robot. Struktur minimalnya:
 
@@ -236,30 +154,19 @@ Begin()
 End()
 ```
 
-Jika ingin program menunggu trigger di dalam script, dapat memakai:
-
-```text
-Begin()
-ModbusRead(trigger_pick, HIGH, timeout=5)
-; isi gerakan pick-place yang sudah aman
-ModbusWrite(cycle_done, HIGH)
-End()
-```
-
-Namun untuk Blok B, trigger utama sudah ditangani oleh handler Blok B. Karena
-itu, skenario yang paling rapi adalah:
+Trigger utama sudah ditangani oleh handler pengujian. Skenario yang paling rapi:
 
 - PLC menulis `trigger_pick`.
-- Blok B mendeteksi trigger.
+- App mendeteksi trigger.
 - App menjalankan program pick-place.
 - App menulis `cycle_done` atau `error_flag` setelah program selesai.
 
-Hindari menggandakan mekanisme trigger kecuali memang sedang menguji script
-ModbusRead secara khusus.
+Hindari menggandakan mekanisme trigger di dalam script (`ModbusRead`) kecuali
+memang sedang menguji script `ModbusRead` secara khusus.
 
-### 4.4 Konfigurasi Blok B
+### 3.4 Konfigurasi
 
-Pada section **Blok B - Cycle Time Test**, isi:
+Pada section **Pengujian Modbus (Per Siklus)**, isi:
 
 | Field | Nilai awal yang disarankan | Keterangan |
 | --- | --- | --- |
@@ -270,10 +177,11 @@ Pada section **Blok B - Cycle Time Test**, isi:
 
 Pastikan nama tersebut sama persis dengan kolom `Name` di Address Mapping.
 
-### 4.5 Langkah menjalankan Blok B
+### 3.5 Langkah menjalankan
 
 1. Jalankan app.
-2. Connect robot sampai status app menunjukkan `CONNECTED`.
+2. Connect robot sampai status app menunjukkan `CONNECTED` (jika program berisi
+   gerakan fisik).
 3. Buka atau tulis program pick-place di editor program.
 4. Jalankan program sekali secara manual tanpa Modbus.
 5. Jika program manual sukses, kembali ke tab **Modbus**.
@@ -284,12 +192,12 @@ Pastikan nama tersebut sama persis dengan kolom `Name` di Address Mapping.
    - `Slave ID` sesuai PLC.
 7. Klik **Connect**.
 8. Pastikan status Modbus menunjukkan `MOCK` atau `<ip>:<port>`.
-9. Isi konfigurasi Blok B:
+9. Isi konfigurasi pengujian:
    - `N = 100` atau sesuai rancangan pengujian.
    - `Trigger = trigger_pick`.
    - `Done = cycle_done`.
    - `Error = error_flag`.
-10. Klik **Start Block B**.
+10. Klik **Start**.
 11. Pastikan label `progress` berubah menjadi `RUNNING`.
 12. Dari PLC atau emulator, set `trigger_pick` dari `False` ke `True`.
 13. App akan menjalankan program robot.
@@ -299,26 +207,37 @@ Pastikan nama tersebut sama persis dengan kolom `Name` di Address Mapping.
 16. Cek hasil:
     - Jika sukses, `cycle_done` ditulis `True`.
     - Jika gagal, `error_flag` ditulis `True`.
-    - Log table Blok B menampilkan status dan `duration_s`.
+    - Tabel data menampilkan status dan cycle time siklus tersebut.
 17. Ulangi trigger sampai `completed = N`.
-18. Setelah selesai, klik **Export XLSX**.
+18. Setelah selesai, klik **Export Data**.
 19. Simpan file hasil dengan nama yang jelas, misalnya:
 
     ```text
-    block_b_pick_place_n100_YYYYMMDD.xlsx
+    modbus_pick_place_n100_YYYYMMDD.xlsx
     ```
 
-### 4.6 Validasi hasil Blok B
+File XLSX berisi dua sheet:
 
-Hasil Blok B dianggap valid jika:
+- **Data**: tabel mentah per-siklus (No. Siklus, Timestamp, Response Time,
+  Packet Status, Cycle Time, Outcome).
+- **Ringkasan**: `avg_rt_ms`, `throughput_rps`, `packet_loss_pct`,
+  `avg_cycle_time_s`, `jumlah_data`.
+
+Tombol **Clear Data** mengosongkan tabel untuk memulai sesi pengujian baru.
+
+### 3.6 Validasi hasil
+
+Hasil dianggap valid jika:
 
 1. Jumlah sample sama dengan jumlah siklus yang direncanakan.
 2. `success_count + failed_count = completed`.
 3. `failed_count` rendah atau sesuai toleransi penelitian.
-4. `avg_s`, `min_s`, `max_s`, dan `std_s` masuk akal terhadap observasi fisik.
+4. `avg_cycle_time_s` masuk akal terhadap observasi fisik.
 5. Setiap trigger menghasilkan tepat satu siklus, bukan nol siklus atau lebih
    dari satu siklus.
 6. `cycle_done` dan `error_flag` terbaca benar oleh PLC.
+7. `packet_loss_pct` rendah atau 0% untuk jaringan stabil, dan `avg_rt_ms`
+   masih sesuai batas penelitian.
 
 Jika trigger tidak terdeteksi:
 
@@ -326,44 +245,44 @@ Jika trigger tidak terdeteksi:
 - Pastikan type address adalah `coil`.
 - Pastikan address sesuai mapping PLC.
 - Pastikan nilai berubah dari `False` ke `True`, bukan tetap `True`.
-- Pastikan Blok B sudah dalam kondisi `RUNNING`.
+- Pastikan pengujian sudah dalam kondisi `RUNNING`.
 - Pastikan Modbus polling sedang connected.
 
-## 5. Urutan Pengujian yang Disarankan
+Jika `packet_loss_pct = 100%`, cek:
 
-Gunakan urutan berikut agar masalah lebih mudah dilacak.
+- IP PLC salah.
+- Port `502` tertutup.
+- Slave ID salah.
+- Firewall memblokir koneksi.
+- PLC belum aktif sebagai Modbus TCP server.
 
-### 5.1 Tahap 1 - Dry-run Modbus internal
+## 4. Urutan Pengujian yang Disarankan
+
+### 4.1 Tahap 1 - Dry-run Modbus internal
 
 Tujuan: memastikan UI, konfigurasi, logging, dan export berjalan.
 
 1. Set `IP = MOCK`.
-2. Klik **Save Config**.
-3. Jalankan Blok A dengan `N = 100`.
-4. Export XLSX.
-5. Jalankan Blok B dengan program non-fisik atau program sederhana yang aman.
-6. Export XLSX.
+2. Klik **Save Config**, lalu **Connect**.
+3. Jalankan pengujian dengan program non-fisik atau program sederhana yang aman.
+4. Export Data.
 
-Catatan: Jika robot tidak connect dan program berisi command gerak, Blok B akan
+Catatan: Jika robot tidak connect dan program berisi command gerak, siklus akan
 gagal. Untuk dry-run tanpa robot, gunakan program software-only.
 
-### 5.2 Tahap 2 - Uji komunikasi PLC tanpa robot
+### 4.2 Tahap 2 - Uji komunikasi PLC tanpa robot
 
 Tujuan: memastikan koneksi TCP/IP PLC stabil.
 
-1. Set `IP = <alamat PLC>`.
-2. Set `Port` dan `Slave ID`.
-3. Klik **Disconnect** jika sebelumnya sudah connected.
-4. Klik **Connect**.
-5. Jalankan Blok A dengan address/function yang valid di PLC.
-6. Export XLSX.
-7. Cek `packet_loss_pct`, `timeout_count`, dan `avg_rt_ms`.
+1. Set `IP = <alamat PLC>`, set `Port` dan `Slave ID`.
+2. Klik **Disconnect** jika sebelumnya sudah connected, lalu **Connect**.
+3. Amati status Modbus dan monitor snapshot address mapping.
 
-Jangan lanjut ke Blok B jika Blok A masih gagal total.
+Jangan lanjut ke pengujian penuh jika koneksi masih gagal total.
 
-### 5.3 Tahap 3 - Validasi program robot manual
+### 4.3 Tahap 3 - Validasi program robot manual
 
-Tujuan: memastikan kegagalan Blok B bukan berasal dari program robot.
+Tujuan: memastikan kegagalan pengujian bukan berasal dari program robot.
 
 1. Connect robot.
 2. Home atau siapkan posisi awal sesuai prosedur lab.
@@ -371,41 +290,18 @@ Tujuan: memastikan kegagalan Blok B bukan berasal dari program robot.
 4. Catat apakah program selesai normal.
 5. Perbaiki program sampai stabil sebelum lanjut.
 
-### 5.4 Tahap 4 - Uji Blok B dengan PLC atau emulator
+### 4.4 Tahap 4 - Uji per siklus dengan PLC atau emulator
 
-Tujuan: mengukur cycle time end-to-end.
+Tujuan: mengukur cycle time dan performa komunikasi end-to-end.
 
-1. Pastikan Blok A sudah stabil.
-2. Pastikan robot connect.
-3. Pastikan program pick-place sudah stabil.
-4. Klik **Start Block B**.
-5. Trigger `trigger_pick` sebanyak `N` siklus.
-6. Export XLSX.
-7. Simpan catatan kondisi eksperimen.
+1. Pastikan koneksi Modbus stabil dan robot connect.
+2. Pastikan program pick-place sudah stabil.
+3. Klik **Start**.
+4. Trigger `trigger_pick` sebanyak `N` siklus.
+5. Export Data.
+6. Simpan catatan kondisi eksperimen.
 
-### 5.5 Tahap 5 - Analisis gabungan
-
-Gabungkan hasil Blok A dan Blok B di tahap analisis, bukan di loop pengujian.
-
-Gunakan Blok A untuk:
-
-- Rata-rata response time.
-- Throughput.
-- Packet loss.
-- Timeout.
-
-Gunakan Blok B untuk:
-
-- Rata-rata cycle time.
-- Minimum cycle time.
-- Maximum cycle time.
-- Standar deviasi cycle time.
-- Success/fail per siklus.
-
-Jika ingin menguji korelasi, sejajarkan data berdasarkan waktu pengambilan,
-kondisi jaringan, dan skenario trigger.
-
-## 6. Format Data yang Perlu Dicatat
+## 5. Format Data yang Perlu Dicatat
 
 Selain export XLSX dari app, catat metadata eksperimen berikut:
 
@@ -417,85 +313,67 @@ Selain export XLSX dari app, catat metadata eksperimen berikut:
 | IP PLC | `192.168.1.10` |
 | Port | `502` |
 | Slave ID | `1` |
-| Function Blok A | `read_coil` |
-| Address Blok A | `0` |
-| N Blok A | `1000` |
-| N Blok B | `100` |
+| N siklus | `100` |
 | Program robot | Nama file program |
 | Kondisi objek | Jenis dan posisi objek |
 | Catatan error | Timeout, failed trigger, gagal grip, dll. |
 
-## 7. Kriteria Keberhasilan
+## 6. Kriteria Keberhasilan
 
-### 7.1 Blok A
-
-Pengujian Blok A berhasil jika:
-
-- App dapat menyelesaikan N request.
-- Data sample dan summary dapat diexport.
-- `packet_loss_pct` dan `timeout_count` berada dalam batas penelitian.
-- Tidak ada error koneksi berulang.
-
-### 7.2 Blok B
-
-Pengujian Blok B berhasil jika:
+Pengujian berhasil jika:
 
 - App mendeteksi trigger Modbus.
 - Robot menjalankan satu program per satu trigger.
 - App menulis `cycle_done` untuk siklus sukses.
 - App menulis `error_flag` untuk siklus gagal.
-- Data cycle time dapat diexport.
+- `packet_loss_pct` dan response time berada dalam batas penelitian.
+- Data (tabel per-siklus dan ringkasan) dapat diexport.
 
-## 8. Troubleshooting
+## 7. Troubleshooting
 
 | Gejala | Penyebab umum | Tindakan |
 | --- | --- | --- |
 | Status Modbus tetap disconnected | IP/port salah, PLC mati, firewall | Cek IP, port 502, firewall, koneksi kabel |
-| `packet_loss_pct = 100%` | Semua request gagal/timeout | Cek function, address, slave ID, dan PLC |
-| Blok B tidak mulai siklus | Tidak ada rising edge trigger | Set trigger `False` dulu, lalu `True` |
+| `packet_loss_pct` tinggi | Banyak request gagal/timeout | Cek slave ID, koneksi, dan PLC |
+| Pengujian tidak mulai siklus | Tidak ada rising edge trigger | Set trigger `False` dulu, lalu `True` |
 | Trigger hanya jalan sekali | Trigger tidak dikembalikan ke `False` | Reset trigger setelah program mulai |
 | Program gagal saat robot tidak connect | Program berisi command fisik | Connect robot atau pakai program software-only |
 | IP sudah diganti tapi masih ke target lama | Client Modbus lama masih aktif | Klik **Disconnect**, lalu **Connect** lagi |
-| Address mapping berubah tapi tidak tersimpan | Belum klik save/start | Klik **Save Config** atau **Connect** |
+| Address mapping berubah tapi tidak tersimpan | Belum klik save/start | Klik **Save Config** atau **Start** |
 | Export kosong/hilang | Test belum jalan atau app ditutup | Export segera setelah test selesai |
 
-## 9. Checklist Sebelum Mengambil Data Final
-
-Gunakan checklist ini sebelum data final dicatat.
+## 8. Checklist Sebelum Mengambil Data Final
 
 - [ ] App berjalan tanpa error.
-- [ ] Robot connect untuk Blok B fisik.
+- [ ] Robot connect untuk pengujian fisik.
 - [ ] PLC/emulator Modbus siap.
 - [ ] IP, port, slave ID sudah benar.
 - [ ] Address mapping sudah benar.
 - [ ] Konfigurasi sudah disimpan.
 - [ ] Jika IP baru dipakai, Modbus sudah reconnect.
 - [ ] Program pick-place sudah diuji manual.
-- [ ] Blok A sudah diuji dan hasil komunikasi stabil.
-- [ ] Blok B sudah diset ke jumlah siklus yang benar.
+- [ ] Koneksi Modbus sudah stabil.
+- [ ] Jumlah siklus (`N`) sudah diset benar.
 - [ ] File XLSX diexport setelah test selesai.
 - [ ] Metadata eksperimen dicatat.
 
-## 10. Catatan untuk Flowchart Penelitian
+## 9. Catatan untuk Flowchart Penelitian
 
-Untuk flowchart metodologi, jangan mencampur Blok A dan Blok B dalam satu loop
-yang sama.
+Struktur alur pengujian yang disarankan:
 
-Struktur yang disarankan:
-
-1. Konfigurasi sistem.
-2. Jalankan Blok A untuk uji protokol.
-3. Analisis awal hasil Blok A.
-4. Jalankan Blok B untuk uji cycle time.
-5. Export dan rekap hasil Blok B.
-6. Analisis gabungan:
-   - response time,
+1. Konfigurasi sistem (IP, port, slave ID, address mapping).
+2. Connect Modbus dan robot.
+3. Klik **Start**.
+4. Trigger `trigger_pick` sebanyak `N` siklus; tiap siklus mencatat response
+   time, packet status, cycle time, dan outcome.
+5. Export Data (tabel per-siklus + ringkasan).
+6. Analisis hasil:
+   - rata-rata response time,
    - throughput,
    - packet loss,
-   - cycle time,
-   - success/fail,
-   - korelasi jika diperlukan.
+   - rata-rata cycle time,
+   - success/fail per siklus.
 7. Pembahasan dan kesimpulan.
 
-Dengan struktur ini, hasil pengujian lebih sesuai dengan implementasi app dan
+Dengan satu alur ini, hasil pengujian lebih sesuai dengan implementasi app dan
 lebih mudah dipertanggungjawabkan dalam laporan.

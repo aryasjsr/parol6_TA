@@ -1,0 +1,16 @@
+Begin()
+Output(1,LOW)
+Output(2,HIGH)
+Delay(2)
+MoveJoint(-43.427,-142.923,115.1,-4.022,-68.4,322.836,t=2)
+MoveJoint(88.444,-142.923,115.1,-4.022,-68.4,322.836,t=2)
+ModbusWrite(trigger_place, HIGH)
+MoveJoint(88.444,-125.913,143.366,-4.022,-3.53,174.583,t=2)
+End()
+
+
+
+
+
+
+

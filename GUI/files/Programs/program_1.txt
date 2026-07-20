@@ -3,12 +3,15 @@ print("pick start")
 Output(1,LOW)
 Output(2,HIGH)
 MoveJoint(90,-88,174,0,3,177,t=4)
-vision()
-print("Z+ Tool = $vision.z_plus mm")
-print("Z- Tool = $vision.z_minus mm")
 Delay(1)
-MoveCartRelTRF(-20,0,$vision.z_plus,0,0,0,t=4)
+MoveCartRelTRF(-10,0,67,0,0,0,t=4)
+Delay(1)
+Output(1,HIGH)
+Output(2,LOW)
+MoveCartRelTRF(-11,0,-140,0,0,0,t=4)
 Delay(1)
 End()
+
+
 
 

@@ -68,6 +68,15 @@ class WorkspaceValidator:
                 int(expected_size[1]),
             ]:
                 return False
+        # The homography only applies to the pixel mapping it was solved with,
+        # so zoom and image size are compared. The recorded video_source is
+        # informational only: OS camera indices shift across reboots/replugs,
+        # so index equality proves nothing about camera identity.
+        recorded_zoom = calibration.get("zoom")
+        if recorded_zoom is not None:
+            current_zoom = float(self._config.get("vision.zoom", 1.0))
+            if abs(float(recorded_zoom) - current_zoom) > 1e-6:
+                return False
         return True
 
     def pixel_to_base(

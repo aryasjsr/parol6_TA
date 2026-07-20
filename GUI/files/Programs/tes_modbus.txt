@@ -1,0 +1,8 @@
+Begin()
+print("trigger from PLC to Pick")
+Delay(10)
+print("trigger to PLC to Place")
+
+End()
+
+
