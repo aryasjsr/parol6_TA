@@ -1,36 +1,21 @@
 Begin()
 print("pick start")
-ModbusRead(trigger_pick, HIGH, timeout=5)
 Output(1,LOW)
 Output(2,HIGH)
 Delay(1)
-vision()
-MoveJoint(90,-88,174,0,3,177,t=4)
-print("Grip = ($vision.grip_x, $vision.grip_y, $vision.grip_z) mm")
-Delay(1)
-MoveCart($vision.grip_x,$vision.grip_y,$vision.grip_z,-87.0,0.0,-95.0,t=4)
-Delay(1)
-Output(1,HIGH)
-Output(2,LOW)
-MoveCart(-3.4,197.5,224,-87.0,0.0,-95.0,t=4)
-Delay(1)
-MoveJoint(90.422,-140.586,147.491,-4.036,6.005,180.979)
-MoveJoint(90.422,-144.278,141.899,-4.022,-73.617,180.973)
+MoveJoint(91.837,-82.28,195.428,-24.286,-21.952,219.094)
 
-print("Move J1 to place")
-MoveJoint(-43.98,-144.278,141.899,-4.022,-73.617,180.973)
-print("more closer")
-MoveJoint(-39.709,-98.156,175.699,-4.022,-90.0,291.077)
-MoveJoint(-42.267,-92.9,178.325,-4.022,-89.958,312.536)
-Output(1,LOW)
-Output(2,HIGH)
-MoveJoint(-42.258,-134.657,130.46,-4.022,-89.958,312.519)
-MoveJoint(89.569,-134.657,130.46,-4.022,-89.958,312.519)
-MoveJoint(89.569,-134.657,146.727,-4.022,-15.623,191.222)
-ModbusWrite(trigger_place, HIGH)
-ModbusWrite(trigger_pick, LOW)
-Loop()
+MoveJoint(72.316,-82.28,195.428,-24.286,-21.952,219.094)
+
 End()
+
+
+
+
+
+
+
+
 
 
 

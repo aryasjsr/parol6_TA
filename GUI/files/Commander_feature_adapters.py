@@ -48,6 +48,9 @@ MODBUS_CYCLE_LOG_HEADINGS = {
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
+    "ui": {
+        "theme": "Dark",
+    },
     "modbus": {
         "ip": "MOCK",
         "port": 502,
