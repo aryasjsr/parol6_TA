@@ -39,11 +39,18 @@ class SafePickValidator:
         (status, pick_point_px) where status ∈ {"SAFE", "MARGINAL", "UNSAFE", "UNKNOWN"}.
         pick_point_px is ``None`` when UNSAFE.
         """
+        config = getattr(self, "_config", None)
         if margin_pct is None:
-            margin_pct = float(self._config.get("vision.safe_pick_margin_pct", 0.25))
+            margin_pct = float(
+                config.get("vision.safe_pick_margin_pct", 0.25)
+                if config is not None
+                else 0.25
+            )
         if left_offset_px is None:
             left_offset_px = float(
-                self._config.get("vision.safe_pick_left_offset_px", 0.0)
+                config.get("vision.safe_pick_left_offset_px", 0.0)
+                if config is not None
+                else 0.0
             )
         left_offset_px = max(0.0, float(left_offset_px))
 

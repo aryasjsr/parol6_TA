@@ -1,101 +1,138 @@
-# PAROL-commander-software
-[![License: MIT](https://img.shields.io/badge/license-GPLv3-blue)](https://opensource.org/license/gpl-3-0/)  ![Issues](https://img.shields.io/github/issues/PCrnjak/PAROL-commander-software) ![release](https://img.shields.io/github/v/release/PCrnjak/PAROL-commander-software) [![Powered by the Robotics Toolbox](https://raw.githubusercontent.com/petercorke/robotics-toolbox-python/master/.github/svg/rtb_powered.min.svg)](https://github.com/petercorke/robotics-toolbox-python)
+# PAROL6 TA Commander
 
+PAROL6 TA Commander adalah aplikasi desktop untuk pengembangan dan pengujian sistem robot PAROL6 pada tugas akhir. Aplikasi ini menggabungkan kontrol robot, simulator, vision, komunikasi Modbus TCP, dan pencatatan data penelitian dalam satu antarmuka.
 
-<img src="Images/screen_2.png" alt="drawing" width="700"/>
+![Tampilan PAROL6 Commander](Images/screen_2.png)
 
-https://source-robotics.com
+## Fitur utama
 
-To use commander software your PC needs to meet some [minimal hardware specs!](https://github.com/PCrnjak/PAROL-commander-software/blob/main/confirmed_working_systems.md)
+- Jogging enam joint dan gerakan Cartesian pada world/tool reference frame.
+- Telemetri posisi, status koneksi, I/O, error, dan kontrol gripper.
+- Editor program robot dengan perintah gerak, I/O, delay, loop, Modbus, dan vision.
+- Simulator PAROL6 bawaan.
+- Deteksi objek dari kamera atau sumber `MOCK` untuk dry-run.
+- Kalibrasi intrinsik kamera dan transformasi camera-to-base.
+- Validasi workspace, safe-pick, perhitungan Tool-Z, dan placeholder `$vision.*`.
+- Modbus TCP untuk integrasi PLC, termasuk mode `MOCK` tanpa PLC.
+- Logging metrik penelitian dan ekspor hasil pengujian.
+- Tema antarmuka `Dark`, `Light`, dan `Gray`; pilihan terakhir disimpan otomatis.
 
-Robot arm building instructions, STL files, BOM can be found here: [Link](https://github.com/PCrnjak/PAROL6-Desktop-robot-arm)
+## Persyaratan
 
-To run this code you need to use the PAROL6 control board! You can buy it here: [Link!](https://source-robotics.com/products/parol6-control-board)
+- Python **3.10.x**. Beberapa dependensi yang dipin belum kompatibel dengan Python 3.12.
+- Linux atau Windows dengan dukungan GUI/Tk.
+- Board kontrol PAROL6 untuk menjalankan robot fisik.
+- Kamera dan PLC hanya diperlukan untuk pengujian nyata; mode `MOCK` tersedia untuk pengujian perangkat lunak.
 
-PAROL6 commander software is a tool for controlling and programming the PAROL6 robotic arm!
-Some of the features are: <br />
-* Loop rates of up to 100Hz allowing for real-time control
-* Joint jogging
-* Cartesian level jogging in the world reference frame and tool reference frame
-* Full telemetry data
-* Error handling like Inverse kinematics errors, Joint position limits, speed limits, Estop...
-* Response log 
-* Built-in simulator
-* Programming interface with simple-to-use commands
-* Real-time control of robot outputs and reading of inputs
-* Built-in control for [SSG-48 adaptive electric gripper](https://source-robotics.com/products/compliant-gripper)
+Model ONNX tidak disimpan di Git karena ukurannya besar. Untuk deteksi berbasis model, letakkan model pada path yang dipilih di GUI (default: `vision/models/best.onnx`).
 
-# What is PAROL6 robotic arm?
+> [!CAUTION]
+> Uji program terlebih dahulu dengan simulator atau mode `MOCK`. Sebelum mengaktifkan robot fisik, pastikan area kerja kosong, batas joint benar, tombol emergency stop dapat dijangkau, dan kecepatan awal dibuat rendah.
 
-PAROL6 is a high-performance 3D-printed desktop robotic arm. The design approach of PAROL6 was to be similar to industrial robots in terms of mechanical design, control software, and usability. Control software, GUI, and robots STL files are open-source. You can build your own PAROL6 robot by following the instructions on this [page](https://github.com/PCrnjak/PAROL6-Desktop-robot-arm/tree/main/Building%20instructions).
+## Instalasi cepat di Linux
 
-# Minimal hardware requirements
+Contoh berikut ditujukan untuk Ubuntu dan turunannya.
 
-To run the PAROL6 robotic arm with commander software you will need to meet some minimal PC specifications.
-Check already tested systems and compare them to your system: [Compare](https://github.com/PCrnjak/PAROL-commander-software/blob/main/confirmed_working_systems.md)
+```bash
+sudo apt update
+sudo apt install -y git build-essential python3-tk python3-pil python3-pil.imagetk
 
-# How to install 
+git clone https://github.com/aryasjsr/parol6_TA.git
+cd parol6_TA
+git checkout comsoft
 
-Tested on python 3.10.12 <br />
+python3.10 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools
+python -m pip install wheel==0.42.0
+python -m pip install -r requirements.txt
+```
 
-**Manual**<br />
-How to install on the Linux: [Link](https://github.com/PCrnjak/PAROL-commander-software/blob/main/Linux_install.md)<br />
-How to install on Windows: [Link](https://github.com/PCrnjak/PAROL-commander-software/blob/main/Windows_install.md)
-<br /> **Also works on MAC, just follow the Linux install guide.
+Jalankan aplikasi dari root repository:
 
-**Using requirements.txt**<br />
-pip install -r requirements.txt
+```bash
+chmod +x run_linux.sh
+./run_linux.sh
+```
 
-For Linux you will also have to:<br />
-sudo apt-get install python3-tk<br />
-sudo apt-get install python3-pil python3-pil.imagetk<br />
+`run_linux.sh` selalu memakai `.venv/bin/python` dan menjalankan entry point dari direktori yang benar agar asset GUI serta import lokal dapat ditemukan.
 
-# Dependency
+Panduan Linux yang lebih lengkap, termasuk instalasi Python melalui `pyenv`, tersedia di [Linux_install.md](Linux_install.md). Untuk Windows, lihat [Windows_install.md](Windows_install.md).
 
-You can compare what Python modules are used on the systems that are proven to work!<br />
-[Dependency](https://github.com/PCrnjak/PAROL-commander-software/tree/main/Working%20dependency)
+## Menjalankan secara manual
 
-# Documentation:
+Jika launcher tidak digunakan:
 
-How to use PAROL commander software can be found in [DOCS](https://source-robotics.github.io/PAROL-docs/)
+```bash
+cd GUI/files
+../../.venv/bin/python Serial_sender_good_latest.py
+```
 
-# More about PAROL6
-Join [Discord](https://discord.com/invite/prjUvjmGpZ ) community!
-- [Youtube](https://www.youtube.com/channel/UCp3sDRwVkbm7b2M-2qwf5aQ)
-- [Hackaday](https://hackaday.io/project/167247-faze4-robotic-arm)
-- [Instagram](https://www.instagram.com/source_robotics/)
-- [DOCS](https://source-robotics.github.io/PAROL-docs/)
+Jangan menjalankan entry point dari root repository karena beberapa asset lama masih memakai path relatif terhadap `GUI/files`.
 
-  
-# 📢📢Contributing to the project 📢📢
-Some features are still missing on the software and hardware side of the PAROL6.<br />
-If you want to contribute to the project and don't know how you can help in the implementation of some of these features:
+## Konfigurasi awal
 
-General features:
-  - ROS2 support
-  - Moveit example
-  - ROBODK postprocessor
-  - TODO -> Stepper driver stages need to go to short or all fets low when the power button is pressed
-  - TODO ->Implement Swift simulator - https://github.com/jhavl/swift
-  - TODO -> Create executable files for windows and Linux
+Saat pertama dijalankan, aplikasi membuat `config.json` di root repository. File ini bersifat lokal dan tidak dilacak Git. Pengaturan utama dapat diubah dari GUI:
 
-  PAROL6 commander software features:
-  - Reading GCODE commands
-  - Reading inputs
-  - implementing flow control
-  - Graphical simulator?
-  - Saving programs to the Control board Flash
-  - Offline execution of the code (from the flash)
-  - Blending in trajectory planner
+1. **Robot/Serial** — pilih port board, misalnya `COM3` di Windows atau `/dev/ttyACM0` di Linux.
+2. **Modbus** — gunakan IP PLC dan port `502`, atau isi IP dengan `MOCK` untuk dry-run.
+3. **Vision** — pilih `MOCK`, indeks kamera, atau sumber video; kemudian atur metode deteksi dan kalibrasi.
+4. **Workspace** — periksa batas X/Y/Z dan margin sebelum menjalankan gerakan otomatis.
+5. **Theme** — pilih `Dark`, `Light`, atau `Gray` dari header. Pilihan disimpan ke `config.json`.
 
-# Liability 
-1. The software is still in development and may contain bugs, errors, or incomplete features.
-2. Users are encouraged to use this software responsibly and at their own risk.
+Data runtime seperti `runtime_state.json`, log, snapshot kalibrasi, dan model lokal juga diabaikan oleh Git.
 
-# Support
-This project is entirely open source and free for all to use. Any support, whether through donations or advice, is greatly appreciated. Thank you!
+## Alur penggunaan yang disarankan
 
- [![General badge](https://img.shields.io/badge/PayPal-00457C?style=for-the-badge&logo=paypal&logoColor=white)](https://paypal.me/PCrnjak?locale.x=en_US)
-[![General badge](https://img.shields.io/badge/Patreon-F96854?style=for-the-badge&logo=patreon&logoColor=white)](https://www.patreon.com/PCrnjak)
+1. Jalankan aplikasi dan pastikan status GUI normal.
+2. Uji Modbus dan vision dengan mode `MOCK`.
+3. Buka simulator untuk memeriksa arah serta jangkauan gerak.
+4. Hubungkan board PAROL6 dan pastikan status berubah menjadi `CONNECTED`.
+5. Lakukan homing/kalibrasi sesuai prosedur perangkat keras.
+6. Jalankan program dengan kecepatan rendah, lalu pantau response log dan emergency stop.
 
-# Project is under GPLv3 Licence
+Contoh program tersedia di [`GUI/files/Programs`](GUI/files/Programs). Dokumentasi khusus fitur penelitian:
+
+- [Panduan pengujian Modbus PAROL6](docs/PANDUAN_PENGUJIAN_MODBUS_PAROL6.md)
+- [Panduan Vision Tool-Z](docs/VISION_TOOL_Z.md)
+- [Rangkuman IK, MoveCart, dan vision](docs/RANGKUMAN_IK_MOVECART_VISION.md)
+
+## Pengujian
+
+Install `pytest` pada virtual environment pengembangan, lalu jalankan seluruh unit test dari root repository:
+
+```bash
+source .venv/bin/activate
+python -m pip install pytest
+python -m pytest -q
+```
+
+Tes mencakup kontrol program, kalibrasi kamera, transformasi camera-to-base, validasi safe-pick, akurasi pick, runtime Tool-Z, dan helper tema UI. Tes unit tidak menggantikan validasi gerak pada simulator maupun robot fisik.
+
+## Struktur repository
+
+```text
+GUI/files/                    GUI, komunikasi serial, simulator, dan program contoh
+backend/                      konfigurasi, kontrol program, logging, dan helper tema
+vision/                       deteksi, kalibrasi, workspace, safe-pick, dan Tool-Z
+tests/                        unit test
+docs/                         panduan pengujian dan catatan teknis
+tools/Camera/param/           parameter intrinsik kamera
+run_linux.sh                  launcher Linux
+requirements.txt              dependensi Python
+```
+
+Entry point aplikasi adalah `GUI/files/Serial_sender_good_latest.py`. Modul tersebut menjalankan komunikasi robot dan menghubungkan GUI dengan adapter Modbus/vision di `GUI/files/Commander_feature_adapters.py`.
+
+## Troubleshooting singkat
+
+- **GUI gagal dibuka:** pastikan Python 3.10, Tk, dan semua dependensi pada `requirements.txt` terpasang di `.venv`.
+- **Port serial ditolak di Linux:** tambahkan user ke grup `dialout` dengan `sudo usermod -aG dialout "$USER"`, lalu logout dan login kembali.
+- **Robot tidak terhubung:** periksa kabel, daya, firmware, port serial, dan izin device.
+- **Modbus masih memakai target lama:** klik **Disconnect**, simpan konfigurasi, lalu **Connect** kembali.
+- **Deteksi model gagal:** periksa path model ONNX dan kecocokan runtime CUDA. Gunakan `MOCK` atau metode non-model untuk isolasi masalah.
+- **Asset tidak ditemukan:** jalankan melalui `./run_linux.sh` atau mulai Python dari direktori `GUI/files`.
+
+## Lisensi
+
+Proyek tugas akhir ini dikelola di repository [aryasjsr/parol6_TA](https://github.com/aryasjsr/parol6_TA). Kode didistribusikan di bawah lisensi [GPLv3](LICENSE). Perangkat lunak masih dalam tahap pengembangan dan digunakan atas risiko pengguna.

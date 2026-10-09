@@ -51,6 +51,13 @@ from backend.program_control import (
     read_program_signal,
     write_program_signal,
 )
+from backend.ui_theme import (
+    DEFAULT_UI_THEME,
+    UI_THEME_NAMES,
+    customtkinter_appearance_mode,
+    get_ui_palette,
+    normalize_ui_theme,
+)
 
 logging.basicConfig(level = logging.DEBUG,
     format='%(asctime)s.%(msecs)03d %(levelname)s:\t%(message)s',
@@ -70,11 +77,11 @@ else:
     
 logging.debug(Image_path)
 
-text_size = 13
-PROGRAM_TEXT_FONT_SIZE = 18
-LOG_TEXT_FONT_SIZE = 18
-COMMAND_TREE_FONT_SIZE = 11
-COMMAND_HELP_FONT_SIZE = 13
+text_size = 15
+PROGRAM_TEXT_FONT_SIZE = 20
+LOG_TEXT_FONT_SIZE = 20
+COMMAND_TREE_FONT_SIZE = 14
+COMMAND_HELP_FONT_SIZE = 16
 
 # Globals
 current_menu = "Jog"
@@ -119,8 +126,14 @@ def _set_text(widget, text):
         widget.configure(text=text)
 
 
-#customtkinter.set_appearance_mode("Light")  # Modes: "System" (standard), "Dark", "Light"
-customtkinter.set_appearance_mode("Dark")  # Industrial Precision HMI — dark variant
+try:
+    INITIAL_UI_THEME = normalize_ui_theme(
+        load_config().get("ui", {}).get("theme", DEFAULT_UI_THEME)
+    )
+except Exception:
+    INITIAL_UI_THEME = DEFAULT_UI_THEME
+
+customtkinter.set_appearance_mode(customtkinter_appearance_mode(INITIAL_UI_THEME))
 customtkinter.set_default_color_theme("blue")  # Themes: "blue" (standard), "green", "dark-blue"
 
 # --- Unified Modern Typography System — Montserrat ---
@@ -154,14 +167,13 @@ def _lazy_resolve_fonts():
 
 _orig_CTkFont = customtkinter.CTkFont
 
-# --- Clean Font Size Scale ---
-# Defines a clear typographic hierarchy for professional UI readability.
-#   Display/Title : 18px  (section headings, hero labels)
-#   Heading       : 15px  (panel titles, group headers)
-#   Subheading    : 13px  (button labels, prominent UI text)
-#   Body          : 12px  (default body text)
-#   Caption       : 11px  (helper text, status labels)
-#   Small         : 10px  (footnotes, micro-labels)
+# --- Readable Font Size Scale ---
+# Older revisions reduced most requested sizes (for example 15px became 13px)
+# and then applied 0.85 widget scaling, making labels difficult to read. Keep a
+# minimum of 14px and enlarge the requested hierarchy consistently.
+UI_FONT_SCALE = 1.25
+UI_MONO_FONT_SCALE = 1.20
+UI_MIN_FONT_SIZE = 14
 
 class UnifiedCTkFont(_orig_CTkFont):
     def __init__(self, family=None, size=None, weight=None, slant=None, underline=None, overstrike=None):
@@ -179,28 +191,10 @@ class UnifiedCTkFont(_orig_CTkFont):
         else:
             family_mapped = family
 
-        # 2. Rescale font sizes to a clean, professional hierarchy
-        # (monospace text is exempt: the hierarchy caps at 18px and shrank the
-        # program/log editors to 13px, which was too small to read)
-        if size is not None:
-            if family_mapped == FONT_FAMILY_MONO:
-                size_mapped = int(size)
-            elif size >= 24:
-                size_mapped = 18   # Display
-            elif size >= 18:
-                size_mapped = 15   # Heading
-            elif size >= 15:
-                size_mapped = 13   # Subheading
-            elif size >= 14:
-                size_mapped = 12   # Body
-            elif size >= 12:
-                size_mapped = 11   # Caption
-            elif size >= 10:
-                size_mapped = 10   # Small
-            else:
-                size_mapped = int(size)
-        else:
-            size_mapped = 12  # Default body size
+        # 2. Enlarge every requested font without flattening its hierarchy.
+        requested_size = 13 if size is None else int(size)
+        scale = UI_MONO_FONT_SCALE if family_mapped == FONT_FAMILY_MONO else UI_FONT_SCALE
+        size_mapped = max(UI_MIN_FONT_SIZE, int(round(requested_size * scale)))
 
         kwargs = {}
         if family_mapped is not None:
@@ -229,26 +223,43 @@ left_frames_width = 430
 right_frames_width = 300
 bottom_frame_height = 96
 
-# === Elegant Black Professional palette ===
-# Pure black foundation with subtle warm-neutral surfaces. Refined, premium feel
-# with restrained accent colors. Gold branding, crisp white typography.
-UI_APP_BG          = "#000000"  # pure black — app background
-UI_SURFACE         = "#0a0a0a"  # near-black panel face
-UI_SURFACE_ALT     = "#111111"  # slightly lifted — header strips
-UI_SURFACE_LOW     = "#080808"  # deepest recessed panels
-UI_SURFACE_HIGH    = "#1a1a1a"  # elevated surfaces / data wells
-UI_BORDER          = "#1f1f1f"  # subtle borders — low contrast
-UI_OUTLINE         = "#2a2a2a"  # stronger separators
-UI_HANDLE          = "#252525"  # drag handles
-UI_ACCENT          = "#3366ff"  # refined blue accent
-UI_ACCENT_DEEP     = "#5588ff"  # hover / pressed state
-UI_ACCENT_SOFT     = "#0d1a33"  # subtle accent tint
-UI_GOLD            = "#d4a843"  # refined Polman gold — muted elegance
-UI_ON_SURFACE      = "#f0f0f0"  # crisp white text
-UI_ON_SURFACE_MUTE = "#808080"  # muted secondary text
-UI_SUCCESS         = "#2ecc71"  # refined green — Start/Run
-UI_DANGER          = "#e74c3c"  # refined red — Stop/Emergency
-UI_WARN            = "#f39c12"  # refined amber — Reset/Standby
+# === Switchable professional UI palette ===
+_active_ui_theme = INITIAL_UI_THEME
+
+
+def _activate_palette(theme_name):
+    """Update the module-level colour tokens used by widget constructors."""
+    global _active_ui_theme
+    global UI_APP_BG, UI_SURFACE, UI_SURFACE_ALT, UI_SURFACE_LOW
+    global UI_SURFACE_HIGH, UI_BORDER, UI_OUTLINE, UI_HANDLE
+    global UI_ACCENT, UI_ACCENT_DEEP, UI_ACCENT_SOFT, UI_GOLD
+    global UI_ON_SURFACE, UI_ON_SURFACE_MUTE
+    global UI_SUCCESS, UI_DANGER, UI_WARN
+
+    _active_ui_theme = normalize_ui_theme(theme_name)
+    palette = get_ui_palette(_active_ui_theme)
+    UI_APP_BG = palette["APP_BG"]
+    UI_SURFACE = palette["SURFACE"]
+    UI_SURFACE_ALT = palette["SURFACE_ALT"]
+    UI_SURFACE_LOW = palette["SURFACE_LOW"]
+    UI_SURFACE_HIGH = palette["SURFACE_HIGH"]
+    UI_BORDER = palette["BORDER"]
+    UI_OUTLINE = palette["OUTLINE"]
+    UI_HANDLE = palette["HANDLE"]
+    UI_ACCENT = palette["ACCENT"]
+    UI_ACCENT_DEEP = palette["ACCENT_DEEP"]
+    UI_ACCENT_SOFT = palette["ACCENT_SOFT"]
+    UI_GOLD = palette["GOLD"]
+    UI_ON_SURFACE = palette["ON_SURFACE"]
+    UI_ON_SURFACE_MUTE = palette["ON_SURFACE_MUTE"]
+    UI_SUCCESS = palette["SUCCESS"]
+    UI_DANGER = palette["DANGER"]
+    UI_WARN = palette["WARN"]
+    return palette
+
+
+_activate_palette(INITIAL_UI_THEME)
+
 
 class CollapsibleFrame(customtkinter.CTkFrame):
     def __init__(self, parent, title, content_height=None, start_collapsed=False, **kwargs):
@@ -316,10 +327,15 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
     
 
 
+    # The launcher imports SIMULATOR_Robot after this module; that legacy module
+    # changes CustomTkinter's process-wide mode. Restore the saved main-GUI
+    # preference immediately before constructing any widgets.
+    customtkinter.set_appearance_mode(customtkinter_appearance_mode(INITIAL_UI_THEME))
     app = customtkinter.CTk()
 
-    customtkinter.set_widget_scaling(0.85)
+    customtkinter.set_widget_scaling(1.0)
     app.current_menu = "Jog"
+    app.active_ui_theme = INITIAL_UI_THEME
     shared_string.value = b'PAROL6 commander v1.0'
     
     def _update_tab_highlights(active_name):
@@ -402,7 +418,7 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         app.menu_select_frame = customtkinter.CTkFrame(app,height = 0,width=150, corner_radius=8, fg_color=UI_SURFACE, border_width=1, border_color=UI_BORDER)
         app.menu_select_frame.grid(row=0, column=0, columnspan=4, padx=(5,5), pady=5,sticky="new")
         app.menu_select_frame.grid_columnconfigure(0, weight=0)  # logo
-        app.menu_select_frame.grid_columnconfigure(6, weight=1)  # spacer pushes fw_label + help right
+        app.menu_select_frame.grid_columnconfigure(6, weight=1)  # spacer pushes theme + fw label right
         app.menu_select_frame.grid_rowconfigure(0, weight=0)
 
         # --- Polman Logo (left side of header bar) ---
@@ -440,8 +456,25 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         app.Research_button = customtkinter.CTkButton(app.menu_select_frame,text="▤  Research", font=_tab_font, command = raise_research_frame)
         app.Research_button.grid(row=0, column=5, padx=(10,0) ,pady = 5,sticky="nw")
 
+        app.theme_label = customtkinter.CTkLabel(
+            app.menu_select_frame,
+            text="Theme",
+            text_color=UI_ON_SURFACE_MUTE,
+            font=customtkinter.CTkFont(size=11, weight="bold"),
+        )
+        app.theme_label.grid(row=0, column=7, padx=(14, 5), pady=5, sticky="e")
+
+        app.theme_menu = customtkinter.CTkOptionMenu(
+            app.menu_select_frame,
+            values=list(UI_THEME_NAMES),
+            width=92,
+            command=change_appearance_mode_event,
+        )
+        app.theme_menu.set(INITIAL_UI_THEME)
+        app.theme_menu.grid(row=0, column=8, padx=(0, 10), pady=5, sticky="e")
+
         app.fw_label = customtkinter.CTkLabel(app.menu_select_frame, text="Source controller fw v1.0.0", text_color=UI_GOLD, font=customtkinter.CTkFont(family='JetBrains Mono', size=11, weight='bold'))
-        app.fw_label.grid(row=0, column=7, padx=(20,10), pady=5 ,sticky="ne")
+        app.fw_label.grid(row=0, column=9, padx=(10,10), pady=5 ,sticky="ne")
 
         # help button
         help_image =Image.open(os.path.join(Image_path, "help.png"))
@@ -450,7 +483,7 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         app.help_button = customtkinter.CTkButton(app.menu_select_frame, corner_radius=0, height=1, border_spacing=10,
                                                 fg_color="transparent", text_color=("gray10", "gray90"),
                                                 image=app.help_button_image, anchor="CENTER",text = "",hover = 0,command = Open_help) #hover = 0
-        app.help_button.grid(row=0, column=8, padx=(10,0), sticky="news")
+        app.help_button.grid(row=0, column=10, padx=(10,0), sticky="news")
 
 
     def bottom_frames():
@@ -4809,62 +4842,195 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
         messagebox.showerror("test","test2")
         messagebox.showinfo("test","test2")
         logging.debug(Position_in)
-    def change_appearance_mode_event(new_appearance_mode: str):
-        customtkinter.set_appearance_mode(new_appearance_mode)
 
-        if(new_appearance_mode == "Dark"):
-            style = ttk.Style()
-            style.theme_use("default")
+    def _walk_widgets(root):
+        yield root
+        try:
+            children = root.winfo_children()
+        except Exception:
+            children = ()
+        for child in children:
+            yield from _walk_widgets(child)
 
-            style.configure("Treeview",
-                            background=UI_SURFACE_LOW,
-                            foreground=UI_ON_SURFACE,
-                            rowheight=30,
-                            fieldbackground=UI_SURFACE_LOW,
-                            bordercolor=UI_BORDER,
-                            borderwidth=0,
-                            font=(FONT_FAMILY_MAIN, COMMAND_TREE_FONT_SIZE))
+    def _remap_theme_value(value, old_palette, new_palette):
+        old_roles = {
+            str(color).casefold(): role for role, color in old_palette.items()
+        }
 
-            style.map('Treeview',
-                      background=[('selected', UI_ACCENT)],
-                      foreground=[('selected', '#ffffff')])
+        def remap_single(item):
+            role = old_roles.get(str(item).casefold())
+            return new_palette[role] if role else item
 
-            style.configure("Treeview.Heading",
-                            background=UI_SURFACE_ALT,
-                            foreground=UI_ON_SURFACE,
-                            relief="flat",
-                            font=(FONT_FAMILY_MAIN, COMMAND_TREE_FONT_SIZE,'bold'),
-                            )
+        if isinstance(value, tuple):
+            return tuple(remap_single(item) for item in value)
+        if isinstance(value, list):
+            return [remap_single(item) for item in value]
+        return remap_single(value)
 
-            style.map("Treeview.Heading",
-                        background=[('active', UI_SURFACE_HIGH)])
+    def _configure_treeview_theme():
+        style = ttk.Style()
+        style.theme_use("default")
+        style.configure(
+            "Treeview",
+            background=UI_SURFACE_LOW,
+            foreground=UI_ON_SURFACE,
+            rowheight=30,
+            fieldbackground=UI_SURFACE_LOW,
+            bordercolor=UI_BORDER,
+            borderwidth=0,
+            font=(FONT_FAMILY_MAIN, COMMAND_TREE_FONT_SIZE),
+        )
+        style.map(
+            "Treeview",
+            background=[("selected", UI_ACCENT)],
+            foreground=[("selected", "#ffffff")],
+        )
+        style.configure(
+            "Treeview.Heading",
+            background=UI_SURFACE_ALT,
+            foreground=UI_ON_SURFACE,
+            relief="flat",
+            font=(FONT_FAMILY_MAIN, COMMAND_TREE_FONT_SIZE, "bold"),
+        )
+        style.map(
+            "Treeview.Heading",
+            background=[("active", UI_SURFACE_HIGH)],
+        )
+        if hasattr(app, "table"):
+            app.table.tag_configure(
+                "command_group",
+                font=(FONT_FAMILY_MAIN, COMMAND_TREE_FONT_SIZE, "bold"),
+                foreground=UI_ACCENT,
+            )
 
-        if(new_appearance_mode == "Light"):
-            style = ttk.Style()
-            style.theme_use("default")
+    def _style_gray_defaults(widget):
+        """Neutralise CustomTkinter's built-in blue controls in Gray mode."""
+        widget_type = type(widget)
+        updates = {}
+        if widget_type is customtkinter.CTkButton:
+            try:
+                # Built-in theme colours are stored as a light/dark pair.
+                # Explicit status colours (Run/Stop/Warning) are strings and
+                # must retain their safety meaning in every theme.
+                if isinstance(widget.cget("fg_color"), (tuple, list)):
+                    updates = {
+                        "fg_color": UI_ACCENT,
+                        "hover_color": UI_ACCENT_DEEP,
+                    }
+            except Exception:
+                pass
+        elif widget_type is customtkinter.CTkOptionMenu:
+            try:
+                if isinstance(widget.cget("fg_color"), (tuple, list)):
+                    updates = {
+                        "fg_color": UI_ACCENT,
+                        "button_color": UI_ACCENT_SOFT,
+                        "button_hover_color": UI_ACCENT_DEEP,
+                    }
+            except Exception:
+                pass
+        elif widget_type in (customtkinter.CTkRadioButton, customtkinter.CTkCheckBox):
+            try:
+                if isinstance(widget.cget("fg_color"), (tuple, list)):
+                    updates = {
+                        "fg_color": UI_ACCENT,
+                        "hover_color": UI_ACCENT_DEEP,
+                        "border_color": UI_OUTLINE,
+                    }
+            except Exception:
+                pass
+        elif widget_type is customtkinter.CTkSlider:
+            try:
+                if isinstance(widget.cget("button_color"), (tuple, list)):
+                    updates = {
+                        "button_color": UI_ACCENT,
+                        "button_hover_color": UI_ACCENT_DEEP,
+                        "progress_color": UI_ACCENT,
+                    }
+            except Exception:
+                pass
+        elif widget_type is customtkinter.CTkProgressBar:
+            try:
+                if isinstance(widget.cget("progress_color"), (tuple, list)):
+                    updates = {"progress_color": UI_ACCENT}
+            except Exception:
+                pass
+        if updates:
+            try:
+                widget.configure(**updates)
+            except Exception:
+                pass
 
-            style.configure("Treeview",
-                            background="#e0e0e0",
-                            foreground="black",
-                            rowheight=30,
-                            fieldbackground="#e0e0e0",
-                            bordercolor="#cccccc",
-                            borderwidth=0,
-                            font=(FONT_FAMILY_MAIN, COMMAND_TREE_FONT_SIZE))
+    def change_appearance_mode_event(new_appearance_mode: str, persist=True):
+        theme_name = normalize_ui_theme(new_appearance_mode)
+        old_theme = getattr(app, "active_ui_theme", INITIAL_UI_THEME)
+        old_palette = get_ui_palette(old_theme)
+        new_palette = _activate_palette(theme_name)
+        app.active_ui_theme = theme_name
 
-            style.map('Treeview',
-                      background=[('selected', UI_ACCENT)],
-                      foreground=[('selected', '#ffffff')])
+        customtkinter.set_appearance_mode(customtkinter_appearance_mode(theme_name))
 
-            style.configure("Treeview.Heading",
-                            background="#d0d0d0",
-                            foreground="black",
-                            relief="flat",
-                            font=(FONT_FAMILY_MAIN, COMMAND_TREE_FONT_SIZE,'bold'),
-                            )
+        colour_options = (
+            "fg_color",
+            "bg_color",
+            "hover_color",
+            "border_color",
+            "text_color",
+            "button_color",
+            "button_hover_color",
+            "progress_color",
+        )
+        for widget in _walk_widgets(app):
+            updates = {}
+            for option in colour_options:
+                try:
+                    old_value = widget.cget(option)
+                except Exception:
+                    continue
+                new_value = _remap_theme_value(old_value, old_palette, new_palette)
+                if new_value != old_value:
+                    updates[option] = new_value
+            if updates:
+                try:
+                    widget.configure(**updates)
+                except Exception:
+                    # A few composite widgets expose read-only configuration
+                    # values. One such value should not block the other colours.
+                    for option, value in updates.items():
+                        try:
+                            widget.configure(**{option: value})
+                        except Exception:
+                            pass
+            if theme_name == "Gray":
+                _style_gray_defaults(widget)
 
-            style.map("Treeview.Heading",
-                        background=[('active', "#c0c0c0")])
+        _configure_treeview_theme()
+        if hasattr(app, "research_plot_fig"):
+            app.research_plot_fig.patch.set_facecolor(UI_SURFACE)
+            for axis in app.research_axes.values():
+                axis.set_facecolor(UI_SURFACE_LOW)
+                axis.title.set_color(UI_ON_SURFACE)
+                axis.tick_params(
+                    axis="both",
+                    which="major",
+                    colors=UI_ON_SURFACE_MUTE,
+                )
+                axis.grid(True, alpha=0.25, color=UI_ON_SURFACE_MUTE)
+                for spine in axis.spines.values():
+                    spine.set_color(UI_BORDER)
+            app.research_plot_canvas.draw_idle()
+
+        if hasattr(app, "theme_menu") and app.theme_menu.get() != theme_name:
+            app.theme_menu.set(theme_name)
+        _update_tab_highlights(getattr(app, "current_menu", "Jog"))
+
+        if persist:
+            try:
+                config = load_config()
+                config.setdefault("ui", {})["theme"] = theme_name
+                save_config(config)
+            except Exception as exc:
+                logging.warning("Could not save UI theme preference: %s", exc)
 
 
 
@@ -5156,6 +5322,7 @@ def GUI(shared_string,Position_out,Speed_out,Command_out,Affected_joint_out,InOu
     modbus_frame()
     research_frame()
     layout_resize_handles()
+    change_appearance_mode_event(INITIAL_UI_THEME, persist=False)
     _show_commander_frame(app.jog_frame, "Jog")
 
     Stuff_To_Update()
