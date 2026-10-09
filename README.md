@@ -1,8 +1,7 @@
 # PAROL6 TA Commander
 
-PAROL6 TA Commander adalah aplikasi desktop untuk pengembangan dan pengujian sistem robot PAROL6 pada tugas akhir. Aplikasi ini menggabungkan kontrol robot, simulator, vision, komunikasi Modbus TCP, dan pencatatan data penelitian dalam satu antarmuka.
+PAROL6 TA adalah aplikasi desktop untuk pengembangan dan pengujian sistem robot PAROL6 pada tugas akhir. Aplikasi ini menggabungkan kontrol robot, simulator, vision, komunikasi Modbus TCP, dan pencatatan data penelitian dalam satu antarmuka.
 
-![Tampilan PAROL6 Commander](Images/screen_2.png)
 
 ## Fitur utama
 
